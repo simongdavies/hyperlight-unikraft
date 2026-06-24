@@ -2052,7 +2052,13 @@ pub struct SandboxBuilder {
     listen_ports: Option<ListenPorts>,
     tools: ToolRegistry,
     has_tools: bool,
+    initrd_base: u64,
 }
+
+/// Default guest virtual address where the mapped initrd is placed (3 GiB). Newer
+/// `plat-hyperlight` kernels expect it just below 4 GiB (`0xFEF0_0000`); override per-build
+/// via [`SandboxBuilder::initrd_base`].
+const DEFAULT_INITRD_MAP_BASE: u64 = 0xC000_0000;
 
 impl SandboxBuilder {
     /// The initrd CPIO archive, mapped zero-copy into guest memory.
@@ -2065,6 +2071,15 @@ impl SandboxBuilder {
     /// Prefer [`initrd_file`](Self::initrd_file) for anything non-trivial.
     pub fn initrd_bytes(mut self, bytes: Vec<u8>) -> Self {
         self.initrd = Some(InitrdSource::Bytes(bytes));
+        self
+    }
+
+    /// Guest virtual address where the mapped initrd is placed (default 3 GiB). Newer
+    /// `plat-hyperlight` kernels expect it just below 4 GiB (`0xFEF0_0000`); set this to
+    /// match the kernel, or the VM traps on an unmapped MMIO read during init. Only affects
+    /// [`initrd_file`](Self::initrd_file).
+    pub fn initrd_base(mut self, base: u64) -> Self {
+        self.initrd_base = base;
         self
     }
 
@@ -2143,6 +2158,16 @@ impl SandboxBuilder {
         self
     }
 
+    /// Use a pre-built [`ToolRegistry`] for this sandbox, replacing any tools added via
+    /// [`tool`](Self::tool). Useful when the same host functions must also be re-registered
+    /// on a snapshot-loaded sandbox (see
+    /// [`Sandbox::from_snapshot_file_with_initrd_and_tools`]).
+    pub fn with_tools(mut self, tools: ToolRegistry) -> Self {
+        self.tools = tools;
+        self.has_tools = true;
+        self
+    }
+
     /// Boot the VM, run init, and take a post-init snapshot.
     pub fn build(self) -> Result<Sandbox> {
         let config = VmConfig {
@@ -2167,6 +2192,7 @@ impl SandboxBuilder {
                 &self.preopens,
                 net,
                 lp,
+                self.initrd_base,
             ),
             Some(InitrdSource::Bytes(bytes)) => Sandbox::evolve_inline(
                 &self.kernel,
@@ -2187,6 +2213,7 @@ impl SandboxBuilder {
                 &self.preopens,
                 net,
                 lp,
+                self.initrd_base,
             ),
         }
     }
@@ -2208,6 +2235,7 @@ impl Sandbox {
             listen_ports: None,
             tools: ToolRegistry::new(),
             has_tools: false,
+            initrd_base: DEFAULT_INITRD_MAP_BASE,
         }
     }
 
@@ -2260,6 +2288,7 @@ impl Sandbox {
         preopens: &[Preopen],
         network: Option<&NetworkPolicy>,
         listen_ports: Option<&ListenPorts>,
+        initrd_base: u64,
     ) -> Result<Self> {
         if !kernel_path.exists() {
             return Err(anyhow!("Kernel not found: {:?}", kernel_path));
@@ -2281,12 +2310,12 @@ impl Sandbox {
 
         let mut usbox = UninitializedSandbox::new(env, Some(config.sandbox_config()))?;
 
-        // Map the initrd file (zero-copy via mmap)
-        // Place at 3 GiB — high enough to not overlap any reasonable
-        // primary shared memory region, within the 4 GiB identity map.
-        const INITRD_MAP_BASE: u64 = 0xC000_0000; // 3 GiB
+        // Map the initrd file (zero-copy via mmap). Default 3 GiB (`initrd_base`), but
+        // overridable: newer plat-hyperlight kernels expect it just below 4 GiB
+        // (0xFEF0_0000). Must land within the 4 GiB identity map without overlapping the
+        // primary shared-memory region.
         if let Some(path) = initrd_path {
-            usbox.map_file_cow(path, INITRD_MAP_BASE, Some("initrd"))?;
+            usbox.map_file_cow(path, initrd_base, Some("initrd"))?;
         }
 
         let exit_code = Arc::new(AtomicI32::new(0));
@@ -2536,6 +2565,47 @@ impl Sandbox {
             inner,
             snapshot: Some(arc),
             file_mapping_path: initrd,
+            exit_code,
+            socket_table,
+            sleep_cancel,
+        })
+    }
+
+    /// Like [`from_snapshot_file_with_initrd`](Self::from_snapshot_file_with_initrd) but also
+    /// re-registers a caller-supplied [`ToolRegistry`] on the loaded sandbox, so custom host
+    /// functions survive the snapshot fast-path. (The snapshot restores only guest memory;
+    /// host functions live on the host and must be re-attached on load.)
+    pub fn from_snapshot_file_with_initrd_and_tools<P: AsRef<Path>, I: AsRef<Path>>(
+        path: P,
+        preopens: &[Preopen],
+        initrd: I,
+        user_tools: ToolRegistry,
+    ) -> Result<Self> {
+        let loaded = Snapshot::from_file_unchecked(path.as_ref())?;
+        let arc = Arc::new(loaded);
+
+        let exit_code = Arc::new(AtomicI32::new(0));
+        let sleep_cancel = SleepCancel::new();
+        let mut tools = build_tools(Some(user_tools), preopens)?.unwrap_or_default();
+        let socket_table =
+            register_internal_tools(&mut tools, &exit_code, &sleep_cancel, None, None);
+        let tools = Arc::new(tools);
+        let tools_ref = tools.clone();
+
+        let mut host_funcs = HostFunctions::default();
+        host_funcs.register_host_function("__dispatch", move |payload: Vec<u8>| -> Vec<u8> {
+            tools_ref.dispatch(&payload)
+        })?;
+
+        let mut inner = MultiUseSandbox::from_snapshot(arc.clone(), host_funcs, None)?;
+
+        const INITRD_MAP_BASE: u64 = 0xC000_0000;
+        inner.map_file_cow(initrd.as_ref(), INITRD_MAP_BASE, Some("initrd"))?;
+
+        Ok(Self {
+            inner,
+            snapshot: Some(arc),
+            file_mapping_path: Some(initrd.as_ref().to_path_buf()),
             exit_code,
             socket_table,
             sleep_cancel,
