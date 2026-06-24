@@ -2902,11 +2902,6 @@ pub fn run_vm_capture_output(
 }
 
 // ---------------------------------------------------------------------------
-// Snapshot sparsification
-// ---------------------------------------------------------------------------
-
-/// Punch holes in zero-filled 4 KiB pages of a snapshot file.
-///
 // ---------------------------------------------------------------------------
 // FsSandbox tests — prove that host-side path resolution rejects escapes.
 //
