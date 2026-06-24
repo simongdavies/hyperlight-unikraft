@@ -2299,6 +2299,9 @@ pub struct Sandbox {
     inner: MultiUseSandbox,
     /// Post-init snapshot for fast restore between calls.
     snapshot: Option<Arc<Snapshot>>,
+    /// Initrd path — re-mapped after every restore() since restore
+    /// overwrites the region with the snapshot's original memory.
+    initrd_path: Option<std::path::PathBuf>,
     exit_code: Arc<AtomicI32>,
     /// Shared socket table — cleared on [`Sandbox::restore`] so that
     /// host-side fds don't leak across guest restore cycles.
@@ -2534,7 +2537,7 @@ impl Sandbox {
             tools_ref.dispatch(&payload)
         })?;
 
-        Self::finish_evolve(usbox, exit_code, sleep_cancel, socket_table)
+        Self::finish_evolve(usbox, None, exit_code, sleep_cancel, socket_table)
     }
 
     /// Low-level: boot with a zero-copy mapped initrd file. Prefer the builder.
@@ -2575,9 +2578,12 @@ impl Sandbox {
         // from KVM_SET_USER_MEMORY_REGION on kernels where in-kernel
         // IRQCHIP reserves that range.
         const INITRD_MAP_BASE: u64 = 0xFEF0_0000;
-        if let Some(path) = initrd_path {
+        let initrd_owned = if let Some(path) = initrd_path {
             usbox.map_file_cow(path, INITRD_MAP_BASE)?;
-        }
+            Some(path.to_path_buf())
+        } else {
+            None
+        };
 
         let exit_code = Arc::new(AtomicI32::new(0));
         let sleep_cancel = SleepCancel::new();
@@ -2590,11 +2596,12 @@ impl Sandbox {
             tools_ref.dispatch(&payload)
         })?;
 
-        Self::finish_evolve(usbox, exit_code, sleep_cancel, socket_table)
+        Self::finish_evolve(usbox, initrd_owned, exit_code, sleep_cancel, socket_table)
     }
 
     fn finish_evolve(
         usbox: UninitializedSandbox,
+        initrd_path: Option<std::path::PathBuf>,
         exit_code: Arc<AtomicI32>,
         sleep_cancel: SleepCancel,
         socket_table: Option<Arc<Mutex<SocketTable>>>,
@@ -2604,6 +2611,7 @@ impl Sandbox {
         Ok(Self {
             inner,
             snapshot,
+            initrd_path,
             exit_code,
             socket_table,
             sleep_cancel,
@@ -2617,6 +2625,10 @@ impl Sandbox {
     pub fn restore(&mut self) -> Result<()> {
         if let Some(ref snap) = self.snapshot {
             self.inner.restore(snap.clone())?;
+        }
+        const INITRD_MAP_BASE: u64 = 0xFEF0_0000;
+        if let Some(ref path) = self.initrd_path {
+            self.inner.map_file_cow(path, INITRD_MAP_BASE)?;
         }
         if let Some(ref table) = self.socket_table {
             table.lock().unwrap().clear();
@@ -2812,6 +2824,7 @@ impl Sandbox {
         Ok(Self {
             inner,
             snapshot: Some(arc),
+            initrd_path: initrd,
             exit_code,
             socket_table,
             sleep_cancel,
