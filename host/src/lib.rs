@@ -1052,6 +1052,34 @@ fn register_internal_tools(
     socket_table
 }
 
+/// In-guest output captured during a `run` call. The guest driver redirects its
+/// Python `sys.stdout`/`sys.stderr` into buffers and posts them to the host via the
+/// internal `__hl_result` tool over `__dispatch` after each run (mirroring how
+/// `__hl_exit` reports the exit code). Behind a mutex so the dispatch thread can write
+/// it while [`Sandbox::run_code`] reads it.
+#[derive(Debug, Default, Clone)]
+struct CapturedOutput {
+    stdout: String,
+    stderr: String,
+}
+
+/// Register the internal `__hl_result` tool, which receives `{ "stdout", "stderr" }`
+/// from the guest after each run and stores it in `captured` for [`Sandbox::run_code`]
+/// to return. Kept separate from [`register_internal_tools`] because its sink is a
+/// per-sandbox slot threaded through to `run_code`, not process-wide plumbing.
+fn register_result_tool(tools: &mut ToolRegistry, captured: &Arc<Mutex<CapturedOutput>>) {
+    let cap = captured.clone();
+    tools.register("__hl_result", move |args| {
+        let stdout = args["stdout"].as_str().unwrap_or_default().to_string();
+        let stderr = args["stderr"].as_str().unwrap_or_default().to_string();
+        if let Ok(mut c) = cap.lock() {
+            c.stdout = stdout;
+            c.stderr = stderr;
+        }
+        Ok(serde_json::json!({}))
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Host-proxied networking (hostsock)
 // ---------------------------------------------------------------------------
@@ -2303,11 +2331,25 @@ pub struct Sandbox {
     /// overwrites the region with the snapshot's original memory.
     initrd_path: Option<std::path::PathBuf>,
     exit_code: Arc<AtomicI32>,
+    /// In-guest stdout/stderr captured via the `__hl_result` tool, returned by
+    /// [`Sandbox::run_code`]. Cleared before each run.
+    captured: Arc<Mutex<CapturedOutput>>,
     /// Shared socket table — cleared on [`Sandbox::restore`] so that
     /// host-side fds don't leak across guest restore cycles.
     socket_table: Option<Arc<Mutex<SocketTable>>>,
     /// Cancellation token for in-progress `__hl_sleep` host calls.
     sleep_cancel: SleepCancel,
+}
+
+/// The result of a [`Sandbox::run_code`] call: the guest's captured stdout/stderr
+/// plus its exit code. `stdout`/`stderr` require a resident driver that posts
+/// `__hl_result`; against an older driver they are empty and `exit_code` is
+/// authoritative.
+#[derive(Debug, Default, Clone)]
+pub struct RunOutput {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: i32,
 }
 
 /// Where the initrd comes from — either a file (zero-copy `map_file_cow`)
@@ -2527,17 +2569,19 @@ impl Sandbox {
         let mut usbox = UninitializedSandbox::new(env, Some(config.sandbox_config()))?;
 
         let exit_code = Arc::new(AtomicI32::new(0));
+        let captured = Arc::new(Mutex::new(CapturedOutput::default()));
         let sleep_cancel = SleepCancel::new();
         let mut tools = build_tools(tools, preopens)?.unwrap_or_default();
         let socket_table =
             register_internal_tools(&mut tools, &exit_code, &sleep_cancel, network, listen_ports);
+        register_result_tool(&mut tools, &captured);
         let tools = Arc::new(tools);
         let tools_ref = tools.clone();
         usbox.register_host_function("__dispatch", move |payload: Vec<u8>| -> Vec<u8> {
             tools_ref.dispatch(&payload)
         })?;
 
-        Self::finish_evolve(usbox, None, exit_code, sleep_cancel, socket_table)
+        Self::finish_evolve(usbox, None, exit_code, captured, sleep_cancel, socket_table)
     }
 
     /// Low-level: boot with a zero-copy mapped initrd file. Prefer the builder.
@@ -2586,23 +2630,26 @@ impl Sandbox {
         };
 
         let exit_code = Arc::new(AtomicI32::new(0));
+        let captured = Arc::new(Mutex::new(CapturedOutput::default()));
         let sleep_cancel = SleepCancel::new();
         let mut tools = build_tools(tools, preopens)?.unwrap_or_default();
         let socket_table =
             register_internal_tools(&mut tools, &exit_code, &sleep_cancel, network, listen_ports);
+        register_result_tool(&mut tools, &captured);
         let tools = Arc::new(tools);
         let tools_ref = tools.clone();
         usbox.register_host_function("__dispatch", move |payload: Vec<u8>| -> Vec<u8> {
             tools_ref.dispatch(&payload)
         })?;
 
-        Self::finish_evolve(usbox, initrd_owned, exit_code, sleep_cancel, socket_table)
+        Self::finish_evolve(usbox, initrd_owned, exit_code, captured, sleep_cancel, socket_table)
     }
 
     fn finish_evolve(
         usbox: UninitializedSandbox,
         initrd_path: Option<std::path::PathBuf>,
         exit_code: Arc<AtomicI32>,
+        captured: Arc<Mutex<CapturedOutput>>,
         sleep_cancel: SleepCancel,
         socket_table: Option<Arc<Mutex<SocketTable>>>,
     ) -> Result<Self> {
@@ -2613,6 +2660,7 @@ impl Sandbox {
             snapshot,
             initrd_path,
             exit_code,
+            captured,
             socket_table,
             sleep_cancel,
         })
@@ -2676,16 +2724,29 @@ impl Sandbox {
     ///
     /// Requires a resident-driver image (e.g. `python-agent-driver`) whose `run`
     /// entry reads the code from the call payload, plus a snapshot to restore to
-    /// (the post-init snapshot from `build`, or a later [`snapshot_now`]). Guest
-    /// stdout/stderr currently go to the console; in-band capture is a follow-up,
-    /// so this returns only the exit code for now.
+    /// (the post-init snapshot from `build`, or a later [`snapshot_now`]). The guest
+    /// driver posts its captured stdout/stderr via the `__hl_result` tool; against an
+    /// older driver that does not, `stdout`/`stderr` are empty and `exit_code` stands.
     ///
     /// [`snapshot_now`]: Self::snapshot_now
-    pub fn run_code(&mut self, code: &str) -> Result<i32> {
+    pub fn run_code(&mut self, code: &str) -> Result<RunOutput> {
         self.restore()?;
         self.reset_exit_code();
+        if let Ok(mut c) = self.captured.lock() {
+            c.stdout.clear();
+            c.stderr.clear();
+        }
         let _: () = self.call_named("run", code.to_string())?;
-        Ok(self.last_exit_code())
+        let (stdout, stderr) = self
+            .captured
+            .lock()
+            .map(|c| (c.stdout.clone(), c.stderr.clone()))
+            .unwrap_or_default();
+        Ok(RunOutput {
+            stdout,
+            stderr,
+            exit_code: self.last_exit_code(),
+        })
     }
 
     /// Read the exit code reported by the guest via `__hl_exit`.
@@ -2823,10 +2884,12 @@ impl Sandbox {
         let arc = Arc::new(loaded);
 
         let exit_code = Arc::new(AtomicI32::new(0));
+        let captured = Arc::new(Mutex::new(CapturedOutput::default()));
         let sleep_cancel = SleepCancel::new();
         let mut tools = build_tools(None, preopens)?.unwrap_or_default();
         let socket_table =
             register_internal_tools(&mut tools, &exit_code, &sleep_cancel, network, listen_ports);
+        register_result_tool(&mut tools, &captured);
         let tools = Arc::new(tools);
         let tools_ref = tools.clone();
 
@@ -2847,6 +2910,7 @@ impl Sandbox {
             snapshot: Some(arc),
             initrd_path: initrd,
             exit_code,
+            captured,
             socket_table,
             sleep_cancel,
         })

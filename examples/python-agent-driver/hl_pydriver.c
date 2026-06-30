@@ -152,53 +152,6 @@ static void report_exit_code(int code)
 	close(fd);
 }
 
-static int run_code_with_exceptions(const char *code)
-{
-	PyObject *m = PyImport_AddModule("__main__");
-	if (!m) return 1;
-	PyObject *d = PyModule_GetDict(m);
-	if (!d) return 1;
-
-	PyObject *result = PyRun_String(code, Py_file_input, d, d);
-	if (result) {
-		Py_DECREF(result);
-		return 0;
-	}
-
-	if (PyErr_ExceptionMatches(PyExc_SystemExit)) {
-		PyObject *type, *value, *tb;
-		PyErr_Fetch(&type, &value, &tb);
-		PyErr_NormalizeException(&type, &value, &tb);
-		int exit_code = 1;
-		if (value) {
-			PyObject *ca = PyObject_GetAttrString(value, "code");
-			if (ca) {
-				if (PyLong_Check(ca)) {
-					exit_code = (int)PyLong_AsLong(ca);
-				} else if (ca == Py_None) {
-					exit_code = 0;
-				} else {
-					PyObject *s = PyObject_Str(ca);
-					if (s) {
-						const char *msg = PyUnicode_AsUTF8(s);
-						if (msg)
-							fprintf(stderr, "%s\n", msg);
-						Py_DECREF(s);
-					}
-				}
-				Py_DECREF(ca);
-			}
-		}
-		Py_XDECREF(type);
-		Py_XDECREF(value);
-		Py_XDECREF(tb);
-		return exit_code;
-	}
-
-	PyErr_Print();
-	return 1;
-}
-
 static void py_run_user_code(const uint8_t *fc, size_t fc_len)
 {
 	if (g_py_fsbase)
@@ -209,24 +162,34 @@ static void py_run_user_code(const uint8_t *fc, size_t fc_len)
 	if (!code)
 		return;
 
-	char stack_buf[4096];
-	char *buf;
-	if (code_len < sizeof(stack_buf)) {
-		memcpy(stack_buf, code, code_len);
-		stack_buf[code_len] = '\0';
-		buf = stack_buf;
-	} else {
-		buf = malloc(code_len + 1);
-		if (!buf)
-			return;
-		memcpy(buf, code, code_len);
-		buf[code_len] = '\0';
+	/* Hand the code to the in-guest __hl_run harness (installed by
+	 * py_initialize_once, so present in every restored snapshot). It
+	 * execs the code in __main__ with sys.stdout/stderr redirected to
+	 * buffers, posts the captured output to the host via the __hl_result
+	 * tool over /dev/hcall, and returns the exit code. Fetch it fresh
+	 * each call: restore() rewinds guest memory, so a PyObject* cached
+	 * across calls would dangle. */
+	int exit_code = 1;
+	PyObject *m = PyImport_AddModule("__main__");
+	PyObject *d = m ? PyModule_GetDict(m) : NULL;
+	PyObject *fn = d ? PyDict_GetItemString(d, "__hl_run") : NULL;
+	if (fn) {
+		PyObject *codeobj =
+			PyUnicode_FromStringAndSize(code, (Py_ssize_t)code_len);
+		if (codeobj) {
+			PyObject *res =
+				PyObject_CallFunctionObjArgs(fn, codeobj, NULL);
+			Py_DECREF(codeobj);
+			if (res) {
+				exit_code = PyLong_Check(res)
+						    ? (int)PyLong_AsLong(res)
+						    : 0;
+				Py_DECREF(res);
+			} else {
+				PyErr_Print();
+			}
+		}
 	}
-
-	int exit_code = run_code_with_exceptions(buf);
-
-	if (buf != stack_buf)
-		free(buf);
 
 	if (exit_code != 0)
 		report_exit_code(exit_code);
@@ -292,6 +255,46 @@ static void py_initialize_once(void)
 		"    fd.close()\n"
 		"_hl_time.sleep = _hl_sleep\n"
 		"del _hl_time, _hl_sleep\n");
+
+	/* Install the __hl_run harness in __main__ (captured into the
+	 * post-init snapshot, so every restored call has it). It runs the
+	 * user's code with sys.stdout/stderr redirected to in-memory
+	 * buffers, then returns the captured text to the host via the
+	 * __hl_result tool over /dev/hcall (JSON, same channel as
+	 * __hl_exit/__hl_sleep). Imports are function-local so __main__
+	 * isn't polluted; SystemExit handling mirrors the previous C path. */
+	PyRun_SimpleString(
+		"def __hl_run(code):\n"
+		"    import sys, io, json, traceback, __main__\n"
+		"    _ns = __main__.__dict__\n"
+		"    _o, _e = sys.stdout, sys.stderr\n"
+		"    _ob, _eb = io.StringIO(), io.StringIO()\n"
+		"    sys.stdout, sys.stderr = _ob, _eb\n"
+		"    _code = 0\n"
+		"    try:\n"
+		"        exec(compile(code, '<hl>', 'exec'), _ns)\n"
+		"    except SystemExit as _se:\n"
+		"        _c = _se.code\n"
+		"        if _c is None:\n"
+		"            _code = 0\n"
+		"        elif isinstance(_c, int):\n"
+		"            _code = _c\n"
+		"        else:\n"
+		"            sys.stderr.write(str(_c) + '\\n')\n"
+		"            _code = 1\n"
+		"    except BaseException:\n"
+		"        traceback.print_exc()\n"
+		"        _code = 1\n"
+		"    finally:\n"
+		"        sys.stdout, sys.stderr = _o, _e\n"
+		"    try:\n"
+		"        _fd = open('/dev/hcall', 'r+b', buffering=0)\n"
+		"        _fd.write(json.dumps({'name': '__hl_result', 'args': {'stdout': _ob.getvalue(), 'stderr': _eb.getvalue()}}).encode())\n"
+		"        _fd.read()\n"
+		"        _fd.close()\n"
+		"    except Exception:\n"
+		"        pass\n"
+		"    return _code\n");
 }
 
 /* -- Entry points --------------------------------------------------- */
