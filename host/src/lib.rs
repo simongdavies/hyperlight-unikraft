@@ -2666,6 +2666,28 @@ impl Sandbox {
         Ok(self.inner.call(func_name, args)?)
     }
 
+    /// Run a string of code in the resident guest driver and return its exit code.
+    ///
+    /// Hermetic: restores the post-init snapshot before the call so guest state
+    /// (e.g. Python `__main__` / globals) does not leak between runs. The code is
+    /// delivered **per call** as the `run` function's argument — no boot-argv
+    /// baking — so distinct code does NOT re-evolve the VM; a warm restore + run is
+    /// ~hundreds of ms.
+    ///
+    /// Requires a resident-driver image (e.g. `python-agent-driver`) whose `run`
+    /// entry reads the code from the call payload, plus a snapshot to restore to
+    /// (the post-init snapshot from `build`, or a later [`snapshot_now`]). Guest
+    /// stdout/stderr currently go to the console; in-band capture is a follow-up,
+    /// so this returns only the exit code for now.
+    ///
+    /// [`snapshot_now`]: Self::snapshot_now
+    pub fn run_code(&mut self, code: &str) -> Result<i32> {
+        self.restore()?;
+        self.reset_exit_code();
+        let _: () = self.call_named("run", code.to_string())?;
+        Ok(self.last_exit_code())
+    }
+
     /// Read the exit code reported by the guest via `__hl_exit`.
     /// Defaults to 0 (success) if the guest never called it.
     pub fn last_exit_code(&self) -> i32 {
