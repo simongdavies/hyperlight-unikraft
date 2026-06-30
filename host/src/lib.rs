@@ -60,7 +60,8 @@ pub mod stderr_capture;
 
 use anyhow::{anyhow, Result};
 use hyperlight_host::func::Registerable;
-use hyperlight_host::sandbox::snapshot::{OciTag, Snapshot};
+use hyperlight_host::sandbox::snapshot::OciTag;
+pub use hyperlight_host::sandbox::snapshot::Snapshot;
 use hyperlight_host::sandbox::uninitialized::GuestEnvironment;
 use hyperlight_host::sandbox::SandboxConfiguration;
 use hyperlight_host::{GuestBinary, HostFunctions, MultiUseSandbox, UninitializedSandbox};
@@ -2872,17 +2873,36 @@ impl Sandbox {
         )
     }
 
-    fn from_snapshot_file_full<P: AsRef<Path>>(
-        path: P,
+    /// Load a persisted OCI snapshot into a shared, reference-counted handle.
+    ///
+    /// Load the golden snapshot **once per node**, then create many sandboxes from the
+    /// returned `Arc` via [`from_snapshot`](Self::from_snapshot): Hyperlight maps the
+    /// snapshot's memory copy-on-write, so the golden pages are shared across every VM and
+    /// each sandbox only pays for the pages it dirties — the basis for high VM density.
+    ///
+    /// Uses `Snapshot::load` (no SHA-256 digest verification) for speed; trust the
+    /// snapshot's provenance (written by [`save_snapshot`](Self::save_snapshot) or pulled
+    /// from a digest-pinned registry).
+    pub fn load_snapshot<P: AsRef<Path>>(path: P) -> Result<Arc<Snapshot>> {
+        let tag = OciTag::new("latest").map_err(|e| anyhow!("{e}"))?;
+        let loaded = Snapshot::load(path.as_ref(), tag).map_err(|e| anyhow!("{e}"))?;
+        Ok(Arc::new(loaded))
+    }
+
+    /// Create a `Sandbox` from an already-loaded snapshot handle, sharing its golden memory
+    /// copy-on-write with every other sandbox built from the same `Arc`.
+    ///
+    /// Pair with [`load_snapshot`](Self::load_snapshot): load the golden once per node, then
+    /// call this per execution. `preopens`/`initrd` are re-applied to each sandbox (the
+    /// guest-side mount points are fixed in the snapshot image; only the host side is
+    /// remapped). `network`/`listen_ports` configure this sandbox's egress.
+    pub fn from_snapshot(
+        snapshot: Arc<Snapshot>,
         preopens: &[Preopen],
         initrd: Option<std::path::PathBuf>,
         network: Option<&NetworkPolicy>,
         listen_ports: Option<&ListenPorts>,
     ) -> Result<Self> {
-        let tag = OciTag::new("latest").map_err(|e| anyhow!("{e}"))?;
-        let loaded = Snapshot::load(path.as_ref(), tag).map_err(|e| anyhow!("{e}"))?;
-        let arc = Arc::new(loaded);
-
         let exit_code = Arc::new(AtomicI32::new(0));
         let captured = Arc::new(Mutex::new(CapturedOutput::default()));
         let sleep_cancel = SleepCancel::new();
@@ -2898,7 +2918,7 @@ impl Sandbox {
             tools_ref.dispatch(&payload)
         })?;
 
-        let mut inner = MultiUseSandbox::from_snapshot(arc.clone(), host_funcs, None)?;
+        let mut inner = MultiUseSandbox::from_snapshot(snapshot.clone(), host_funcs, None)?;
 
         const INITRD_MAP_BASE: u64 = 0xFEF0_0000;
         if let Some(ref initrd_path) = initrd {
@@ -2907,13 +2927,24 @@ impl Sandbox {
 
         Ok(Self {
             inner,
-            snapshot: Some(arc),
+            snapshot: Some(snapshot),
             initrd_path: initrd,
             exit_code,
             captured,
             socket_table,
             sleep_cancel,
         })
+    }
+
+    fn from_snapshot_file_full<P: AsRef<Path>>(
+        path: P,
+        preopens: &[Preopen],
+        initrd: Option<std::path::PathBuf>,
+        network: Option<&NetworkPolicy>,
+        listen_ports: Option<&ListenPorts>,
+    ) -> Result<Self> {
+        let snapshot = Self::load_snapshot(path)?;
+        Self::from_snapshot(snapshot, preopens, initrd, network, listen_ports)
     }
 }
 
