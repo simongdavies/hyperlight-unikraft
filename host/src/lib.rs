@@ -2672,15 +2672,31 @@ impl Sandbox {
     /// This is a fast operation (host-level CoW via mmap) that resets all
     /// guest memory to the state captured after init.
     pub fn restore(&mut self) -> Result<()> {
+        // Opt-in per-phase timing (set HL_RESTORE_TIMING) to see where restore spends its
+        // time: the CoW snapshot rewind vs the per-call initrd re-map.
+        let timing = std::env::var_os("HL_RESTORE_TIMING").is_some();
+
+        let t = std::time::Instant::now();
         if let Some(ref snap) = self.snapshot {
             self.inner.restore(snap.clone())?;
         }
+        let restore_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        let t = std::time::Instant::now();
         const INITRD_MAP_BASE: u64 = 0xFEF0_0000;
         if let Some(ref path) = self.initrd_path {
             self.inner.map_file_cow(path, INITRD_MAP_BASE)?;
         }
+        let initrd_ms = t.elapsed().as_secs_f64() * 1000.0;
+
         if let Some(ref table) = self.socket_table {
             table.lock().unwrap().clear();
+        }
+
+        if timing {
+            eprintln!(
+                "[restore-timing] inner.restore={restore_ms:.2}ms map_file_cow(initrd)={initrd_ms:.2}ms"
+            );
         }
         Ok(())
     }
