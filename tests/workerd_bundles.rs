@@ -41,7 +41,7 @@ fn request(method: &str, url: &str, headers: Vec<Header>) -> RequestEnvelope {
 
 fn execute(bundle: WorkerBundle, request: RequestEnvelope) -> (WorkerVersionSandbox, String) {
     let version = bundle.worker_version.clone();
-    let mut worker = WorkerVersionSandbox::initialize(
+    let worker = WorkerVersionSandbox::initialize(
         bundle,
         artifact("rootfs.img"),
         artifact("executor"),

@@ -11,11 +11,13 @@
 //! and trust assumptions; this is not stock-workerd or production support.
 
 mod extensions;
+mod pool;
 mod protocol;
 mod sandbox;
 mod snapshot;
 
 pub use extensions::*;
+pub use pool::{PoolSubmitError, RequestExecution, WorkerPoolStatus, WorkerRequestPool};
 pub use protocol::*;
 pub use sandbox::{
     ExecutionProfile, InitializationFailure, InitializationProfile, WorkerVersionSandbox,

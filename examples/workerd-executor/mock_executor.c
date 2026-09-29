@@ -5,6 +5,7 @@
 #include "hl_driver.h"
 
 static int initialized;
+static unsigned int fetch_count;
 
 static int dispatch(const uint8_t *fc, size_t fc_len)
 {
@@ -24,6 +25,7 @@ static int dispatch(const uint8_t *fc, size_t fc_len)
 	}
 	if (!initialized || !fc_name_is(fc, fc_len, "fetch"))
 		return -1;
+	fetch_count++;
 	char *json = strndup(arg, len);
 	if (!json)
 		return -1;
@@ -47,12 +49,19 @@ static int dispatch(const uint8_t *fc, size_t fc_len)
 	}
 	if (strstr(json, "/sleep\""))
 		sleep(60);
+	if (strstr(json, "/delay\""))
+		usleep(300000);
 	if (strstr(json, "/stale\""))
 		strcpy(id, "stale");
 	char response[512];
+	const char *body = strstr(json, "/instance\"") ? "MQ==" : "b2s=";
 	int size = snprintf(response, sizeof(response),
 		"{\"protocol_version\":1,\"request_id\":\"%s\","
-		"\"status\":200,\"headers\":[],\"body_base64\":\"b2s=\"}\n", id);
+		"\"status\":200,\"headers\":[],\"body_base64\":\"%s\"}\n", id, body);
+	if (strstr(json, "/instance\"") && fetch_count != 1)
+		size = snprintf(response, sizeof(response),
+			"{\"protocol_version\":1,\"request_id\":\"%s\","
+			"\"status\":500,\"headers\":[],\"body_base64\":\"cmV1c2Vk\"}\n", id);
 	int result = 0;
 	if (strstr(json, "/oversized\"")) {
 		char block[4096];

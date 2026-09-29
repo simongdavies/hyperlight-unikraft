@@ -108,7 +108,7 @@ fn main() {
         scratch_mb,
         Duration::from_secs(90),
     );
-    let (mut worker, initialization) = match initialized {
+    let (worker, initialization) = match initialized {
         Ok(value) => value,
         Err(failure) => {
             emit(ProbeResult {

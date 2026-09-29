@@ -215,9 +215,9 @@ impl Responses {
 /// One immutable Worker version; no reassignment or raw sandbox escape hatch.
 /// Every request starts from the initialized snapshot. After each call the
 /// VM is dropped, including after a kill: a killed Hyperlight VM is not reused.
+#[derive(Clone)]
 pub struct WorkerVersionSandbox {
     image: VerifiedSnapshot,
-    responses: Responses,
 }
 
 impl WorkerVersionSandbox {
@@ -315,7 +315,7 @@ impl WorkerVersionSandbox {
             .map_err(|error| Self::initialization_failure("snapshot", error, &profile))?;
         profile.snapshot_ms = Self::elapsed_ms(started);
         let image = VerifiedSnapshot::initialized(snapshot, binding);
-        Ok((Self { image, responses }, profile))
+        Ok((Self { image }, profile))
     }
 
     fn elapsed_ms(started: Instant) -> f64 {
@@ -335,10 +335,7 @@ impl WorkerVersionSandbox {
     }
 
     pub fn from_verified_snapshot(image: VerifiedSnapshot) -> Self {
-        Self {
-            image,
-            responses: Responses::default(),
-        }
+        Self { image }
     }
 
     pub fn snapshot(&self) -> &VerifiedSnapshot {
@@ -350,7 +347,7 @@ impl WorkerVersionSandbox {
     }
 
     pub fn execute(
-        &mut self,
+        &self,
         version: &WorkerVersionId,
         request: RequestEnvelope,
         timeout: Duration,
@@ -359,7 +356,7 @@ impl WorkerVersionSandbox {
     }
 
     pub fn execute_profiled(
-        &mut self,
+        &self,
         version: &WorkerVersionId,
         request: RequestEnvelope,
         timeout: Duration,
@@ -385,9 +382,7 @@ impl WorkerVersionSandbox {
         if timeout.is_zero() {
             fail!(Error::Timeout);
         }
-        if let Err(error) = self.responses.clear() {
-            fail!(error);
-        }
+        let responses = Responses::default();
         profile.request_setup_ms += Self::elapsed_ms(setup_started);
 
         let restore_started = Instant::now();
@@ -399,7 +394,7 @@ impl WorkerVersionSandbox {
         profile.snapshot_restore_ms = Self::elapsed_ms(restore_started);
 
         let setup_started = Instant::now();
-        if let Err(error) = self.responses.register(&mut sandbox) {
+        if let Err(error) = responses.register(&mut sandbox) {
             fail!(error);
         }
         let mut app = AppSandbox {
@@ -408,7 +403,7 @@ impl WorkerVersionSandbox {
             exited: None,
             pending: None,
         };
-        if let Err(error) = self.responses.begin(&request.request_id) {
+        if let Err(error) = responses.begin(&request.request_id) {
             fail!(error);
         }
         profile.request_setup_ms += Self::elapsed_ms(setup_started);
@@ -425,8 +420,8 @@ impl WorkerVersionSandbox {
 
         let finish_started = Instant::now();
         let result = match result {
-            Ok(()) => self.responses.finish(),
-            Err(error) => match self.responses.clear() {
+            Ok(()) => responses.finish(),
+            Err(error) => match responses.clear() {
                 Ok(()) => Err(error),
                 Err(clear_error) => Err(clear_error),
             },

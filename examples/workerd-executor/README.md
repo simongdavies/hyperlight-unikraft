@@ -35,7 +35,8 @@ Once packaged, start the minimal host HTTP bridge with:
 ```sh
 cargo run --example workerd-demo -- \
   --bundle examples/workerd-bundles/helloworld_esm.json \
-  --bind 0.0.0.0:8787
+  --bind 0.0.0.0:8787 \
+  --max-concurrent-sandboxes 4 --queue-capacity 64
 curl http://127.0.0.1:8787/
 ```
 
@@ -51,11 +52,14 @@ hluk workerd --bundle examples/workerd-bundles/helloworld_esm.json \
   --url https://example.test/
 ```
 
-The bridge is deliberately sequential and forwards each bounded HTTP request
-to a fresh VM restored from the initialized one-Worker snapshot. It grants no
-guest filesystem or networking capability. Use `--request-timeout-ms` to set
-the watchdog deadline; a timed-out request receives HTTP 504 and the next
-request starts from a fresh VM.
+The bridge uses `--max-concurrent-sandboxes` fixed, long-lived worker threads
+(default 4). Each thread restores, runs, joins the watchdog for, and drops one
+fresh request VM before taking another job. Requests above that limit wait in a
+bounded queue (`--queue-capacity`, default 64); admission never waits for queue
+space, and overflow receives HTTP 503. It grants no guest filesystem or
+networking capability. Use `--request-timeout-ms` to set the watchdog deadline;
+a timed-out request receives HTTP 504 and later requests continue in fresh VMs.
+Both concurrency and queue capacity must be nonzero.
 
 ## Workerd-fork executor ABI
 
@@ -137,11 +141,27 @@ while a snapshot or sandbox uses it. Do not open untrusted snapshots.
 Every fetch uses a fresh VM from the initialized snapshot and drops it on
 success or failure. InterruptHandle kills a spinning VM at the deadline;
 bounded host waits also cover guest sleeps. The watchdog is joined and
-request/output state cleared before another request can run. A killed VM is
-never reused, and an instance cannot be assigned another Worker version.
+request/output state cleared before another request can run. Response state is
+created per request; unrelated VMs do not share a response collector or mutex.
+A killed VM is never reused, and an instance cannot be assigned another Worker
+version.
 Artifact loading and VM construction are not covered by the execution timeout.
 Repeated request IDs are allowed across completed requests; correlation and
 duplicate-response checks apply to the one active request, not a replay store.
+
+KVM documents vCPU ioctls as thread-affine: they should be issued from the
+thread that created the vCPU unless an ioctl is explicitly asynchronous, and
+switching threads can impose a first-ioctl penalty. The pool therefore does not
+move VMs through an async executor: restore/create, `KVM_RUN` handling, normal
+vCPU operations, teardown, and destruction all remain on one named
+`workerd-sandbox-N` thread for a request. Hyperlight's existing watchdog is the
+only cross-thread interaction. On Linux it calls `pthread_kill` with Hyperlight's
+configured real-time signal; the signal makes the owner's `KVM_RUN` return
+`EINTR`, and the owner performs all subsequent vCPU handling. The watchdog does
+not issue ordinary vCPU ioctls and is joined before VM destruction. See the
+[Linux KVM API](https://www.kernel.org/doc/html/latest/virt/kvm/api.html)
+(`KVM_RUN`, `KVM_SET_SIGNAL_MASK`) and
+[the kernel API source](https://github.com/torvalds/linux/blob/master/Documentation/virt/kvm/api.rst).
 
 `execute_profiled()` reports each host-side phase separately:
 
@@ -242,7 +262,8 @@ another:
 HYPERLIGHT_MAX_SURROGATES=2 HYPERLIGHT_INITIAL_SURROGATES=0 \
 cargo run --release --locked --example workerd-demo -- \
   --bundle examples/workerd-bundles/acceptance.json \
-  --bind 0.0.0.0:8787 --scratch-mb 512 --request-timeout-ms 500
+  --bind 0.0.0.0:8787 --scratch-mb 512 --request-timeout-ms 500 \
+  --max-concurrent-sandboxes 2 --queue-capacity 32
 ```
 
 ```sh
@@ -250,6 +271,18 @@ curl -i -X POST http://127.0.0.1:8787/hello -d hello
 curl -i -X POST http://127.0.0.1:8787/busy -d busy
 curl -i -X POST http://127.0.0.1:8787/after -d after
 ```
+
+For a bounded load check, keep `hey` concurrency at or above the configured
+sandbox count:
+
+```sh
+hey -n 200 -c 16 http://127.0.0.1:8787/hello
+```
+
+With the example configuration, up to two requests execute in parallel in two
+separate VMs, the next 32 wait in the queue, and further simultaneous admissions
+receive deterministic HTTP 503 responses. Increasing `hey -c` does not create
+unbounded VMs or an unbounded host queue.
 
 `cargo test --test workerd_sandbox` runs the real-hypervisor cases and **fails**
 if artifacts/hypervisor access are missing; it does not silently self-skip.

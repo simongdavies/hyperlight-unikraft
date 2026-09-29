@@ -4,7 +4,7 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use hyperlight_unikraft::workerd::{
     Header, MAX_BODY_BYTES, MAX_HEADER_BYTES, PROTOCOL_VERSION, RequestEnvelope, WorkerBundle,
-    WorkerVersionId, WorkerVersionSandbox,
+    WorkerRequestPool, WorkerVersionId, WorkerVersionSandbox,
 };
 use std::env;
 use std::io::{Read, Write};
@@ -17,6 +17,8 @@ const DEFAULT_ROOTFS: &str = "build-elfloader/workerd-executor/rootfs.img";
 const DEFAULT_EXECUTOR: &str = "build-elfloader/workerd-executor/executor";
 const DEFAULT_BUNDLE: &str = "examples/workerd-bundles/helloworld_esm.json";
 const MAX_REQUEST_HEAD_BYTES: usize = MAX_HEADER_BYTES + 8 * 1024;
+const DEFAULT_MAX_CONCURRENT_SANDBOXES: usize = 4;
+const DEFAULT_QUEUE_CAPACITY: usize = 64;
 
 struct Options {
     bind: String,
@@ -29,6 +31,8 @@ struct Options {
     scratch_mb: usize,
     init_timeout: Duration,
     request_timeout: Duration,
+    max_concurrent_sandboxes: usize,
+    queue_capacity: usize,
 }
 
 impl Options {
@@ -44,6 +48,8 @@ impl Options {
             scratch_mb: 512,
             init_timeout: Duration::from_secs(30),
             request_timeout: Duration::from_secs(2),
+            max_concurrent_sandboxes: DEFAULT_MAX_CONCURRENT_SANDBOXES,
+            queue_capacity: DEFAULT_QUEUE_CAPACITY,
         };
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -78,17 +84,29 @@ impl Options {
                 "--request-timeout-ms" => {
                     options.request_timeout = duration(value()?, "--request-timeout-ms")?
                 }
+                "--max-concurrent-sandboxes" => {
+                    options.max_concurrent_sandboxes =
+                        nonzero_usize(value()?, "--max-concurrent-sandboxes")?
+                }
+                "--queue-capacity" => {
+                    options.queue_capacity = nonzero_usize(value()?, "--queue-capacity")?
+                }
                 "--help" | "-h" => {
                     return Err(format!(
                         "usage: workerd-demo [--bind ADDR] [--rootfs CPIO] \
                          [--executor ELF] [--version ID] [--scratch-mb MIB] \
                          [--bundle JSON | --script JS] [--compatibility-date YYYY-MM-DD] \
-                         [--init-timeout-ms MS] [--request-timeout-ms MS]\n\
+                         [--init-timeout-ms MS] [--request-timeout-ms MS] \
+                         [--max-concurrent-sandboxes N] [--queue-capacity N]\n\
                          defaults: --bind 0.0.0.0:8787 --rootfs {DEFAULT_ROOTFS} \
                          --executor {DEFAULT_EXECUTOR} --version demo-v1 \
                          --bundle {DEFAULT_BUNDLE} \
                          --scratch-mb 512 --init-timeout-ms 30000 \
-                         --request-timeout-ms 2000"
+                         --request-timeout-ms 2000 \
+                         --max-concurrent-sandboxes {DEFAULT_MAX_CONCURRENT_SANDBOXES} \
+                         --queue-capacity {DEFAULT_QUEUE_CAPACITY}\n\
+                         Each worker owns every VM it restores, runs, and drops. Requests above \
+                         the sandbox limit queue up to --queue-capacity; overflow receives HTTP 503."
                     ));
                 }
                 _ => return Err(format!("unknown argument: {arg}")),
@@ -96,6 +114,16 @@ impl Options {
         }
         Ok(options)
     }
+}
+
+fn nonzero_usize(value: String, flag: &str) -> Result<usize, String> {
+    let value = value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid {flag}"))?;
+    if value == 0 {
+        return Err(format!("{flag} must be nonzero"));
+    }
+    Ok(value)
 }
 
 fn duration(value: String, flag: &str) -> Result<Duration, String> {
@@ -135,19 +163,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let bundle_sha256 = bundle.sha256()?;
     let version = bundle.worker_version.clone();
-    let mut worker = WorkerVersionSandbox::initialize(
+    let worker = WorkerVersionSandbox::initialize(
         bundle,
         &options.rootfs,
         &options.executor,
         options.scratch_mb,
         options.init_timeout,
     )?;
+    let pool = WorkerRequestPool::new(
+        worker,
+        options.max_concurrent_sandboxes,
+        options.queue_capacity,
+    )?;
     let listener = TcpListener::bind(&options.bind)?;
     eprintln!(
-        "workerd demo listening on http://{} (Worker {}, bundle {})",
+        "workerd demo listening on http://{} (Worker {}, bundle {}, {} sandboxes, queue {})",
         listener.local_addr()?,
         version.as_str(),
-        bundle_sha256
+        bundle_sha256,
+        options.max_concurrent_sandboxes,
+        options.queue_capacity
     );
     let sequence = AtomicU64::new(1);
     for connection in listener.incoming() {
@@ -159,42 +194,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
         let request_id = format!("http-{}", sequence.fetch_add(1, Ordering::Relaxed));
-        if let Err(error) = serve(
-            &mut stream,
-            &mut worker,
-            &version,
-            request_id,
-            options.request_timeout,
-        ) {
-            eprintln!("request failed: {error}");
-            let _ = write_error(&mut stream, 500, "worker request failed");
+        if let Err(error) = stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .and_then(|()| stream.set_write_timeout(Some(Duration::from_secs(5))))
+        {
+            eprintln!("connection setup failed: {error}");
+            continue;
         }
+        let request = match read_request(&mut stream, request_id) {
+            Ok(request) => request,
+            Err(error) => {
+                if let Err(write_error) = write_error(&mut stream, 400, &error) {
+                    eprintln!("bad request response failed: {write_error}");
+                }
+                continue;
+            }
+        };
+        let _ = pool.try_submit(request, options.request_timeout, move |execution| {
+            if let Err(error) = finish_request(&mut stream, execution) {
+                eprintln!("request response failed: {error}");
+            }
+        });
     }
     Ok(())
 }
 
-fn serve(
+fn finish_request(
     stream: &mut TcpStream,
-    worker: &mut WorkerVersionSandbox,
-    version: &WorkerVersionId,
-    request_id: String,
-    timeout: Duration,
+    execution: hyperlight_unikraft::workerd::RequestExecution,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    let request = match read_request(stream, request_id.clone()) {
-        Ok(request) => request,
-        Err(error) => {
-            write_error(stream, 400, &error)?;
-            return Ok(());
-        }
-    };
-    let (result, profile) = worker.execute_profiled(version, request, timeout);
+    let request_id = execution.request_id;
     eprintln!(
         "workerd request {request_id}: {}",
-        serde_json::to_string(&profile)?
+        serde_json::to_string(&execution.profile)?
     );
-    match result {
+    if execution.submit_error.is_some() {
+        write_error(stream, 503, "Worker request queue is full")?;
+        return Ok(());
+    }
+    match execution.result {
         Ok(response) => {
             let body = STANDARD.decode(response.body_base64)?;
             write!(
@@ -336,6 +374,7 @@ fn reason(status: u16) -> &'static str {
         404 => "Not Found",
         500 => "Internal Server Error",
         502 => "Bad Gateway",
+        503 => "Service Unavailable",
         504 => "Gateway Timeout",
         _ => "Worker Response",
     }

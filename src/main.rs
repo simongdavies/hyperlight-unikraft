@@ -525,7 +525,7 @@ fn cmd_workerd(args: WorkerdArgs) -> CliResult<()> {
     };
     let version = bundle.worker_version.clone();
     let bundle_sha256 = bundle.sha256()?;
-    let mut worker = WorkerVersionSandbox::initialize(
+    let worker = WorkerVersionSandbox::initialize(
         bundle,
         args.rootfs,
         args.executor,

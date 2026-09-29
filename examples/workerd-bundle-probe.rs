@@ -51,7 +51,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let bundle = WorkerBundle::from_path(bundle_path)?;
     let bundle_sha256 = bundle.sha256()?;
     let version = bundle.worker_version.clone();
-    let mut worker = WorkerVersionSandbox::initialize(
+    let worker = WorkerVersionSandbox::initialize(
         bundle,
         "build-elfloader/workerd-executor/rootfs.img",
         "build-elfloader/workerd-executor/executor",
