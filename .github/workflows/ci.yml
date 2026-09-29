@@ -92,7 +92,7 @@ jobs:
 
       - name: Cache key
         id: key
-        run: echo "key=rootfs-${{ hashFiles('drivers/**', 'conformance/python/**', 'examples/agent/custom/Dockerfile', 'examples/c/**', 'examples/rust/**', 'examples/go/**', 'examples/dotnet-aot/**', 'examples/autonomous/**', 'examples/http-server/**', 'examples/agent-framework/local.Dockerfile', 'demos/pptx-gen/Dockerfile.rootfs') }}" >> "$GITHUB_OUTPUT"
+        run: echo "key=rootfs-${{ hashFiles('drivers/**', 'conformance/python/**', 'examples/agent/custom/Dockerfile', 'examples/c/**', 'examples/rust/**', 'examples/go/**', 'examples/dotnet-aot/**', 'examples/workerd-executor/**', 'examples/autonomous/**', 'examples/http-server/**', 'examples/agent-framework/local.Dockerfile', 'demos/pptx-gen/Dockerfile.rootfs') }}" >> "$GITHUB_OUTPUT"
 
       - name: Cache guest images and test binaries
         id: rootfs-cache
@@ -123,6 +123,7 @@ jobs:
       - name: Build rootfs images, conformance image and test binaries
         if: steps.rootfs-cache.outputs.cache-hit != 'true'
         run: |
+          just guests
           just build-all-rootfs
           just build-conformance python
           just build-test-bins

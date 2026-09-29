@@ -2,8 +2,9 @@
 // Copyright 2026 The Hyperlight Authors.
 use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use base64::{Engine, engine::general_purpose::STANDARD};
 use clap::{Parser, Subcommand};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -44,6 +45,9 @@ enum Command {
     /// Benchmark modes with structured timing output.
     #[command(subcommand)]
     Bench(BenchCommand),
+
+    /// Initialize, snapshot, fresh-restore and fetch a trusted Worker bundle.
+    Workerd(WorkerdArgs),
 }
 
 #[derive(Subcommand)]
@@ -53,6 +57,49 @@ enum SnapshotCommand {
 
     /// Restore a guest from a saved snapshot and dispatch commands.
     Run(SnapshotRunArgs),
+}
+
+#[derive(clap::Args)]
+struct WorkerdArgs {
+    /// Trusted protocol-v1 Worker bundle JSON.
+    #[arg(long, conflicts_with = "script")]
+    bundle: Option<PathBuf>,
+
+    /// Convenience single ES module; source is sent only during initialization.
+    #[arg(long, conflicts_with = "bundle")]
+    script: Option<PathBuf>,
+
+    /// Worker version for --script.
+    #[arg(long, default_value = "cli-v1")]
+    version: String,
+
+    /// Compatibility date for --script.
+    #[arg(long, default_value = "2025-01-01")]
+    compatibility_date: String,
+
+    /// Packaged executor image/rootfs.
+    #[arg(long, default_value = "build-elfloader/workerd-executor/rootfs.img")]
+    rootfs: PathBuf,
+
+    /// Matching trusted executor artifact.
+    #[arg(long, default_value = "build-elfloader/workerd-executor/executor")]
+    executor: PathBuf,
+
+    /// Request URL.
+    #[arg(long, default_value = "https://example.test/")]
+    url: String,
+
+    /// Scratch memory in MiB.
+    #[arg(long, default_value_t = 512)]
+    scratch_mb: usize,
+
+    /// Initialization timeout in milliseconds.
+    #[arg(long, default_value_t = 90_000)]
+    init_timeout_ms: u64,
+
+    /// Fetch timeout in milliseconds.
+    #[arg(long, default_value_t = 10_000)]
+    request_timeout_ms: u64,
 }
 
 /// Arguments for `run` — boot the embedded kernel + initrd and dispatch.
@@ -441,6 +488,7 @@ fn cmd_run(args: RunArgs) -> CliResult<()> {
     if let Some(entry) = args.entry {
         builder = builder.entry(entry);
     }
+
     if let Some(policy) = policy {
         builder = builder.network(policy);
     }
@@ -455,6 +503,60 @@ fn cmd_run(args: RunArgs) -> CliResult<()> {
     info!(elapsed_ms = t.elapsed().as_secs_f64() * 1000.0, "boot");
 
     drive(&mut sandbox, no_workload, exec)
+}
+
+fn cmd_workerd(args: WorkerdArgs) -> CliResult<()> {
+    use hyperlight_unikraft::workerd::{
+        PROTOCOL_VERSION, RequestEnvelope, WorkerBundle, WorkerVersionId, WorkerVersionSandbox,
+    };
+
+    let bundle = match (args.bundle, args.script) {
+        (Some(path), None) => WorkerBundle::from_path(path)?,
+        (None, Some(path)) => WorkerBundle::single_script(
+            WorkerVersionId::new(args.version)?,
+            args.compatibility_date,
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("worker.js"),
+            std::fs::read_to_string(&path)?,
+        )?,
+        (None, None) => WorkerBundle::from_path("examples/workerd-bundles/helloworld_esm.json")?,
+        (Some(_), Some(_)) => unreachable!("clap rejects conflicting arguments"),
+    };
+    let version = bundle.worker_version.clone();
+    let bundle_sha256 = bundle.sha256()?;
+    let mut worker = WorkerVersionSandbox::initialize(
+        bundle,
+        args.rootfs,
+        args.executor,
+        args.scratch_mb,
+        Duration::from_millis(args.init_timeout_ms),
+    )?;
+    let request = RequestEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        request_id: "cli-1".into(),
+        method: "GET".into(),
+        url: args.url,
+        headers: Vec::new(),
+        body_base64: String::new(),
+    };
+    let (response, profile) = worker.execute_profiled(
+        &version,
+        request,
+        Duration::from_millis(args.request_timeout_ms),
+    );
+    eprintln!(
+        "worker={} bundle={} profile={}",
+        version.as_str(),
+        bundle_sha256,
+        serde_json::to_string(&profile)?
+    );
+    let response = response?;
+    std::io::Write::write_all(
+        &mut std::io::stdout(),
+        &STANDARD.decode(response.body_base64)?,
+    )?;
+    Ok(())
 }
 
 /// Run the workload in a booted guest.  With nothing to run and no driver
@@ -919,6 +1021,7 @@ fn cli_main() -> CliResult<()> {
 
     match cli.command {
         Command::Run(args) => cmd_run(args),
+        Command::Workerd(args) => cmd_workerd(args),
         Command::Snapshot(cmd) => match cmd {
             SnapshotCommand::Save(args) => cmd_snapshot_save(args),
             SnapshotCommand::Run(args) => cmd_snapshot_run(args),
@@ -936,6 +1039,23 @@ fn cli_main() -> CliResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workerd_bundle_and_script_are_exclusive() {
+        assert!(
+            Cli::try_parse_from([
+                "hluk",
+                "workerd",
+                "--bundle",
+                "bundle.json",
+                "--script",
+                "worker.js"
+            ])
+            .is_err()
+        );
+        let cli = Cli::try_parse_from(["hluk", "workerd", "--bundle", "bundle.json"]).unwrap();
+        assert!(matches!(cli.command, Command::Workerd(_)));
+    }
 
     #[test]
     fn parse_envs_basic() {

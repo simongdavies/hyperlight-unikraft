@@ -75,11 +75,50 @@ build *flags:
 build *flags:
     if ("{{flags}}" -match '--debug') { cargo build --manifest-path "{{root_dir}}/Cargo.toml" } else { cargo build --release --manifest-path "{{root_dir}}/Cargo.toml" }
 
+# Workerd foundation validation uses the release's existing target features.
+fmt-apply:
+    cargo fmt --all --manifest-path "{{root_dir}}/Cargo.toml"
+
+clippy:
+    cargo clippy --all-targets --locked --manifest-path "{{root_dir}}/Cargo.toml" -- -D warnings
+
+# Cross-check only: this does not qualify macOS runtime or HVF support.
+# Requires rustup target add aarch64-apple-darwin and the target C toolchain.
+clippym:
+    cargo clippy --all-targets --locked --target aarch64-apple-darwin --manifest-path "{{root_dir}}/Cargo.toml" -- -D warnings
+
+clippyw:
+    cargo clippy --all-targets --locked --target x86_64-pc-windows-gnu --manifest-path "{{root_dir}}/Cargo.toml" -- -D warnings
+
+# Build the changed fixture, not unrelated runtime images.
+[unix]
+guests:
+    bash "{{examples_dir}}/workerd-executor/build-rootfs.sh" \
+        --mock "{{build_dir}}/workerd-executor-fixture"
+
+# The native Linux fixture needs gcc + cpio. WSL builds in this worktree.
+[windows]
+guests:
+    wsl.exe -d Ubuntu-24.04 -- bash -c 'cd "$(wslpath -u "{{root_dir}}")" && bash examples/workerd-executor/build-rootfs.sh --mock build-elfloader/workerd-executor-fixture'
+
+# Initialize, snapshot, fresh-restore and fetch one trusted Worker bundle.
+workerd-bundle-probe bundle url="https://example.test/" scratch="512":
+    cargo run --release --locked --example workerd-bundle-probe -- \
+        "{{bundle}}" "{{url}}" "{{scratch}}"
+
+# Representative ECMA-429/WPT-derived Web API smoke (not conformance).
+workerd-api-probe scratch="512":
+    cargo run --release --locked --example workerd-bundle-probe -- \
+        examples/workerd-bundles/api-smoke.json \
+        https://example.test/wintertc-smoke "{{scratch}}" POST x-smoke:yes
+
 # ── Kernel ───────────────────────────────────────────────────────
 
 kernel_dir    := root_dir / "kernel"
 kernel_bin    := kernel_dir / "elfloader_hyperlight-x86_64"
 kernel_build  := kernel_dir / ".build"
+workerd_kernel_bin   := kernel_dir / "workerd_hyperlight-x86_64"
+workerd_kernel_build := kernel_dir / ".build-workerd"
 
 # Native test-fixture kernel (a C main() compiled into the kernel — no
 # elfloader/initrd), used by tests/native_kernel.rs.
@@ -136,6 +175,17 @@ build-kernel:
 build-kernel:
     @Write-Error "build-kernel needs Docker on Linux. Build there (just build-kernel) and commit kernel/elfloader_hyperlight-x86_64."; exit 1
 
+# Build the workerd-specific elfloader. Its initrd is the static executor ELF
+# itself, so boot does not duplicate it through CPIO extraction into RAMFS.
+[unix]
+build-workerd-kernel:
+    sed 's/\r$//' "{{root_dir}}/tools/build-workerd-kernel.sh" | \
+        HLUK_ROOT="{{root_dir}}" bash -s -- "{{workerd_kernel_bin}}"
+
+[windows]
+build-workerd-kernel:
+    @Write-Error "build-workerd-kernel needs Docker on Linux; run it inside WSL."; exit 1
+
 # Verify the committed kernel binary matches a fresh build.
 # Returns exit 0 if they match, exit 1 if they differ.
 [unix]
@@ -189,6 +239,26 @@ verify-kernel:
 [windows]
 verify-kernel:
     @Write-Error "verify-kernel needs Docker on Linux; run it there."; exit 1
+
+[unix]
+verify-workerd-kernel:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    committed="$(sha256sum "{{workerd_kernel_bin}}" | cut -d' ' -f1)"
+    fresh="{{kernel_dir}}/.workerd-verify.bin"
+    trap 'rm -f -- "$fresh"' EXIT
+    sed 's/\r$//' "{{root_dir}}/tools/build-workerd-kernel.sh" | \
+        HLUK_ROOT="{{root_dir}}" bash -s -- "$fresh" >/dev/null
+    rebuilt="$(sha256sum "$fresh" | cut -d' ' -f1)"
+    if [ "$committed" != "$rebuilt" ]; then
+        echo "workerd kernel rebuild changed: $committed -> $rebuilt" >&2
+        exit 1
+    fi
+    echo "✓ Workerd kernel matches source (sha256: $committed)"
+
+[windows]
+verify-workerd-kernel:
+    @Write-Error "verify-workerd-kernel needs Docker on Linux; run it inside WSL."; exit 1
 
 # Build the native test-fixture kernel from source, reproducibly, in the same
 # Docker toolchain as the elfloader kernel.  Sources live in the fixture dir;

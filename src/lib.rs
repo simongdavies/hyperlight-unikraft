@@ -39,6 +39,7 @@ mod errno;
 mod hostfs;
 mod hostnet;
 pub mod net_policy;
+pub mod workerd;
 
 pub use net_policy::{AllowList, BlockList, ListenPorts, NetworkPolicy, ResolveError};
 
@@ -138,6 +139,10 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Embedded Unikraft app-elfloader kernel binary.
 static KERNEL: &[u8] = include_bytes!("../kernel/elfloader_hyperlight-x86_64");
+
+/// Workerd kernel that loads a trusted static PIE directly from the mapped
+/// initrd, avoiding the CPIO-to-RAMFS executor copy.
+static WORKERD_KERNEL: &[u8] = include_bytes!("../kernel/workerd_hyperlight-x86_64");
 
 /// GPA where the initrd is mapped via `map_file_cow`.
 ///
@@ -943,6 +948,53 @@ fn assemble_sandbox(
     network: Option<NetworkPolicy>,
     listen_ports: Option<ListenPorts>,
 ) -> Result<(UninitializedSandbox, GuestConfig)> {
+    let guest_binary = match kernel {
+        Some(path) => {
+            info!(path = %path.display(), "booting external kernel (advanced)");
+            GuestBinary::FilePath(path.clone())
+        }
+        None => GuestBinary::Buffer(KERNEL.to_vec()),
+    };
+    assemble_sandbox_from_binary(
+        guest_binary,
+        initrd,
+        entry,
+        scratch_mb,
+        mounts,
+        network,
+        listen_ports,
+    )
+}
+
+fn assemble_sandbox_with_embedded_kernel(
+    embedded_kernel: &[u8],
+    initrd: &Option<PathBuf>,
+    entry: &Option<String>,
+    scratch_mb: usize,
+    mounts: Vec<Mount>,
+    network: Option<NetworkPolicy>,
+    listen_ports: Option<ListenPorts>,
+) -> Result<(UninitializedSandbox, GuestConfig)> {
+    assemble_sandbox_from_binary(
+        GuestBinary::Buffer(embedded_kernel.to_vec()),
+        initrd,
+        entry,
+        scratch_mb,
+        mounts,
+        network,
+        listen_ports,
+    )
+}
+
+fn assemble_sandbox_from_binary(
+    guest_binary: GuestBinary,
+    initrd: &Option<PathBuf>,
+    entry: &Option<String>,
+    scratch_mb: usize,
+    mounts: Vec<Mount>,
+    network: Option<NetworkPolicy>,
+    listen_ports: Option<ListenPorts>,
+) -> Result<(UninitializedSandbox, GuestConfig)> {
     let scratch_size = scratch_mb * 1024 * 1024;
     let mut cfg = SandboxConfiguration::default();
     cfg.set_scratch_size(scratch_size);
@@ -954,13 +1006,6 @@ fn assemble_sandbox(
     // Permit the guest to touch the MSRs the Unikraft kernel programs
     apply_guest_msrs(&mut cfg)?;
 
-    let guest_binary = match kernel {
-        Some(path) => {
-            info!(path = %path.display(), "booting external kernel (advanced)");
-            GuestBinary::FilePath(path.clone())
-        }
-        None => GuestBinary::Buffer(KERNEL.to_vec()),
-    };
     let mut usandbox = UninitializedSandbox::new(guest_binary, Some(cfg))?;
 
     let (initrd_base, initrd_size) = if let Some(path) = initrd {

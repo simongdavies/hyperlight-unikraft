@@ -1,0 +1,14 @@
+{
+  "protocol_version": 1,
+  "worker_version": "acceptance-v1",
+  "compatibility_date": "2025-01-01",
+  "compatibility_flags": [],
+  "main_module": "worker.js",
+  "modules": [
+    {
+      "name": "worker.js",
+      "type": "esModule",
+      "source": "export default {\n  fetch(request) {\n    const path = new URL(request.url).pathname;\n    if (path === \"/busy\") for (;;) {}\n    return Response.json({ path, method: request.method });\n  }\n};\n"
+    }
+  ]
+}
