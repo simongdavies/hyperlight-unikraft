@@ -6,7 +6,7 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use hyperlight_unikraft::workerd::{
     Error, MAX_BODY_BYTES, PROTOCOL_VERSION, RequestEnvelope, SnapshotBinding, VerifiedSnapshot,
-    WorkerBundle, WorkerRequestPool, WorkerVersionId, WorkerVersionSandbox,
+    WorkerBundle, WorkerPoolRestoreMode, WorkerRequestPool, WorkerVersionId, WorkerVersionSandbox,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -328,6 +328,89 @@ fn request_pool_parallelism_bounds_queue_isolation_and_timeout_recovery() {
         assert_eq!(response.status, 200, "request VM was reused");
         assert_eq!(STANDARD.decode(response.body_base64).unwrap(), b"1");
     }
+}
+
+#[test]
+fn prewarmed_pool_is_ready_one_shot_bounded_and_replenishes() {
+    #[cfg(windows)]
+    hyperlight_unikraft::configure_surrogates(4);
+    let (rootfs, executor) = artifacts();
+    let version = WorkerVersionId::new("prewarmed-worker-v1").unwrap();
+    let worker = WorkerVersionSandbox::initialize(
+        bundle(version, "export default {}"),
+        &rootfs,
+        &executor,
+        64,
+        Duration::from_secs(10),
+    )
+    .expect("real hypervisor must boot the v0.14 fixture");
+    let pool = WorkerRequestPool::with_restore_mode(
+        worker,
+        1,
+        2,
+        WorkerPoolRestoreMode::Prewarmed {
+            sandboxes: 2,
+            max_concurrent_restores: 1,
+        },
+    )
+    .unwrap();
+    wait_for_status(&pool, |status| {
+        status.ready == 2 && status.replenishing == 0
+    });
+
+    let (tx, rx) = mpsc::channel();
+    for id in ["burst-a", "burst-b", "burst-c"] {
+        let tx = tx.clone();
+        pool.try_submit(
+            request(id, "delay"),
+            Duration::from_secs(5),
+            move |result| {
+                let _ = tx.send(result);
+            },
+        )
+        .unwrap();
+    }
+    wait_for_status(&pool, |status| status.active == 1 && status.queued == 2);
+    assert_eq!(
+        pool.try_submit(
+            request("overflow", "instance"),
+            Duration::from_secs(5),
+            |_| {},
+        ),
+        Err(hyperlight_unikraft::workerd::PoolSubmitError::Full)
+    );
+    for _ in 0..3 {
+        let execution = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(execution.result.is_ok());
+        assert_eq!(execution.profile.snapshot_restore_ms, 0.0);
+        assert!(execution.profile.replenishment_restore_ms > 0.0);
+        assert!(pool.status().active <= 1);
+        assert!(pool.status().replenishing <= 1);
+    }
+    wait_for_status(&pool, |status| {
+        status.ready == 2 && status.replenishing == 0
+    });
+
+    for id in ["fresh-one", "fresh-two"] {
+        let tx = tx.clone();
+        pool.try_submit(
+            request(id, "instance"),
+            Duration::from_secs(5),
+            move |result| {
+                let _ = tx.send(result);
+            },
+        )
+        .unwrap();
+        let response = rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(STANDARD.decode(response.body_base64).unwrap(), b"1");
+    }
+    wait_for_status(&pool, |status| {
+        status.ready == 2 && status.replenishing == 0
+    });
 }
 
 #[allow(clippy::permissions_set_readonly_false)]

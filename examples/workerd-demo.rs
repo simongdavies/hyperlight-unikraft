@@ -4,7 +4,7 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use hyperlight_unikraft::workerd::{
     Header, MAX_BODY_BYTES, MAX_HEADER_BYTES, PROTOCOL_VERSION, RequestEnvelope, WorkerBundle,
-    WorkerRequestPool, WorkerVersionId, WorkerVersionSandbox,
+    WorkerPoolRestoreMode, WorkerRequestPool, WorkerVersionId, WorkerVersionSandbox,
 };
 use std::env;
 use std::io::{Read, Write};
@@ -18,7 +18,15 @@ const DEFAULT_EXECUTOR: &str = "build-elfloader/workerd-executor/executor";
 const DEFAULT_BUNDLE: &str = "examples/workerd-bundles/helloworld_esm.json";
 const MAX_REQUEST_HEAD_BYTES: usize = MAX_HEADER_BYTES + 8 * 1024;
 const DEFAULT_MAX_CONCURRENT_SANDBOXES: usize = 4;
+const DEFAULT_PREWARMED_SANDBOXES: usize = 4;
+const DEFAULT_MAX_CONCURRENT_RESTORES: usize = 1;
 const DEFAULT_QUEUE_CAPACITY: usize = 64;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RestoreMode {
+    OnDemand,
+    Prewarmed,
+}
 
 struct Options {
     bind: String,
@@ -31,6 +39,9 @@ struct Options {
     scratch_mb: usize,
     init_timeout: Duration,
     request_timeout: Duration,
+    restore_mode: RestoreMode,
+    prewarmed_sandboxes: usize,
+    max_concurrent_restores: Option<usize>,
     max_concurrent_sandboxes: usize,
     queue_capacity: usize,
 }
@@ -48,6 +59,9 @@ impl Options {
             scratch_mb: 512,
             init_timeout: Duration::from_secs(30),
             request_timeout: Duration::from_secs(2),
+            restore_mode: RestoreMode::OnDemand,
+            prewarmed_sandboxes: DEFAULT_PREWARMED_SANDBOXES,
+            max_concurrent_restores: None,
             max_concurrent_sandboxes: DEFAULT_MAX_CONCURRENT_SANDBOXES,
             queue_capacity: DEFAULT_QUEUE_CAPACITY,
         };
@@ -84,6 +98,14 @@ impl Options {
                 "--request-timeout-ms" => {
                     options.request_timeout = duration(value()?, "--request-timeout-ms")?
                 }
+                "--restore-mode" => options.restore_mode = parse_restore_mode(&value()?)?,
+                "--prewarmed-sandboxes" => {
+                    options.prewarmed_sandboxes = nonzero_usize(value()?, "--prewarmed-sandboxes")?
+                }
+                "--max-concurrent-restores" => {
+                    options.max_concurrent_restores =
+                        Some(nonzero_usize(value()?, "--max-concurrent-restores")?)
+                }
                 "--max-concurrent-sandboxes" => {
                     options.max_concurrent_sandboxes =
                         nonzero_usize(value()?, "--max-concurrent-sandboxes")?
@@ -97,23 +119,52 @@ impl Options {
                          [--executor ELF] [--version ID] [--scratch-mb MIB] \
                          [--bundle JSON | --script JS] [--compatibility-date YYYY-MM-DD] \
                          [--init-timeout-ms MS] [--request-timeout-ms MS] \
+                         [--restore-mode on-demand|prewarmed] [--prewarmed-sandboxes N] \
+                         [--max-concurrent-restores N] \
                          [--max-concurrent-sandboxes N] [--queue-capacity N]\n\
                          defaults: --bind 0.0.0.0:8787 --rootfs {DEFAULT_ROOTFS} \
                          --executor {DEFAULT_EXECUTOR} --version demo-v1 \
                          --bundle {DEFAULT_BUNDLE} \
                          --scratch-mb 512 --init-timeout-ms 30000 \
                          --request-timeout-ms 2000 \
+                         --restore-mode on-demand \
+                         --prewarmed-sandboxes {DEFAULT_PREWARMED_SANDBOXES} \
+                         --max-concurrent-restores {DEFAULT_MAX_CONCURRENT_RESTORES} (prewarmed) \
                          --max-concurrent-sandboxes {DEFAULT_MAX_CONCURRENT_SANDBOXES} \
                          --queue-capacity {DEFAULT_QUEUE_CAPACITY}\n\
-                         Each worker owns every VM it restores, runs, and drops. Requests above \
-                         the sandbox limit queue up to --queue-capacity; overflow receives HTTP 503."
+                         On-demand owners restore one fresh VM per request. Prewarmed owners restore \
+                         before advertising readiness, execute at most one request, drop the VM, and \
+                         replenish. --max-concurrent-restores bounds restore CPU pressure and \
+                         --max-concurrent-sandboxes remains the active execution cap; \
+                         requests above it queue up to --queue-capacity and overflow receives HTTP 503."
                     ));
                 }
                 _ => return Err(format!("unknown argument: {arg}")),
             }
         }
+        validate_restore_options(options.restore_mode, options.max_concurrent_restores)?;
         Ok(options)
     }
+}
+
+fn parse_restore_mode(value: &str) -> Result<RestoreMode, String> {
+    match value {
+        "on-demand" => Ok(RestoreMode::OnDemand),
+        "prewarmed" => Ok(RestoreMode::Prewarmed),
+        _ => Err("--restore-mode must be on-demand or prewarmed".to_string()),
+    }
+}
+
+fn validate_restore_options(
+    mode: RestoreMode,
+    max_concurrent_restores: Option<usize>,
+) -> Result<(), String> {
+    if mode == RestoreMode::OnDemand && max_concurrent_restores.is_some() {
+        return Err(
+            "--max-concurrent-restores is only valid with --restore-mode prewarmed".to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn nonzero_usize(value: String, flag: &str) -> Result<usize, String> {
@@ -170,18 +221,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         options.scratch_mb,
         options.init_timeout,
     )?;
-    let pool = WorkerRequestPool::new(
+    let restore_mode = match options.restore_mode {
+        RestoreMode::OnDemand => WorkerPoolRestoreMode::OnDemand,
+        RestoreMode::Prewarmed => WorkerPoolRestoreMode::Prewarmed {
+            sandboxes: options.prewarmed_sandboxes,
+            max_concurrent_restores: options
+                .max_concurrent_restores
+                .unwrap_or(DEFAULT_MAX_CONCURRENT_RESTORES),
+        },
+    };
+    let pool = WorkerRequestPool::with_restore_mode(
         worker,
         options.max_concurrent_sandboxes,
         options.queue_capacity,
+        restore_mode,
     )?;
     let listener = TcpListener::bind(&options.bind)?;
     eprintln!(
-        "workerd demo listening on http://{} (Worker {}, bundle {}, {} sandboxes, queue {})",
+        "workerd demo listening on http://{} (Worker {}, bundle {}, restore {}, {} active, {} owners, {} restores, queue {})",
         listener.local_addr()?,
         version.as_str(),
         bundle_sha256,
+        match options.restore_mode {
+            RestoreMode::OnDemand => "on-demand",
+            RestoreMode::Prewarmed => "prewarmed",
+        },
         options.max_concurrent_sandboxes,
+        match options.restore_mode {
+            RestoreMode::OnDemand => options.max_concurrent_sandboxes,
+            RestoreMode::Prewarmed => options.prewarmed_sandboxes,
+        },
+        match options.restore_mode {
+            RestoreMode::OnDemand => options.max_concurrent_sandboxes,
+            RestoreMode::Prewarmed => options
+                .max_concurrent_restores
+                .unwrap_or(DEFAULT_MAX_CONCURRENT_RESTORES),
+        },
         options.queue_capacity
     );
     let sequence = AtomicU64::new(1);
@@ -228,8 +303,8 @@ fn finish_request(
         "workerd request {request_id}: {}",
         serde_json::to_string(&execution.profile)?
     );
-    if execution.submit_error.is_some() {
-        write_error(stream, 503, "Worker request queue is full")?;
+    if let Some(error) = execution.submit_error {
+        write_error(stream, 503, submit_error_message(error))?;
         return Ok(());
     }
     match execution.result {
@@ -264,6 +339,18 @@ fn finish_request(
         }
     }
     Ok(())
+}
+
+fn submit_error_message(error: hyperlight_unikraft::workerd::PoolSubmitError) -> &'static str {
+    match error {
+        hyperlight_unikraft::workerd::PoolSubmitError::Full => "Worker request queue is full",
+        hyperlight_unikraft::workerd::PoolSubmitError::ShuttingDown => {
+            "Worker request pool is shutting down"
+        }
+        hyperlight_unikraft::workerd::PoolSubmitError::Unavailable => {
+            "Worker request pool is unavailable"
+        }
+    }
 }
 
 fn read_request(stream: &mut TcpStream, request_id: String) -> Result<RequestEnvelope, String> {
@@ -377,5 +464,43 @@ fn reason(status: u16) -> &'static str {
         503 => "Service Unavailable",
         504 => "Gateway Timeout",
         _ => "Worker Response",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restore_mode_switch_accepts_only_documented_values() {
+        assert_eq!(parse_restore_mode("on-demand"), Ok(RestoreMode::OnDemand));
+        assert_eq!(parse_restore_mode("prewarmed"), Ok(RestoreMode::Prewarmed));
+        assert!(parse_restore_mode("warm").is_err());
+    }
+
+    #[test]
+    fn restore_limit_is_prewarmed_only() {
+        assert!(validate_restore_options(RestoreMode::OnDemand, None).is_ok());
+        assert!(validate_restore_options(RestoreMode::Prewarmed, None).is_ok());
+        assert!(validate_restore_options(RestoreMode::Prewarmed, Some(2)).is_ok());
+        assert!(validate_restore_options(RestoreMode::OnDemand, Some(1)).is_err());
+    }
+
+    #[test]
+    fn submit_errors_have_distinct_service_unavailable_messages() {
+        use hyperlight_unikraft::workerd::PoolSubmitError;
+
+        assert_eq!(
+            submit_error_message(PoolSubmitError::Full),
+            "Worker request queue is full"
+        );
+        assert_eq!(
+            submit_error_message(PoolSubmitError::Unavailable),
+            "Worker request pool is unavailable"
+        );
+        assert_eq!(
+            submit_error_message(PoolSubmitError::ShuttingDown),
+            "Worker request pool is shutting down"
+        );
     }
 }

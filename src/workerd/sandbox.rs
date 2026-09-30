@@ -22,6 +22,9 @@ pub struct InitializationProfile {
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct ExecutionProfile {
+    pub ready_wait_ms: f64,
+    pub replenishment_wait_ms: f64,
+    pub replenishment_restore_ms: f64,
     pub snapshot_restore_ms: f64,
     pub request_setup_ms: f64,
     pub guest_execution_ms: f64,
@@ -220,6 +223,11 @@ pub struct WorkerVersionSandbox {
     image: VerifiedSnapshot,
 }
 
+pub(super) struct RestoredWorkerVersionSandbox {
+    app: AppSandbox,
+    responses: Responses,
+}
+
 impl WorkerVersionSandbox {
     /// Boot trusted artifacts, invoke `init(canonical_bundle_json)` once and snapshot.
     /// `timeout` bounds guest initialization, not filesystem/hypervisor creation.
@@ -363,16 +371,63 @@ impl WorkerVersionSandbox {
     ) -> (Result<ResponseEnvelope>, ExecutionProfile) {
         let total_started = Instant::now();
         let mut profile = ExecutionProfile::default();
+        if version != self.worker_version() {
+            profile.total_ms = Self::elapsed_ms(total_started);
+            return (
+                Err(Error::State(
+                    "sandbox cannot be reassigned across Worker versions".into(),
+                )),
+                profile,
+            );
+        }
+        let (restored, restore_ms) = match self.restore() {
+            Ok(restored) => restored,
+            Err(error) => {
+                profile.total_ms = Self::elapsed_ms(total_started);
+                return (Err(error), profile);
+            }
+        };
+        let (result, mut execution_profile) =
+            restored.execute_profiled(request, timeout, total_started);
+        execution_profile.snapshot_restore_ms = restore_ms;
+        execution_profile.total_ms = Self::elapsed_ms(total_started);
+        (result, execution_profile)
+    }
+
+    pub(super) fn restore(&self) -> Result<(RestoredWorkerVersionSandbox, f64)> {
+        let restore_started = Instant::now();
+        let (mut sandbox, config) =
+            crate::restore_snapshot(self.image.snapshot.clone(), vec![], None, None)?;
+        let responses = Responses::default();
+        responses.register(&mut sandbox)?;
+        Ok((
+            RestoredWorkerVersionSandbox {
+                app: AppSandbox {
+                    sandbox,
+                    config,
+                    exited: None,
+                    pending: None,
+                },
+                responses,
+            },
+            Self::elapsed_ms(restore_started),
+        ))
+    }
+}
+
+impl RestoredWorkerVersionSandbox {
+    pub(super) fn execute_profiled(
+        mut self,
+        request: RequestEnvelope,
+        timeout: Duration,
+        total_started: Instant,
+    ) -> (Result<ResponseEnvelope>, ExecutionProfile) {
+        let mut profile = ExecutionProfile::default();
         macro_rules! fail {
             ($error:expr) => {{
-                profile.total_ms = Self::elapsed_ms(total_started);
+                profile.total_ms = WorkerVersionSandbox::elapsed_ms(total_started);
                 return (Err($error), profile);
             }};
-        }
-        if version != self.worker_version() {
-            fail!(Error::State(
-                "sandbox cannot be reassigned across Worker versions".into(),
-            ));
         }
         let setup_started = Instant::now();
         let encoded = match request.to_json() {
@@ -382,52 +437,31 @@ impl WorkerVersionSandbox {
         if timeout.is_zero() {
             fail!(Error::Timeout);
         }
-        let responses = Responses::default();
-        profile.request_setup_ms += Self::elapsed_ms(setup_started);
-
-        let restore_started = Instant::now();
-        let (mut sandbox, config) =
-            match crate::restore_snapshot(self.image.snapshot.clone(), vec![], None, None) {
-                Ok(restored) => restored,
-                Err(error) => fail!(error.into()),
-            };
-        profile.snapshot_restore_ms = Self::elapsed_ms(restore_started);
-
-        let setup_started = Instant::now();
-        if let Err(error) = responses.register(&mut sandbox) {
+        if let Err(error) = self.responses.begin(&request.request_id) {
             fail!(error);
         }
-        let mut app = AppSandbox {
-            sandbox,
-            config,
-            exited: None,
-            pending: None,
-        };
-        if let Err(error) = responses.begin(&request.request_id) {
-            fail!(error);
-        }
-        profile.request_setup_ms += Self::elapsed_ms(setup_started);
+        profile.request_setup_ms = WorkerVersionSandbox::elapsed_ms(setup_started);
 
         let execution_started = Instant::now();
-        let result = timed_request(&mut app, encoded, timeout);
-        profile.guest_execution_ms = Self::elapsed_ms(execution_started);
+        let result = timed_request(&mut self.app, encoded, timeout);
+        profile.guest_execution_ms = WorkerVersionSandbox::elapsed_ms(execution_started);
 
         // Join the watchdog before dropping the VM; no late kill can hit the
         // next request. Dropping also discards timers, threads and guest secrets.
         let teardown_started = Instant::now();
-        drop(app);
-        profile.vm_teardown_ms = Self::elapsed_ms(teardown_started);
+        drop(self.app);
+        profile.vm_teardown_ms = WorkerVersionSandbox::elapsed_ms(teardown_started);
 
         let finish_started = Instant::now();
         let result = match result {
-            Ok(()) => responses.finish(),
-            Err(error) => match responses.clear() {
+            Ok(()) => self.responses.finish(),
+            Err(error) => match self.responses.clear() {
                 Ok(()) => Err(error),
                 Err(clear_error) => Err(clear_error),
             },
         };
-        profile.response_finish_ms = Self::elapsed_ms(finish_started);
-        profile.total_ms = Self::elapsed_ms(total_started);
+        profile.response_finish_ms = WorkerVersionSandbox::elapsed_ms(finish_started);
+        profile.total_ms = WorkerVersionSandbox::elapsed_ms(total_started);
         (result, profile)
     }
 }

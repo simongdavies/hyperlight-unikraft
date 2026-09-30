@@ -36,6 +36,8 @@ Once packaged, start the minimal host HTTP bridge with:
 cargo run --example workerd-demo -- \
   --bundle examples/workerd-bundles/helloworld_esm.json \
   --bind 0.0.0.0:8787 \
+  --restore-mode prewarmed --prewarmed-sandboxes 8 \
+  --max-concurrent-restores 2 \
   --max-concurrent-sandboxes 4 --queue-capacity 64
 curl http://127.0.0.1:8787/
 ```
@@ -52,14 +54,31 @@ hluk workerd --bundle examples/workerd-bundles/helloworld_esm.json \
   --url https://example.test/
 ```
 
-The bridge uses `--max-concurrent-sandboxes` fixed, long-lived worker threads
-(default 4). Each thread restores, runs, joins the watchdog for, and drops one
-fresh request VM before taking another job. Requests above that limit wait in a
-bounded queue (`--queue-capacity`, default 64); admission never waits for queue
-space, and overflow receives HTTP 503. It grants no guest filesystem or
-networking capability. Use `--request-timeout-ms` to set the watchdog deadline;
-a timed-out request receives HTTP 504 and later requests continue in fresh VMs.
-Both concurrency and queue capacity must be nonzero.
+The bridge defaults to `--restore-mode on-demand`, which preserves the original
+behavior: each owner restores, runs, joins the watchdog for, and drops one fresh
+request VM. `--restore-mode prewarmed` instead makes each owner restore its own
+VM before advertising readiness, execute at most one request in it, destroy it,
+and replenish. `--prewarmed-sandboxes` controls owner/ready capacity and the
+number of reserved VMs (and therefore reserved VM/RSS footprint). It may be
+larger than `--max-concurrent-sandboxes`, which remains the active execution cap
+so replenishment can overlap guest execution. In prewarmed mode,
+`--max-concurrent-restores` (default 1) separately bounds restore CPU pressure;
+owners waiting for either a restore permit or a request block rather than spin.
+The flag is rejected in on-demand mode, where restore concurrency equals
+`--max-concurrent-sandboxes`.
+
+Budget active execution and restore together for the host. For example, a
+32-core host could use 28 active sandboxes plus 4 concurrent restores, subject
+to measured guest CPU and memory headroom. Startup logs report active, owner,
+and restore counts; per-request profiles report ready wait and restore time,
+while pool status exposes ready and replenishing owner counts.
+
+Requests above the active limit wait in a bounded queue (`--queue-capacity`,
+default 64); admission never waits for queue space, and overflow receives HTTP
+503. The bridge grants no guest filesystem or networking capability. Use
+`--request-timeout-ms` to set the watchdog deadline; a timed-out request receives
+HTTP 504 and later requests continue in fresh VMs. All capacities must be
+nonzero.
 
 ## Workerd-fork executor ABI
 
@@ -165,8 +184,14 @@ not issue ordinary vCPU ioctls and is joined before VM destruction. See the
 
 `execute_profiled()` reports each host-side phase separately:
 
+* `ready_wait_ms`: time from request admission until an owner starts it.
+* `replenishment_wait_ms`: time that prewarmed owner waited for a bounded
+  restore permit, exposing restore contention.
+* `replenishment_restore_ms`: restore time paid by a prewarmed owner before it
+  advertised readiness.
 * `snapshot_restore_ms`: clone the immutable snapshot handle and construct a
-  fresh Hyperlight VM from it.
+  fresh Hyperlight VM from it in on-demand mode. This remains zero for a
+  prewarmed request because restore completed before admission to that VM.
 * `request_setup_ms`: validate/serialize the request, clear request state,
   register `HostPrint`, and activate the request ID.
 * `guest_execution_ms`: resume the restored guest and execute `fetch` under
