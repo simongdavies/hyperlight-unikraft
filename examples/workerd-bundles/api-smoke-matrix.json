@@ -2,6 +2,11 @@
   "schema_version": 1,
   "standard": "ECMA-429 Minimum Common Web API",
   "qualification": "executor smoke plus upstream Workerd WPT baseline; not conformance",
+  "label": "smoke-not-conformance",
+  "bundle_version_evidence": {
+    "worker_version": "wintertc-smoke-v2",
+    "compatibility_date": "2025-12-31"
+  },
   "executor_probe": {
     "fixture": "src/workerd/server/sandbox-executor/wintertc-smoke.js",
     "expected_result": "src/workerd/server/sandbox-executor/wintertc-smoke-expected.json",
@@ -25,17 +30,74 @@
       "DecompressionStream",
       "performance.now"
     ],
-    "not_tested": ["AbortController", "EventTarget", "structuredClone"]
+    "behavior_tests_added_pending_runtime_verification": [
+      "TextEncoderStream",
+      "TextDecoderStream",
+      "Event",
+      "EventTarget",
+      "CustomEvent",
+      "AbortController",
+      "AbortSignal",
+      "DOMException",
+      "structuredClone",
+      "WritableStream",
+      "CountQueuingStrategy",
+      "ByteLengthQueuingStrategy"
+    ],
+    "not_tested": ["MessageChannel"]
   },
-  "sandbox_policy_unavailable": [
-    "outbound fetch",
-    "WebSocket",
-    "connect",
-    "bindings",
-    "actors",
-    "timers",
-    "WebAssembly compilation"
-  ],
+  "executor_policy_declarations": {
+    "runtime_behavior_probe_performed": false,
+    "qualification": "unverified policy declarations; API surface types are reported separately by the smoke response",
+    "unavailable": [
+      "outbound fetch",
+      "WebSocket",
+      "connect",
+      "bindings",
+      "actors",
+      "timers",
+      "WebAssembly compilation"
+    ]
+  },
+  "bounded_capability_investigation": {
+    "outbound_fetch": {
+      "status": "not wired",
+      "existing_host_primitives": [
+        "hostsock POSIX socket forwarding",
+        "NetworkPolicy denied by default",
+        "AllowList destination and DNS enforcement",
+        "per-request watchdog",
+        "fresh VM restore and teardown"
+      ],
+      "blocking_gap": "The trusted external Workerd-fork executor has no guest-to-host outbound fetch channel and its source is not vendored in this repository. Registering net_* alone would expose raw guest sockets without supplying Workerd Request/Response semantics.",
+      "required_bridge": [
+        "Add an executor-side global fetch service that calls a typed host function rather than raw sockets.",
+        "Authorize from host-owned worker identity and an explicit scheme, host and port allowlist.",
+        "Resolve on the host, reject redirects outside the allowlist, private/local/metadata addresses unless separately opted in, and DNS rebinding.",
+        "Bound connect and total time, request and response body bytes, header count and bytes, redirects and concurrent requests.",
+        "Return validated protocol envelopes and cancel all in-flight work when the request VM is killed or dropped.",
+        "Test allowed loopback against an explicit test server, denied destinations, redirect denial, size and timeout limits, and fresh-VM isolation."
+      ]
+    },
+    "timers": {
+      "status": "executor channel disabled",
+      "existing_host_primitives": [
+        "guest CLOCK_MONOTONIC backed by TSC",
+        "Unikraft nanosleep and clock_nanosleep deadlines",
+        "Yield(ns) earliest-deadline reporting",
+        "owner-thread AppSandbox::step wakeups",
+        "per-request watchdog and fresh VM teardown"
+      ],
+      "blocking_gap": "The external Workerd-fork executor does not expose its JSG timer channel. The host already parks and re-enters the VM for guest deadlines, but cannot create or cancel JavaScript timers on the executor's behalf.",
+      "required_bridge": [
+        "Implement setTimeout and clearTimeout in the executor using its owner-thread event loop and the guest monotonic clock.",
+        "Cap timers per request and clamp maximum delay to the request deadline.",
+        "Cancel timer handles when fetch completes, the watchdog kills the VM, or the fresh VM is dropped.",
+        "Keep callback execution on the VM owner thread; cross-thread work may only signal that owner.",
+        "Test ordering, cancellation, delay bounds, timeout interruption and absence of timer state in the next fresh VM."
+      ]
+    }
+  },
   "upstream_wpt_baseline": [
     {
       "target": "//src/wpt:url@",

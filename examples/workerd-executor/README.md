@@ -253,7 +253,33 @@ just workerd-api-probe 512
 machine-readable ECMA-429/WPT support matrix, not an authoritative conformance
 runner. `api-smoke-matrix.json` records the selected pure Web APIs,
 capability-backed APIs intentionally unavailable in this sandbox, untested
-surfaces, and the expected SHA-256 digest vector.
+surfaces, and the expected SHA-256 digest vector. The response preserves the
+`smoke-not-conformance` label and reports the Worker version and compatibility
+date; the Rust acceptance test cross-checks both against the parsed top-level
+bundle metadata. In addition to the original URL, fetch primitives,
+crypto, readable/transform streams and compression checks, the probe exercises
+event dispatch and cancellation, custom event detail, abort reason identity,
+`DOMException`, independent structured clones, writable stream ordering,
+queuing-strategy sizing, and streaming text encode/decode round trips.
+
+The smoke reports the `typeof` values for outbound `fetch`, `setTimeout`, and
+`clearTimeout` separately from executor policy declarations. It does not invoke
+networking or wait on a timer, so those declarations are explicitly marked
+unverified rather than presented as behavior-test results.
+
+The repository has a capable hostsock transport and denied-by-default
+`NetworkPolicy`, but the external Workerd-fork executor has no typed
+outbound-fetch channel and is not built from source in this repository. Merely
+registering `net_*` would grant raw guest sockets and would not implement
+Workerd `Request`/`Response`, redirect, DNS-rebinding, body limit or
+cancellation semantics. The matrix records the required bounded bridge and its
+allow/deny, timeout, size-limit and fresh-VM tests.
+
+Unikraft already turns monotonic sleep deadlines into `Yield(ns)`, and
+`AppSandbox::step` parks and re-enters the VM on the owner thread under the
+request watchdog. A future executor timer channel must cap timer count and
+delay, cancel on completion/kill/drop, and execute callbacks only on that owner
+thread; the matrix records the remaining behavior tests.
 
 For a curlable listener, run the demo in one terminal and issue requests from
 another:

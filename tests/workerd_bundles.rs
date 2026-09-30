@@ -107,8 +107,11 @@ fn real_workerd_bundles_and_snapshot_identity() {
         "synchronous transform must uppercase the generated stream"
     );
 
+    let smoke_bundle = bundle("api-smoke.json");
+    let smoke_worker_version = smoke_bundle.worker_version.as_str().to_owned();
+    let smoke_compatibility_date = smoke_bundle.compatibility_date.clone();
     let (_, smoke) = execute(
-        bundle("api-smoke.json"),
+        smoke_bundle,
         request(
             "POST",
             "https://example.test/wintertc-smoke",
@@ -128,16 +131,50 @@ fn real_workerd_bundles_and_snapshot_identity() {
         "formData",
         "blob",
         "textCodec",
+        "eventTarget",
+        "customEvent",
+        "abortController",
+        "domException",
+        "structuredClone",
         "cryptoDigest",
         "cryptoRandom",
         "readableStream",
         "transformStream",
+        "writableStream",
+        "queuingStrategies",
+        "textCodecStreams",
         "compression",
         "performance",
     ] {
         assert_eq!(smoke[field], true, "{field}");
     }
+    assert_eq!(smoke["qualification"], "smoke-not-conformance");
+    assert_eq!(
+        smoke["versionEvidence"]["workerVersion"],
+        smoke_worker_version
+    );
+    assert_eq!(
+        smoke["versionEvidence"]["compatibilityDate"],
+        smoke_compatibility_date
+    );
     assert_eq!(smoke["webAssembly"], "blocked by executor embedder policy");
+    assert_eq!(
+        smoke["policyDeclarations"]["kind"],
+        "unverified-embedder-policy"
+    );
+    assert_eq!(smoke["policyDeclarations"]["runtimeProbePerformed"], false);
+    assert!(
+        smoke["policyDeclarations"]["unavailable"]
+            .as_array()
+            .unwrap()
+            .contains(&Value::String("outbound fetch".into()))
+    );
+    for field in ["outboundFetch", "setTimeout", "clearTimeout"] {
+        assert!(
+            smoke["apiSurface"][field].is_string(),
+            "{field} surface observation"
+        );
+    }
 }
 
 #[allow(clippy::permissions_set_readonly_false)]
