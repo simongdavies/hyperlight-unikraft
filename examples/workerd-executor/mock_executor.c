@@ -7,6 +7,75 @@
 static int initialized;
 static unsigned int fetch_count;
 
+static int timer_check(int cancel_after_deadline)
+{
+	size_t cap = hl_host_call_max_payload();
+	char *result = malloc(cap + 1);
+	if (!result)
+		return -1;
+	struct hlcall_host_arg start_arg = {
+		.type = HLCALL_HOST_U64,
+		.value = cancel_after_deadline ? 1000000 : 20000000,
+	};
+	size_t result_len;
+	int rc = -1;
+	if (hl_host_call_string("WorkerdTimerV1Start", &start_arg, 1,
+				result, cap, &result_len) ||
+	    result_len >= cap)
+		goto out;
+	result[result_len] = 0;
+	const char *timer = strstr(result, "\"timer_id\":");
+	if (!timer || !strstr(result, "\"state\":\"pending\""))
+		goto out;
+	uint64_t timer_id = strtoull(timer + strlen("\"timer_id\":"), NULL, 10);
+	if (!timer_id)
+		goto out;
+	struct hlcall_host_arg id_arg = {
+		.type = HLCALL_HOST_U64,
+		.value = timer_id,
+	};
+	if (!cancel_after_deadline) {
+		if (hl_host_call_string("WorkerdTimerV1Read", &id_arg, 1,
+					result, cap, &result_len) ||
+		    result_len >= cap)
+			goto out;
+		result[result_len] = 0;
+		if (!strstr(result, "\"state\":\"pending\""))
+			goto out;
+		usleep(30000);
+		if (hl_host_call_string("WorkerdTimerV1Read", &id_arg, 1,
+					result, cap, &result_len) ||
+		    result_len >= cap)
+			goto out;
+		result[result_len] = 0;
+		if (!strstr(result, "\"state\":\"fired\""))
+			goto out;
+	} else {
+		usleep(5000);
+		int32_t status;
+		if (hl_host_call_i32("WorkerdTimerV1Cancel", &id_arg, 1, &status) ||
+		    status ||
+		    hl_host_call_i32("WorkerdTimerV1Cancel", &id_arg, 1, &status) ||
+		    status)
+			goto out;
+		if (hl_host_call_string("WorkerdTimerV1Read", &id_arg, 1,
+					result, cap, &result_len) ||
+		    result_len >= cap)
+			goto out;
+		result[result_len] = 0;
+		if (!strstr(result, "\"state\":\"cancelled\""))
+			goto out;
+	}
+	int32_t released;
+	if (hl_host_call_i32("WorkerdTimerV1Cancel", &id_arg, 1, &released) ||
+	    released != -2)
+		goto out;
+	rc = 0;
+out:
+	free(result);
+	return rc;
+}
+
 static int broker_fetch(const char *request_json, const char *id, int post)
 {
 	const char *url = strstr(request_json,
@@ -185,7 +254,13 @@ static int dispatch(const uint8_t *fc, size_t fc_len)
 		strcpy(id, "stale");
 	int broker = strstr(json, "/broker\"") != NULL;
 	int broker_post = strstr(json, "/broker-post\"") != NULL;
+	int timer = strstr(json, "/timer\"") != NULL;
+	int timer_cancel = strstr(json, "/timer-cancel\"") != NULL;
 	if ((broker || broker_post) && broker_fetch(json, id, broker_post)) {
+		free(json);
+		return -1;
+	}
+	if ((timer || timer_cancel) && timer_check(timer_cancel)) {
 		free(json);
 		return -1;
 	}

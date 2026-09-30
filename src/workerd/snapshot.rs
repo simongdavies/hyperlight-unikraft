@@ -11,10 +11,10 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 
-const SCHEMA_VERSION: u16 = 3;
+const SCHEMA_VERSION: u16 = 4;
 const METADATA_FILE: &str = "worker.json";
-const CAPABILITIES: &[u8] =
-    b"stdout:ndjson-response:v1;console:bounded;stdin:denied;hostfs:none;hostsock:none";
+const CAPABILITIES: &[u8] = b"stdout:ndjson-response:v1;console:bounded;stdin:denied;\
+hostfs:none;hostsock:none;fetch:hcall:v1,v2;timer:hcall:v1";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

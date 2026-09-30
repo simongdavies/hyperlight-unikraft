@@ -196,6 +196,46 @@ complete ordered-header JSON block preceding body bytes. Reading EOF collects
 a successful handle. Cancel aborts DNS, connect, upload, or download work and
 request-VM teardown cancels every remaining operation.
 
+### Monotonic timer channel v1
+
+The generic host-call bridge also exposes one-shot monotonic deadlines. This is
+the Hyperlight side of the Workerd timer adapter; it adds no timer ioctl, kernel
+mechanism, background host thread or blocking host call:
+
+* `WorkerdTimerV1Start(u64 delay_ns) -> String`
+* `WorkerdTimerV1Read(u64 timer_id) -> String`
+* `WorkerdTimerV1Cancel(u64 timer_id) -> i32`
+
+All JSON objects require exactly their documented keys; key order is not part
+of the contract. Start succeeds with
+`{"protocol_version":1,"timer_id":N,"state":"pending","error":null}`.
+`N` is session-local, never reused and between 1 and 2^53-1. A zero delay is an
+immediately due timer. If adding the full `u64` nanosecond duration to the
+monotonic clock overflows, Start returns timer ID zero, state `error`, and
+`invalid_duration`. Admission failures use `overloaded`.
+
+Read never waits. It returns state `pending`, or terminal state `fired` or
+`cancelled`; a terminal Read releases the handle. Reading an unknown or
+released ID returns state `error` with `unknown_timer`. The error object is
+`{"code":"invalid_duration|overloaded|unknown_timer","message":"..."}`.
+
+Cancel returns zero for any issued, unreleased handle, including one already
+cancelled. Cancellation wins until terminal delivery: even if the deadline has
+elapsed, Cancel marks the timer cancelled when Read has not yet returned and
+released `fired`. A later Cancel on a released or unknown handle returns
+`-ENOENT`. Workerd combines nonblocking Read with the guest monotonic
+sleep/yield path; the existing Hyperlight step model parks the halted VM until
+the guest deadline rather than blocking inside a host call or spinning.
+
+`TimerLimits` defaults to 1,024 active pending timers per Worker version and
+4,096 unreleased handles per request VM. Hosts can supply a configured
+`TimerLimits` through `WorkerVersionSandbox::initialize_with_capabilities`;
+zero limits and an unreleased-handle limit below the active limit are rejected.
+Cancelled handles release active admission immediately but retain session
+handle capacity until terminal Read or VM teardown. Each fresh request VM gets
+an isolated timer session. Watchdog expiry and session/VM drop cancel and
+release every remaining handle before the next request can run.
+
 ## Snapshots, deadlines and trust
 
 `WorkerVersionSandbox::initialize` creates an initialized, version- and
@@ -330,7 +370,13 @@ just workerd-api-probe 512
 machine-readable ECMA-429/WPT support matrix, not an authoritative conformance
 runner. `api-smoke-matrix.json` records the selected pure Web APIs,
 capability-backed APIs intentionally unavailable in this sandbox, untested
-surfaces, and the expected SHA-256 digest vector.
+surfaces, the Hyperlight/executor ownership boundary, and the expected SHA-256
+digest vector. The timer host channel is covered by the native executor fixture;
+the Workerd KJ adapter and real-V8 timer qualification are separate. No
+additional Hyperlight kernel or host capability is currently identified for
+safe WebAssembly enablement, MessageChannel, File or BYOB streams: those remain
+executor embedder-policy/API verification tasks, followed by this same real-VM
+bundle probe.
 
 For a curlable listener, run the demo in one terminal and issue requests from
 another:

@@ -325,6 +325,35 @@ fn real_guest_uses_host_owned_loopback_fetch_policy() {
 }
 
 #[test]
+fn real_guest_uses_nonblocking_monotonic_timer_channel() {
+    #[cfg(windows)]
+    hyperlight_unikraft::configure_surrogates(4);
+    let (rootfs, executor) = artifacts();
+    let version = WorkerVersionId::new("timer-worker-v1").unwrap();
+    let worker = WorkerVersionSandbox::initialize(
+        bundle(version.clone(), "export default {}"),
+        &rootfs,
+        &executor,
+        64,
+        Duration::from_secs(10),
+    )
+    .expect("real hypervisor must boot the timer fixture");
+
+    for (id, path) in [
+        ("timer-fired", "timer"),
+        ("timer-cancelled", "timer-cancel"),
+    ] {
+        let started = Instant::now();
+        let response = worker
+            .execute(&version, request(id, path), Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(response.request_id, id);
+        assert_eq!(response.status, 200);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+}
+
+#[test]
 fn request_pool_parallelism_bounds_queue_isolation_and_timeout_recovery() {
     #[cfg(windows)]
     hyperlight_unikraft::configure_surrogates(4);

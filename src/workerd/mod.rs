@@ -6,9 +6,11 @@
 //! The executor reads named `init` and `fetch` calls from `/dev/hlcall`.
 //! It writes exactly one newline-terminated JSON response to stdout, carried
 //! by the existing `HostPrint` host call. Output during fetch is protocol-only.
-//! No host filesystem or networking capabilities are granted. Fetch and D1
-//! are interfaces only. See `examples/workerd-executor/README.md` for the ABI
-//! and trust assumptions; this is not stock-workerd or production support.
+//! No host filesystem or raw socket capabilities are granted. Optional
+//! host-owned outbound fetch and monotonic timer adapters use the generic
+//! host-call bridge. D1 remains an interface only. See
+//! `examples/workerd-executor/README.md` for the ABI and trust assumptions;
+//! this is not stock-workerd or production support.
 
 mod extensions;
 mod fetch;
@@ -16,6 +18,7 @@ mod pool;
 mod protocol;
 mod sandbox;
 mod snapshot;
+mod timer;
 
 pub use extensions::*;
 pub use fetch::{
@@ -28,6 +31,7 @@ pub use sandbox::{
     ExecutionProfile, InitializationFailure, InitializationProfile, WorkerVersionSandbox,
 };
 pub use snapshot::{SnapshotBinding, VerifiedSnapshot};
+pub use timer::{TIMER_PROTOCOL_VERSION, TimerLimits};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
