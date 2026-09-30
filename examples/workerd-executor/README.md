@@ -215,7 +215,6 @@ sha256sum kernel/workerd_hyperlight-x86_64 \
 Run the 512 MiB real-V8 acceptance probe:
 
 ```sh
-HYPERLIGHT_MAX_SURROGATES=2 HYPERLIGHT_INITIAL_SURROGATES=0 \
 RUST_LOG=hyperlight_unikraft=debug \
 cargo run --release --locked --example workerd-memory-probe -- 512 \
   --bundle examples/workerd-bundles/acceptance.json \
@@ -228,7 +227,6 @@ ladder sizes:
 
 ```sh
 for mib in 256 320 384 448 512 640 768 1024 1536 2048; do
-  HYPERLIGHT_MAX_SURROGATES=2 HYPERLIGHT_INITIAL_SURROGATES=0 \
   cargo run --release --locked --example workerd-memory-probe -- "$mib" \
     --bundle examples/workerd-bundles/acceptance.json
 done | tee build-elfloader/workerd-memory-ladder-kvm.jsonl
@@ -259,7 +257,6 @@ For a curlable listener, run the demo in one terminal and issue requests from
 another:
 
 ```sh
-HYPERLIGHT_MAX_SURROGATES=2 HYPERLIGHT_INITIAL_SURROGATES=0 \
 cargo run --release --locked --example workerd-demo -- \
   --bundle examples/workerd-bundles/acceptance.json \
   --bind 0.0.0.0:8787 --scratch-mb 512 --request-timeout-ms 500 \

@@ -6,11 +6,12 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use hyperlight_unikraft::workerd::{
     Header, PROTOCOL_VERSION, RequestEnvelope, SnapshotBinding, VerifiedSnapshot, WorkerBundle,
-    WorkerVersionSandbox,
+    WorkerRequestPool, WorkerVersionSandbox,
 };
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::time::Duration;
 
 fn artifact(name: &str) -> PathBuf {
@@ -29,9 +30,18 @@ fn bundle(name: &str) -> WorkerBundle {
 }
 
 fn request(method: &str, url: &str, headers: Vec<Header>) -> RequestEnvelope {
+    request_with_id("acceptance-1", method, url, headers)
+}
+
+fn request_with_id(
+    request_id: &str,
+    method: &str,
+    url: &str,
+    headers: Vec<Header>,
+) -> RequestEnvelope {
     RequestEnvelope {
         protocol_version: PROTOCOL_VERSION,
-        request_id: "acceptance-1".into(),
+        request_id: request_id.into(),
         method: method.into(),
         url: url.into(),
         headers,
@@ -138,6 +148,67 @@ fn real_workerd_bundles_and_snapshot_identity() {
         assert_eq!(smoke[field], true, "{field}");
     }
     assert_eq!(smoke["webAssembly"], "blocked by executor embedder policy");
+}
+
+#[test]
+fn real_workerd_request_vms_do_not_reuse_module_state() {
+    #[cfg(windows)]
+    hyperlight_unikraft::configure_surrogates(2);
+    assert!(
+        artifact("rootfs.img").is_file(),
+        "package the real executor"
+    );
+    assert!(artifact("executor").is_file(), "package the real executor");
+
+    let bundle = bundle("acceptance.json");
+    let version = bundle.worker_version.clone();
+    let worker = WorkerVersionSandbox::initialize(
+        bundle,
+        artifact("rootfs.img"),
+        artifact("executor"),
+        512,
+        Duration::from_secs(90),
+    )
+    .expect("real Workerd executor must initialize");
+
+    for request_id in ["sequential-1", "sequential-2"] {
+        let response = worker
+            .execute(
+                &version,
+                request_with_id(request_id, "GET", "https://example.test/state", Vec::new()),
+                Duration::from_secs(10),
+            )
+            .expect("real Workerd fetch must succeed");
+        let body: Value =
+            serde_json::from_slice(&STANDARD.decode(response.body_base64).unwrap()).unwrap();
+        assert_eq!(body["count"], 1, "request VM reused module state");
+    }
+
+    let pool = WorkerRequestPool::new(worker, 2, 2).unwrap();
+    let (tx, rx) = mpsc::channel();
+    for request_id in [
+        "concurrent-1",
+        "concurrent-2",
+        "concurrent-3",
+        "concurrent-4",
+    ] {
+        let tx = tx.clone();
+        pool.try_submit(
+            request_with_id(request_id, "GET", "https://example.test/state", Vec::new()),
+            Duration::from_secs(10),
+            move |result| {
+                let _ = tx.send(result);
+            },
+        )
+        .unwrap();
+    }
+    for _ in 0..4 {
+        let execution = rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        let response = execution.result.expect("real Workerd fetch must succeed");
+        let body: Value =
+            serde_json::from_slice(&STANDARD.decode(response.body_base64).unwrap()).unwrap();
+        assert_eq!(body["count"], 1, "request VM reused module state");
+    }
 }
 
 #[allow(clippy::permissions_set_readonly_false)]
