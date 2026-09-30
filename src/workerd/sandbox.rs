@@ -2,8 +2,8 @@
 // Copyright 2026 The Hyperlight Authors.
 
 use super::{
-    Error, RequestEnvelope, ResponseEnvelope, Result, SnapshotBinding, VerifiedSnapshot,
-    WorkerBundle, WorkerVersionId, snapshot::kernel_for_rootfs,
+    Error, FetchBroker, RequestEnvelope, ResponseEnvelope, Result, SnapshotBinding,
+    VerifiedSnapshot, WorkerBundle, WorkerVersionId, snapshot::kernel_for_rootfs,
 };
 use crate::{AppSandbox, Yield};
 use hyperlight_host::func::Registerable;
@@ -69,7 +69,7 @@ impl Responses {
             id: Some(id.into()),
             ..Default::default()
         };
-        Ok(())
+        Ok::<(), Error>(())
     }
 
     fn submit(&self, json: &str) -> Result<()> {
@@ -218,6 +218,7 @@ impl Responses {
 #[derive(Clone)]
 pub struct WorkerVersionSandbox {
     image: VerifiedSnapshot,
+    fetch_broker: FetchBroker,
 }
 
 impl WorkerVersionSandbox {
@@ -241,6 +242,44 @@ impl WorkerVersionSandbox {
         executor: impl AsRef<Path>,
         scratch_mb: usize,
         timeout: Duration,
+    ) -> std::result::Result<(Self, InitializationProfile), InitializationFailure> {
+        Self::initialize_profiled_with_fetch(
+            bundle,
+            rootfs,
+            executor,
+            scratch_mb,
+            timeout,
+            FetchBroker::denied(),
+        )
+    }
+
+    pub fn initialize_with_fetch(
+        bundle: WorkerBundle,
+        rootfs: impl AsRef<Path>,
+        executor: impl AsRef<Path>,
+        scratch_mb: usize,
+        timeout: Duration,
+        fetch_broker: FetchBroker,
+    ) -> Result<Self> {
+        Self::initialize_profiled_with_fetch(
+            bundle,
+            rootfs,
+            executor,
+            scratch_mb,
+            timeout,
+            fetch_broker,
+        )
+        .map(|(worker, _)| worker)
+        .map_err(|failure| Error::State(failure.to_string()))
+    }
+
+    pub fn initialize_profiled_with_fetch(
+        bundle: WorkerBundle,
+        rootfs: impl AsRef<Path>,
+        executor: impl AsRef<Path>,
+        scratch_mb: usize,
+        timeout: Duration,
+        fetch_broker: FetchBroker,
     ) -> std::result::Result<(Self, InitializationProfile), InitializationFailure> {
         let mut profile = InitializationProfile::default();
         if scratch_mb == 0 || scratch_mb.checked_mul(1024 * 1024).is_none() {
@@ -273,6 +312,17 @@ impl WorkerVersionSandbox {
         .map_err(|error| Self::initialization_failure("assemble", error, &profile))?;
         responses
             .register(&mut uninitialized)
+            .map_err(|error| Self::initialization_failure("assemble", error, &profile))?;
+        let init_deadline =
+            Instant::now()
+                .checked_add(timeout)
+                .ok_or_else(|| InitializationFailure {
+                    stage: "assemble",
+                    message: "timeout too large".into(),
+                    profile: profile.clone(),
+                })?;
+        fetch_broker
+            .register(&mut uninitialized, fetch_broker.session(init_deadline))
             .map_err(|error| Self::initialization_failure("assemble", error, &profile))?;
         profile.assemble_ms = Self::elapsed_ms(started);
         // Evolve's boot is trusted startup. The timed init call below is where
@@ -315,7 +365,13 @@ impl WorkerVersionSandbox {
             .map_err(|error| Self::initialization_failure("snapshot", error, &profile))?;
         profile.snapshot_ms = Self::elapsed_ms(started);
         let image = VerifiedSnapshot::initialized(snapshot, binding);
-        Ok((Self { image }, profile))
+        Ok((
+            Self {
+                image,
+                fetch_broker,
+            },
+            profile,
+        ))
     }
 
     fn elapsed_ms(started: Instant) -> f64 {
@@ -335,7 +391,20 @@ impl WorkerVersionSandbox {
     }
 
     pub fn from_verified_snapshot(image: VerifiedSnapshot) -> Self {
-        Self { image }
+        Self {
+            image,
+            fetch_broker: FetchBroker::denied(),
+        }
+    }
+
+    pub fn from_verified_snapshot_with_fetch(
+        image: VerifiedSnapshot,
+        fetch_broker: FetchBroker,
+    ) -> Self {
+        Self {
+            image,
+            fetch_broker,
+        }
     }
 
     pub fn snapshot(&self) -> &VerifiedSnapshot {
@@ -382,21 +451,33 @@ impl WorkerVersionSandbox {
         if timeout.is_zero() {
             fail!(Error::Timeout);
         }
+        let deadline = match Instant::now().checked_add(timeout) {
+            Some(deadline) => deadline,
+            None => fail!(Error::State("timeout too large".into())),
+        };
+        let fetch_session = self.fetch_broker.session(deadline);
         let responses = Responses::default();
         profile.request_setup_ms += Self::elapsed_ms(setup_started);
 
         let restore_started = Instant::now();
-        let (mut sandbox, config) =
-            match crate::restore_snapshot(self.image.snapshot.clone(), vec![], None, None) {
-                Ok(restored) => restored,
-                Err(error) => fail!(error.into()),
-            };
+        let (sandbox, config) = match crate::restore_snapshot_with(
+            self.image.snapshot.clone(),
+            vec![],
+            None,
+            None,
+            |functions| {
+                responses.register(functions)?;
+                self.fetch_broker
+                    .register(functions, fetch_session.clone())?;
+                Ok::<(), Error>(())
+            },
+        ) {
+            Ok(restored) => restored,
+            Err(error) => fail!(error),
+        };
         profile.snapshot_restore_ms = Self::elapsed_ms(restore_started);
 
         let setup_started = Instant::now();
-        if let Err(error) = responses.register(&mut sandbox) {
-            fail!(error);
-        }
         let mut app = AppSandbox {
             sandbox,
             config,
@@ -409,7 +490,7 @@ impl WorkerVersionSandbox {
         profile.request_setup_ms += Self::elapsed_ms(setup_started);
 
         let execution_started = Instant::now();
-        let result = timed_request(&mut app, encoded, timeout);
+        let result = timed_request(&mut app, encoded, deadline, fetch_session);
         profile.guest_execution_ms = Self::elapsed_ms(execution_started);
 
         // Join the watchdog before dropping the VM; no late kill can hit the
@@ -432,15 +513,23 @@ impl WorkerVersionSandbox {
     }
 }
 
-fn timed_request(app: &mut AppSandbox, encoded: String, timeout: Duration) -> Result<()> {
-    with_watchdog(app, timeout, |app, deadline| {
+fn timed_request(
+    app: &mut AppSandbox,
+    encoded: String,
+    deadline: Instant,
+    fetch_session: super::fetch::FetchSession,
+) -> Result<()> {
+    with_watchdog(app, deadline, Some(fetch_session), |app, deadline| {
         app.resume()?;
         drive_call(app, "fetch", encoded, deadline)
     })
 }
 
 fn timed_call(app: &mut AppSandbox, name: &str, argument: String, timeout: Duration) -> Result<()> {
-    with_watchdog(app, timeout, |app, deadline| {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| Error::State("timeout too large".into()))?;
+    with_watchdog(app, deadline, None, |app, deadline| {
         drive_call(app, name, argument, deadline)
     })
 }
@@ -468,13 +557,11 @@ fn drive_call(app: &mut AppSandbox, name: &str, argument: String, deadline: Inst
 
 fn with_watchdog(
     app: &mut AppSandbox,
-    timeout: Duration,
+    deadline: Instant,
+    fetch_session: Option<super::fetch::FetchSession>,
     run: impl FnOnce(&mut AppSandbox, Instant) -> Result<()>,
 ) -> Result<()> {
-    let deadline = Instant::now()
-        .checked_add(timeout)
-        .ok_or_else(|| Error::State("timeout too large".into()))?;
-    if timeout.is_zero() {
+    if Instant::now() >= deadline {
         return Err(Error::Timeout);
     }
     let interrupt = app.interrupt_handle();
@@ -487,6 +574,9 @@ fn with_watchdog(
                 .is_ok()
             {
                 return false;
+            }
+            if let Some(fetch_session) = fetch_session {
+                fetch_session.cancel_all();
             }
             interrupt.kill();
             true

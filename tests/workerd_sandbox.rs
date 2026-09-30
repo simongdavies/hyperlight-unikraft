@@ -5,12 +5,17 @@
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use hyperlight_unikraft::workerd::{
-    Error, MAX_BODY_BYTES, PROTOCOL_VERSION, RequestEnvelope, SnapshotBinding, VerifiedSnapshot,
-    WorkerBundle, WorkerRequestPool, WorkerVersionId, WorkerVersionSandbox,
+    Error, FetchBroker, FetchBrokerConfig, FetchLimits, FetchPolicy, Header, MAX_BODY_BYTES,
+    PROTOCOL_VERSION, RequestEnvelope, SnapshotBinding, VerifiedSnapshot, WorkerBundle,
+    WorkerRequestPool, WorkerVersionId, WorkerVersionSandbox,
 };
+use hyperlight_unikraft::{AllowList, NetworkPolicy};
 use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -39,6 +44,63 @@ fn request(id: &str, path: &str) -> RequestEnvelope {
 
 fn bundle(version: WorkerVersionId, source: &str) -> WorkerBundle {
     WorkerBundle::single_script(version, "2025-01-01", "worker.js", source).unwrap()
+}
+
+fn outbound_request(id: &str, path: &str, target: String) -> RequestEnvelope {
+    let mut request = request(id, path);
+    request.headers.push(Header {
+        name: "x-fetch-url".into(),
+        value: target,
+    });
+    request
+}
+
+fn loopback_server() -> (u16, Arc<AtomicBool>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = stop.clone();
+    thread::spawn(move || {
+        while !stop_thread.load(Ordering::Acquire) {
+            let Ok((mut stream, _)) = listener.accept() else {
+                thread::sleep(Duration::from_millis(2));
+                continue;
+            };
+            stream.set_nonblocking(false).unwrap();
+            thread::spawn(move || {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                let mut length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                let response = if request_line.starts_with("POST ") {
+                    body
+                } else {
+                    b"ok".to_vec()
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response.len()
+                )
+                .unwrap();
+                stream.write_all(&response).unwrap();
+            });
+        }
+    });
+    (port, stop)
 }
 
 fn wait_for_status(
@@ -201,6 +263,65 @@ fn real_guest_protocol_timeout_recovery_and_version_binding() {
         "SHA-256 must reject corrupted OCI layer"
     );
     unseal(&layout);
+}
+
+#[test]
+fn real_guest_uses_host_owned_loopback_fetch_policy() {
+    #[cfg(windows)]
+    hyperlight_unikraft::configure_surrogates(4);
+    let (rootfs, executor) = artifacts();
+    let (port, stop) = loopback_server();
+    let version = WorkerVersionId::new("fetch-worker-v1").unwrap();
+    let fetch_broker = FetchBroker::new(FetchBrokerConfig {
+        policy: FetchPolicy::new(
+            NetworkPolicy::AllowList(AllowList::from_hosts(&["localhost"]).unwrap()),
+            ["http"],
+            [port],
+        )
+        .allow_loopback(true),
+        limits: FetchLimits::default(),
+    })
+    .unwrap();
+    let worker = WorkerVersionSandbox::initialize_with_fetch(
+        bundle(version.clone(), "export default {}"),
+        &rootfs,
+        &executor,
+        64,
+        Duration::from_secs(10),
+        fetch_broker,
+    )
+    .expect("real hypervisor must boot the fetch fixture");
+
+    for (id, path, expected) in [
+        ("broker-get", "broker", "b2s="),
+        ("broker-post", "broker-post", "cG9zdA=="),
+    ] {
+        let response = worker
+            .execute(
+                &version,
+                outbound_request(id, path, format!("http://localhost:{port}/")),
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        assert_eq!(response.request_id, id);
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body_base64, expected);
+    }
+
+    assert!(
+        worker
+            .execute(
+                &version,
+                outbound_request(
+                    "denied-port",
+                    "broker",
+                    format!("http://localhost:{}/", port.saturating_add(1))
+                ),
+                Duration::from_secs(5),
+            )
+            .is_err()
+    );
+    stop.store(true, Ordering::Release);
 }
 
 #[test]

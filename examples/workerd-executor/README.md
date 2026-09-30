@@ -117,7 +117,84 @@ version ID. Serialization escaping/base64 and actual FlatBuffer framing are
 accounted for; the whole encoded call fits the unchanged 64 KiB transport.
 The response stream allows only two additional bytes for the console CRLF. Unknown JSON
 fields and invalid base64 are rejected. Fetch/D1 traits are extension
-interfaces only: no brokers or outbound access are installed.
+interfaces only unless the host installs the outbound fetch broker described
+below.
+
+### Outbound fetch broker v1
+
+Outbound access is denied by default. A configured `WorkerVersionSandbox`
+registers a host-owned broker; no policy is sent to, visible to, or mutable by
+the guest. The demo's `--fetch-loopback-port PORT` option allows only HTTP to
+`localhost:PORT`. Production callers must construct an explicit `FetchPolicy`.
+
+The executor invokes registered host functions through the generic
+`HLCALL_IOC_HOSTCALL` ioctl on `/dev/hlcall`. `drivers/hl_driver.h` defines the
+versioned ioctl structures and helpers. Calls are synchronous and bounded, but
+network work is not: these functions only create, feed, poll, read or cancel an
+independently abortable host task:
+
+* `WorkerdFetchV1Start(String) -> String`
+* `WorkerdFetchV1Write(u64, Vec<u8>) -> i32`
+* `WorkerdFetchV1Finish(u64) -> i32`
+* `WorkerdFetchV1Poll(u64) -> String`
+* `WorkerdFetchV1Read(u64, u64) -> Vec<u8>`
+* `WorkerdFetchV1Cancel(u64) -> i32`
+
+Start metadata is protocol-1 JSON with `request_id`, `method`, `url`,
+`header_block_length`, and decoded `body_length`. Write carries first exactly
+`header_block_length` bytes of UTF-8 JSON containing the ordered header array,
+then exactly `body_length` raw body bytes, in chunks of at most 60 KiB. Start
+returns an operation ID between 1 and 2^53-1 or an error. Poll returns
+`receiving`, `pending`, or `complete`; a completed response contains
+`request_id`, `status`, `header_block_length`, and `body_length`. Read returns
+the response's ordered-header JSON block followed by its raw body. Cancel is
+idempotent for an ID that was issued by that request VM.
+
+Limits are a 16 KiB URL, 32-byte method, 256-byte request ID, 128 headers and
+64 KiB aggregate header data, 1 MiB request body, 4 MiB response body, and 16
+concurrent operations per Worker version. The broker's total deadline is 10
+seconds, clamped to the request VM watchdog deadline; connect time is at most 2
+seconds. Automatic HTTP redirects are disabled, so Workerd observes each 3xx
+and each follow-up is independently resolved and authorized. Errors use
+`invalid_request`, `policy_denied`, `dns_failed`, `connect_failed`, `timeout`,
+`cancelled`, `response_too_large`, `redirect_limit`, or `overloaded`.
+
+### Outbound fetch broker v2
+
+Protocol 2 keeps the same host-owned policy, DNS authorization, redirect
+behavior, deadlines, cancellation and concurrency admission, but streams both
+directions with bounded four-chunk queues instead of imposing v1's total body
+limits. The exported calls are:
+
+* `WorkerdFetchV2Start(String) -> String`
+* `WorkerdFetchV2Write(u64, Vec<u8>) -> i32`
+* `WorkerdFetchV2Finish(u64) -> i32`
+* `WorkerdFetchV2Poll(u64) -> String`
+* `WorkerdFetchV2Read(u64, u64) -> Vec<u8>`
+* `WorkerdFetchV2Cancel(u64) -> i32`
+
+Start accepts exactly `protocol_version`, `request_id`, `method`, `url`,
+`header_block_length`, nullable `body_length`, `preferred_write_chunk`, and
+`preferred_read_chunk`. Success returns a positive JSON-safe `operation_id`
+and the effective `max_write_chunk` and `max_read_chunk`; failure returns zero
+for all three numeric fields. The effective limits are the minimum of the
+guest preference, host configuration, and ABI-safe maxima: 61,440 write bytes
+and 61,439 read payload bytes.
+
+Write is all-or-nothing. A positive result is the accepted byte count;
+`-EAGAIN` means bounded upload backpressure, `-EPIPE` means upload is closed or
+the upstream response began early, `-EFBIG` means the chunk or known body
+length was exceeded, `-EINVAL` means the operation phase is invalid, and
+`-ENOENT` means the ID is unknown. Finish closes the upload and verifies a
+known body length. Poll reports `receiving_headers`, `uploading`, `response`,
+or `complete`; response metadata is visible before the full body arrives.
+
+Read's `maxBytes` is the maximum **data payload**, so the returned vector may
+contain `maxBytes + 1` bytes including its tag. Tag `0` is pending and tag `2`
+is EOF, each exactly one byte. Tag `1` is followed by response bytes, with the
+complete ordered-header JSON block preceding body bytes. Reading EOF collects
+a successful handle. Cancel aborts DNS, connect, upload, or download work and
+request-VM teardown cancels every remaining operation.
 
 ## Snapshots, deadlines and trust
 

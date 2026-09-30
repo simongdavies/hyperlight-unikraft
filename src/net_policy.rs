@@ -9,11 +9,12 @@
 //! - [`NetworkPolicy::AllowList`] — only listed hosts/IPs permitted.
 //! - [`NetworkPolicy::BlockList`] — all except listed hosts/IPs permitted.
 //!
-//! All variants refuse the cloud metadata addresses unconditionally: the
+//! All variants refuse the cloud metadata addresses by default: the
 //! link-local ranges (169.254.0.0/16, fe80::/10), where Azure, AWS and GCP
 //! serve instance metadata at 169.254.169.254, and AWS's IPv6 endpoint
 //! fd00:ec2::254, which is a unique local address rather than a
-//! link-local one.
+//! link-local one. Dedicated host-owned brokers may explicitly opt into
+//! these address classes; the raw hostsock path cannot.
 //!
 //! [`AllowList`] and [`BlockList`] additionally block loopback (127.0.0.0/8,
 //! ::1) because in the hostsock model a guest socket is a real host socket,
@@ -102,11 +103,34 @@ pub enum NetworkPolicy {
 impl NetworkPolicy {
     /// Whether the guest may reach `addr`, on a UDP socket or not.
     pub(crate) fn allows(&self, addr: &SocketAddr, udp: bool) -> bool {
+        self.allows_with(
+            addr,
+            udp,
+            AddressClassOptIns {
+                loopback: matches!(self, NetworkPolicy::AllowAll),
+                private: true,
+                metadata: false,
+            },
+        )
+    }
+
+    pub(crate) fn allows_with(
+        &self,
+        addr: &SocketAddr,
+        udp: bool,
+        opt_ins: AddressClassOptIns,
+    ) -> bool {
         // An IPv4 address spelled as IPv4-mapped IPv6 (`::ffff:a.b.c.d`)
         // reaches the same IPv4 destination through a dual-stack socket,
         // so every rule below sees the IPv4 form.
         let ip = canonical(addr.ip());
-        if is_metadata(&ip) {
+        if is_metadata(&ip) && !opt_ins.metadata {
+            return false;
+        }
+        if ip.is_loopback() && !opt_ins.loopback {
+            return false;
+        }
+        if is_private(&ip) && !opt_ins.private {
             return false;
         }
 
@@ -119,11 +143,21 @@ impl NetworkPolicy {
             // guest socket is a real host socket, so a guest connecting to
             // 127.0.0.1 reaches host-only services.
             NetworkPolicy::AllowList(al) => {
-                !ip.is_loopback()
+                (opt_ins.loopback || !ip.is_loopback())
                     && (al.is_allowed(&ip)
                         || (udp && addr.port() == 53 && dns_resolvers().contains(&ip)))
             }
-            NetworkPolicy::BlockList(bl) => !ip.is_loopback() && !bl.blocks(&ip),
+            NetworkPolicy::BlockList(bl) => {
+                (opt_ins.loopback || !ip.is_loopback()) && !bl.blocks(&ip)
+            }
+        }
+    }
+
+    pub(crate) fn allows_hostname(&self, hostname: &str) -> bool {
+        match self {
+            NetworkPolicy::AllowAll => true,
+            NetworkPolicy::AllowList(allow) => names_contain(&allow.hostnames, hostname),
+            NetworkPolicy::BlockList(block) => !names_contain(&block.hostnames, hostname),
         }
     }
 
@@ -179,7 +213,7 @@ fn canonical(ip: IpAddr) -> IpAddr {
     }
 }
 
-/// Whether `ip` is a cloud metadata address, refused under every policy:
+/// Whether `ip` is a cloud metadata address, refused by default:
 /// link-local (169.254.0.0/16, where Azure, AWS and GCP serve instance
 /// metadata; fe80::/10), or AWS's IPv6 endpoint.
 fn is_metadata(ip: &IpAddr) -> bool {
@@ -187,6 +221,20 @@ fn is_metadata(ip: &IpAddr) -> bool {
         IpAddr::V4(v4) => v4.is_link_local(),
         IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80 || *v6 == AWS_IMDS_V6,
     }
+}
+
+fn is_private(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_private(),
+        IpAddr::V6(ip) => ip.is_unique_local(),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct AddressClassOptIns {
+    pub(crate) loopback: bool,
+    pub(crate) private: bool,
+    pub(crate) metadata: bool,
 }
 
 // ── ResolveError ───────────────────────────────────────────────────

@@ -1693,6 +1693,21 @@ fn restore_snapshot(
     network: Option<NetworkPolicy>,
     listen_ports: Option<ListenPorts>,
 ) -> Result<(MultiUseSandbox, GuestConfig)> {
+    restore_snapshot_with(snapshot, mounts, network, listen_ports, |_| {
+        Ok::<(), Error>(())
+    })
+}
+
+pub(crate) fn restore_snapshot_with<E>(
+    snapshot: Arc<Snapshot>,
+    mounts: Vec<Mount>,
+    network: Option<NetworkPolicy>,
+    listen_ports: Option<ListenPorts>,
+    register: impl FnOnce(&mut HostFunctions) -> std::result::Result<(), E>,
+) -> std::result::Result<(MultiUseSandbox, GuestConfig), E>
+where
+    E: From<Error>,
+{
     if mounts.is_empty() {
         debug!(
             "restore: no mounts provided — if the snapshot was saved with mounts, hostfs operations will fail"
@@ -1708,7 +1723,8 @@ fn restore_snapshot(
         listen_ports,
     );
     let mut hf = HostFunctions::default();
-    config.register(&mut hf)?;
+    config.register(&mut hf).map_err(E::from)?;
+    register(&mut hf)?;
 
     // The restoring VM must declare the same MSRs as the saving VM: the
     // snapshot persists exactly those MSRs and restore validates them
@@ -1720,9 +1736,11 @@ fn restore_snapshot(
     sbcfg.set_input_data_size(IO_STACK_SIZE);
     sbcfg.set_output_data_size(IO_STACK_SIZE);
     sbcfg.set_heap_size(HEAP_SIZE);
-    apply_guest_msrs(&mut sbcfg)?;
+    apply_guest_msrs(&mut sbcfg).map_err(E::from)?;
 
-    let sandbox = MultiUseSandbox::from_snapshot(snapshot, hf, Some(sbcfg))?;
+    let sandbox = MultiUseSandbox::from_snapshot(snapshot, hf, Some(sbcfg))
+        .map_err(Error::from)
+        .map_err(E::from)?;
     Ok((sandbox, config))
 }
 

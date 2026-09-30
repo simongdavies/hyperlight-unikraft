@@ -13,6 +13,8 @@ mkdir -p "$build/kernel/unikraft" \
     "$build/kernel/libs/libelf"
 git -C "$root/kernel/unikraft" archive HEAD |
     tar -x -C "$build/kernel/unikraft"
+patch -d "$build/kernel/unikraft" -p1 \
+    < "$root/kernel/patches/hyperlight-hostcall-ioctl.patch"
 git -C "$root/kernel/app-elfloader" archive HEAD |
     tar -x -C "$build/kernel/app-elfloader"
 git -C "$root/kernel/libs/libelf" archive HEAD |

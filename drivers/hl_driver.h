@@ -69,9 +69,144 @@ struct hlcall_env {
 
 #define HLCALL_IOC_GETENV _IOWR('H', 2, struct hlcall_env)
 
+#define HLCALL_HOST_ABI_VERSION 1
+#define HLCALL_HOST_MAX_ARGS 4
+#define HLCALL_HOST_MAX_NAME 128
+
+enum hlcall_host_value_type {
+	HLCALL_HOST_I32 = 1,
+	HLCALL_HOST_U64 = 2,
+	HLCALL_HOST_STRING = 3,
+	HLCALL_HOST_VECBYTES = 4,
+};
+
+struct hlcall_host_arg {
+	uint32_t type;
+	uint32_t reserved;
+	uint64_t value;
+	const void *data;
+	uint64_t len;
+};
+
+struct hlcall_host_call {
+	uint32_t version;
+	uint32_t return_type;
+	const char *function;
+	uint64_t function_len;
+	uint32_t arg_count;
+	uint32_t reserved;
+	struct hlcall_host_arg args[HLCALL_HOST_MAX_ARGS];
+	void *output;
+	uint64_t output_cap;
+	uint64_t output_len;
+	int32_t output_i32;
+	uint32_t reserved2;
+	uint64_t output_u64;
+};
+
+#define HLCALL_IOC_HOSTCALL _IOWR('H', 3, struct hlcall_host_call)
+
 static int g_hl_call_fd = -1;
 static uint8_t *g_hl_call_buf;
 static size_t g_hl_call_cap;
+
+static inline size_t hl_host_call_max_payload(void)
+{
+	return g_hl_call_cap;
+}
+
+static inline int hl_host_call(struct hlcall_host_call *call)
+{
+	if (!call) {
+		errno = EINVAL;
+		return -1;
+	}
+	call->version = HLCALL_HOST_ABI_VERSION;
+	return ioctl(g_hl_call_fd, HLCALL_IOC_HOSTCALL, call);
+}
+
+static inline int hl_host_call_string(const char *function,
+				      const struct hlcall_host_arg *args,
+				      uint32_t arg_count,
+				      char *output, size_t output_cap,
+				      size_t *output_len)
+{
+	struct hlcall_host_call call = {
+		.return_type = HLCALL_HOST_STRING,
+		.function = function,
+		.function_len = function ? strlen(function) : 0,
+		.arg_count = arg_count,
+		.output = output,
+		.output_cap = output_cap,
+	};
+
+	if (!function || !output || !output_len ||
+	    output_cap != hl_host_call_max_payload() ||
+	    (arg_count && !args) || arg_count > HLCALL_HOST_MAX_ARGS) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (arg_count)
+		memcpy(call.args, args, arg_count * sizeof(*args));
+	if (hl_host_call(&call) < 0)
+		return -1;
+	*output_len = (size_t)call.output_len;
+	return 0;
+}
+
+static inline int hl_host_call_i32(const char *function,
+				   const struct hlcall_host_arg *args,
+				   uint32_t arg_count, int32_t *output)
+{
+	struct hlcall_host_call call = {
+		.return_type = HLCALL_HOST_I32,
+		.function = function,
+		.function_len = function ? strlen(function) : 0,
+		.arg_count = arg_count,
+	};
+
+	if (!function || !output || (arg_count && !args) ||
+	    arg_count > HLCALL_HOST_MAX_ARGS) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (arg_count)
+		memcpy(call.args, args, arg_count * sizeof(*args));
+	if (hl_host_call(&call) < 0)
+		return -1;
+	*output = call.output_i32;
+	return 0;
+}
+
+static inline int hl_host_call_vecbytes(const char *function,
+					const struct hlcall_host_arg *args,
+					uint32_t arg_count,
+					void *output, size_t output_cap,
+					size_t *output_len)
+{
+	struct hlcall_host_call call = {
+		.return_type = HLCALL_HOST_VECBYTES,
+		.function = function,
+		.function_len = function ? strlen(function) : 0,
+		.arg_count = arg_count,
+		.output = output,
+		.output_cap = output_cap,
+	};
+
+	if (!function || !output || !output_len ||
+	    output_cap != hl_host_call_max_payload() ||
+	    (arg_count && !args) ||
+	    arg_count > HLCALL_HOST_MAX_ARGS) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (arg_count)
+		memcpy(call.args, args, arg_count * sizeof(*args));
+	if (hl_host_call(&call) < 0)
+		return -1;
+	*output_len = (size_t)call.output_len;
+	return 0;
+}
 
 /*
  * Open the call queue and size the read buffer from it.  Returns 0 on

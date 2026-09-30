@@ -3,9 +3,11 @@
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use hyperlight_unikraft::workerd::{
-    Header, MAX_BODY_BYTES, MAX_HEADER_BYTES, PROTOCOL_VERSION, RequestEnvelope, WorkerBundle,
-    WorkerRequestPool, WorkerVersionId, WorkerVersionSandbox,
+    FetchBroker, FetchBrokerConfig, FetchLimits, FetchPolicy, Header, MAX_BODY_BYTES,
+    MAX_HEADER_BYTES, PROTOCOL_VERSION, RequestEnvelope, WorkerBundle, WorkerRequestPool,
+    WorkerVersionId, WorkerVersionSandbox,
 };
+use hyperlight_unikraft::{AllowList, NetworkPolicy};
 use std::env;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -33,6 +35,7 @@ struct Options {
     request_timeout: Duration,
     max_concurrent_sandboxes: usize,
     queue_capacity: usize,
+    fetch_loopback_port: Option<u16>,
 }
 
 impl Options {
@@ -50,6 +53,7 @@ impl Options {
             request_timeout: Duration::from_secs(2),
             max_concurrent_sandboxes: DEFAULT_MAX_CONCURRENT_SANDBOXES,
             queue_capacity: DEFAULT_QUEUE_CAPACITY,
+            fetch_loopback_port: None,
         };
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -91,6 +95,13 @@ impl Options {
                 "--queue-capacity" => {
                     options.queue_capacity = nonzero_usize(value()?, "--queue-capacity")?
                 }
+                "--fetch-loopback-port" => {
+                    options.fetch_loopback_port = Some(
+                        value()?
+                            .parse()
+                            .map_err(|_| "invalid --fetch-loopback-port".to_string())?,
+                    )
+                }
                 "--help" | "-h" => {
                     return Err(format!(
                         "usage: workerd-demo [--bind ADDR] [--rootfs CPIO] \
@@ -98,6 +109,7 @@ impl Options {
                          [--bundle JSON | --script JS] [--compatibility-date YYYY-MM-DD] \
                          [--init-timeout-ms MS] [--request-timeout-ms MS] \
                          [--max-concurrent-sandboxes N] [--queue-capacity N]\n\
+                         [--fetch-loopback-port PORT]\n\
                          defaults: --bind 0.0.0.0:8787 --rootfs {DEFAULT_ROOTFS} \
                          --executor {DEFAULT_EXECUTOR} --version demo-v1 \
                          --bundle {DEFAULT_BUNDLE} \
@@ -105,6 +117,8 @@ impl Options {
                          --request-timeout-ms 2000 \
                          --max-concurrent-sandboxes {DEFAULT_MAX_CONCURRENT_SANDBOXES} \
                          --queue-capacity {DEFAULT_QUEUE_CAPACITY}\n\
+                         Outbound fetch is denied by default. --fetch-loopback-port explicitly \
+                         allows HTTP fetches to localhost on exactly PORT for the demo.\n\
                          Each worker owns every VM it restores, runs, and drops. Requests above \
                          the sandbox limit queue up to --queue-capacity; overflow receives HTTP 503."
                     ));
@@ -163,12 +177,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let bundle_sha256 = bundle.sha256()?;
     let version = bundle.worker_version.clone();
-    let worker = WorkerVersionSandbox::initialize(
+    let fetch_broker = if let Some(port) = options.fetch_loopback_port {
+        FetchBroker::new(FetchBrokerConfig {
+            policy: FetchPolicy::new(
+                NetworkPolicy::AllowList(AllowList::from_hosts(&["localhost"])?),
+                ["http"],
+                [port],
+            )
+            .allow_loopback(true),
+            limits: FetchLimits::default(),
+        })?
+    } else {
+        FetchBroker::denied()
+    };
+    let worker = WorkerVersionSandbox::initialize_with_fetch(
         bundle,
         &options.rootfs,
         &options.executor,
         options.scratch_mb,
         options.init_timeout,
+        fetch_broker,
     )?;
     let pool = WorkerRequestPool::new(
         worker,

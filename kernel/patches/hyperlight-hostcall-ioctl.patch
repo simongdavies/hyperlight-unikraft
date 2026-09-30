@@ -1,0 +1,152 @@
+diff --git a/plat/hyperlight/include/hyperlight-x86/step.h b/plat/hyperlight/include/hyperlight-x86/step.h
+index 82684ccb..9149dd2b 100644
+--- a/plat/hyperlight/include/hyperlight-x86/step.h
++++ b/plat/hyperlight/include/hyperlight-x86/step.h
+@@ -107,0 +108,44 @@ struct hlcall_env {
++/*
++ * Generic ring-3 -> registered Hyperlight host-function call.
++ *
++ * All pointers remain owned by the caller and are used only for the duration
++ * of ioctl(). The kernel validates lengths before passing the values to the
++ * existing serialized hl_hcall_* implementation.
++ */
++#define HLCALL_HOST_ABI_VERSION 1
++#define HLCALL_HOST_MAX_ARGS 4
++#define HLCALL_HOST_MAX_NAME 128
++
++enum hlcall_host_value_type {
++	HLCALL_HOST_I32 = 1,
++	HLCALL_HOST_U64 = 2,
++	HLCALL_HOST_STRING = 3,
++	HLCALL_HOST_VECBYTES = 4,
++};
++
++struct hlcall_host_arg {
++	__u32 type;
++	__u32 reserved;
++	__u64 value;
++	const void *data;
++	__u64 len;
++};
++
++struct hlcall_host_call {
++	__u32 version;
++	__u32 return_type;
++	const char *function;
++	__u64 function_len;
++	__u32 arg_count;
++	__u32 reserved;
++	struct hlcall_host_arg args[HLCALL_HOST_MAX_ARGS];
++	void *output;
++	__u64 output_cap;
++	__u64 output_len;
++	__s32 output_i32;
++	__u32 reserved2;
++	__u64 output_u64;
++};
++
++#define HLCALL_IOC_HOSTCALL _IOWR('H', 3, struct hlcall_host_call)
++
+diff --git a/plat/hyperlight/step.c b/plat/hyperlight/step.c
+index f3633814..0710070d 100644
+--- a/plat/hyperlight/step.c
++++ b/plat/hyperlight/step.c
+@@ -319,0 +320,98 @@ static int hlcall_ioctl(struct device *dev __unused, unsigned long cmd,
++	case HLCALL_IOC_HOSTCALL: {
++		struct hlcall_host_call *call = arg;
++		struct hl_param params[HLCALL_HOST_MAX_ARGS];
++		char function[HLCALL_HOST_MAX_NAME + 1];
++		__u64 max = hl_hcall_max_payload();
++		__u64 payload;
++		__u32 i;
++		int rc;
++
++		if (call->version != HLCALL_HOST_ABI_VERSION ||
++		    call->reserved || call->reserved2 ||
++		    !call->function || !call->function_len ||
++		    call->function_len > HLCALL_HOST_MAX_NAME ||
++		    call->arg_count > HLCALL_HOST_MAX_ARGS)
++			return EINVAL;
++		memcpy(function, call->function, call->function_len);
++		if (memchr(function, '\0', call->function_len))
++			return EINVAL;
++		function[call->function_len] = '\0';
++		payload = call->function_len;
++
++		memset(params, 0, sizeof(params));
++		for (i = 0; i < call->arg_count; i++) {
++			const struct hlcall_host_arg *in = &call->args[i];
++			struct hl_param *out = &params[i];
++
++			if (in->reserved || in->len > max ||
++			    in->len > (__u64)UINT32_MAX)
++				return EINVAL;
++			if (payload > max - in->len)
++				return E2BIG;
++			payload += in->len;
++			switch (in->type) {
++			case HLCALL_HOST_I32:
++				if (in->data || in->len ||
++				    in->value > (__u64)UINT32_MAX)
++					return EINVAL;
++				out->type = HL_PV_HLINT;
++				out->i32_val = (__s32)(__u32)in->value;
++				break;
++			case HLCALL_HOST_U64:
++				if (in->data || in->len)
++					return EINVAL;
++				out->type = HL_PV_HLULONG;
++				out->u64_val = in->value;
++				break;
++			case HLCALL_HOST_STRING:
++				if (!in->data)
++					return EINVAL;
++				out->type = HL_PV_HLSTRING;
++				out->str.ptr = in->data;
++				out->str.len = (__u32)in->len;
++				break;
++			case HLCALL_HOST_VECBYTES:
++				if (!in->data && in->len)
++					return EINVAL;
++				out->type = HL_PV_HLVECBYTES;
++				out->vec.ptr = in->data;
++				out->vec.len = (__u32)in->len;
++				break;
++			default:
++				return EINVAL;
++			}
++		}
++
++		call->output_len = 0;
++		switch (call->return_type) {
++		case HLCALL_HOST_I32:
++			if (call->output || call->output_cap)
++				return EINVAL;
++			rc = hl_hcall_int(function, params, call->arg_count,
++					  &call->output_i32);
++			break;
++		case HLCALL_HOST_U64:
++			if (call->output || call->output_cap)
++				return EINVAL;
++			rc = hl_hcall_ulong(function, params, call->arg_count,
++					    &call->output_u64);
++			break;
++		case HLCALL_HOST_STRING:
++			if (!call->output || call->output_cap != hl_call_cap)
++				return EINVAL;
++			rc = hl_hcall_string(function, params, call->arg_count,
++					     call->output, max,
++					     &call->output_len);
++			break;
++		case HLCALL_HOST_VECBYTES:
++			if (!call->output || call->output_cap != hl_call_cap)
++				return EINVAL;
++			rc = hl_hcall_vecbytes(function, params, call->arg_count,
++					       call->output, max,
++					       &call->output_len);
++			break;
++		default:
++			return EINVAL;
++		}
++		return rc < 0 ? EIO : 0;
++	}

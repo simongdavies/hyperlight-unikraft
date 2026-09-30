@@ -11,12 +11,17 @@
 //! and trust assumptions; this is not stock-workerd or production support.
 
 mod extensions;
+mod fetch;
 mod pool;
 mod protocol;
 mod sandbox;
 mod snapshot;
 
 pub use extensions::*;
+pub use fetch::{
+    FetchBroker, FetchBrokerConfig, FetchErrorCode, FetchLimits, FetchPolicy, FetchRequest,
+    FetchResponse,
+};
 pub use pool::{PoolSubmitError, RequestExecution, WorkerPoolStatus, WorkerRequestPool};
 pub use protocol::*;
 pub use sandbox::{
