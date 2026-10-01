@@ -146,11 +146,15 @@ fn agent_verify_all_packages() {
 fn agent_pip_install() {
     let rootfs = require_rootfs("agent");
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/agent/pip_install.py");
-    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
+    let mut builder = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(1536)
-        .network(NetworkPolicy::AllowAll)
-        .boot()
-        .unwrap();
+        .network(NetworkPolicy::AllowAll);
+    for key in ["PIP_INDEX_URL", "PIP_TRUSTED_HOST"] {
+        if let Ok(value) = std::env::var(key) {
+            builder = builder.env(key, value);
+        }
+    }
+    let mut sandbox = builder.boot().unwrap();
     sandbox.run(Exec::File(script)).unwrap();
     let output = sandbox.drain_output();
     assert!(

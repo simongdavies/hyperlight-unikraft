@@ -25,7 +25,9 @@ pub use fetch::{
     FetchBroker, FetchBrokerConfig, FetchErrorCode, FetchLimits, FetchPolicy, FetchRequest,
     FetchResponse,
 };
-pub use pool::{PoolSubmitError, RequestExecution, WorkerPoolStatus, WorkerRequestPool};
+pub use pool::{
+    PoolSubmitError, RequestExecution, WorkerPoolRestoreMode, WorkerPoolStatus, WorkerRequestPool,
+};
 pub use protocol::*;
 pub use sandbox::{
     ExecutionProfile, InitializationFailure, InitializationProfile, WorkerVersionSandbox,

@@ -36,7 +36,10 @@ Once packaged, start the minimal host HTTP bridge with:
 cargo run --example workerd-demo -- \
   --bundle examples/workerd-bundles/helloworld_esm.json \
   --bind 0.0.0.0:8787 \
-  --max-concurrent-sandboxes 4 --queue-capacity 64
+  --restore-mode prewarmed --prewarmed-sandboxes 8 \
+  --max-concurrent-restores 2 \
+  --max-concurrent-sandboxes 4 --queue-capacity 64 \
+  --profile-log-every 64
 curl http://127.0.0.1:8787/
 ```
 
@@ -52,14 +55,72 @@ hluk workerd --bundle examples/workerd-bundles/helloworld_esm.json \
   --url https://example.test/
 ```
 
-The bridge uses `--max-concurrent-sandboxes` fixed, long-lived worker threads
-(default 4). Each thread restores, runs, joins the watchdog for, and drops one
-fresh request VM before taking another job. Requests above that limit wait in a
-bounded queue (`--queue-capacity`, default 64); admission never waits for queue
-space, and overflow receives HTTP 503. It grants no guest filesystem or
-networking capability. Use `--request-timeout-ms` to set the watchdog deadline;
-a timed-out request receives HTTP 504 and later requests continue in fresh VMs.
-Both concurrency and queue capacity must be nonzero.
+The bridge defaults to `--restore-mode on-demand`, which preserves the original
+behavior: each owner restores, runs, joins the watchdog for, and drops one fresh
+request VM. `--restore-mode prewarmed` instead makes each owner restore its own
+VM before advertising readiness, execute at most one request in it, destroy it,
+and replenish. `--prewarmed-sandboxes` controls owner/ready capacity and the
+number of reserved VMs (and therefore reserved VM/RSS footprint). It may be
+larger than `--max-concurrent-sandboxes`, which remains the active execution cap
+so replenishment can overlap guest execution. In prewarmed mode,
+`--max-concurrent-restores` (default 1) separately bounds restore CPU pressure;
+owners waiting for a restore permit block rather than spin. Restored owners
+publish a mailbox handle into one bounded central ready queue. A single
+dispatcher atomically pairs a queued request with a ready owner under the
+active cap and sends the request to that owner's mailbox. Owners never compete
+on the request queue and VMs never move between OS threads. Both prewarm-only
+sizing flags are rejected in on-demand mode, where owner and effective
+execution concurrency equal `--max-concurrent-sandboxes`.
+
+Budget active execution and restore together for the host. For example, a
+32-core host could use 28 active sandboxes plus 4 concurrent restores, subject
+to measured guest CPU and memory headroom. Startup logs report active, owner,
+and restore counts; per-request profiles report ready wait and restore time.
+`/__hyperlight/pool-status` reports the selected mode plus the actual prewarmed
+VM inventory, ready and replenishing counts, and cumulative pairing hits and
+misses. Each restored VM records exactly one result when it takes a request: a
+hit when it was already ready at admission, or a miss when the request arrived
+before that VM finished restoring. Those prewarmed metrics remain zero in
+on-demand mode. Startup and status also distinguish the configured active cap,
+owner count, resolved `prewarmed_sandboxes`, resolved
+`max_concurrent_restores`, and effective concurrency
+(`min(owners, active cap)`). The two prewarm-only configuration fields are
+`null` in on-demand mode.
+
+Status also exposes admitted requests, current execution/restore occupancy,
+recycle queue depth, teardown activity, completion queue depth and callbacks in
+flight. Peak/count/total/average/maximum timing fields cover teardown,
+completion, restore-permit wait and restore execution; restore attempt,
+successful and failed counts are separate. Ready and replenishing observed
+minima/peaks remain cumulative from startup. Restore summaries include every
+restore attempt; `completed_restores` counts only successful restores. These
+fields let a 10 ms sampler distinguish restore pressure, recycle backlog,
+teardown, and slow response writes even when all current gauges are zero at
+phase boundaries.
+
+The execution permit covers guest execution, watchdog join, response
+validation, and one-shot VM teardown. Inventory and active accounting are
+updated and the permit is released before the user completion callback formats
+profiles or writes the HTTP response. Completion runs on a separate bounded
+completion executor, so the owner immediately enters recycle/restore scheduling
+and slow client writes consume neither owner restore time nor active execution
+capacity. Admission remains counted until completion finishes, bounding the
+completion backlog together with queued and executing work.
+
+`--profile-log-every N` controls deterministic `ExecutionProfile` logging on
+the response path. The default `1` preserves logging for every request, `0`
+disables it, and `64` logs request sequences 1, 65, 129, and so on. Each line
+includes the request sequence, request ID, and monotonically increasing sample
+number. Pool status exposes both the configured interval and
+`profile_samples_logged`. Benchmark both `1` and `0` once to quantify logging
+overhead, then use one matched sampled interval for comparative phase evidence.
+
+Requests above the active limit wait in a bounded queue (`--queue-capacity`,
+default 64); admission never waits for queue space, and overflow receives HTTP
+503. The bridge grants no guest filesystem or networking capability. Use
+`--request-timeout-ms` to set the watchdog deadline; a timed-out request receives
+HTTP 504 and later requests continue in fresh VMs. All capacities must be
+nonzero.
 
 ## Workerd-fork executor ABI
 
@@ -282,8 +343,17 @@ not issue ordinary vCPU ioctls and is joined before VM destruction. See the
 
 `execute_profiled()` reports each host-side phase separately:
 
+* `ready_wait_ms`: time from request admission until an owner starts it.
+* `replenishment_wait_ms`: time that prewarmed owner waited for a bounded
+  restore permit, exposing restore contention. Together with
+  `replenishment_restore_ms`, this describes creation of the one-shot VM assigned
+  to the request; for a hit, that work completed before admission and is not
+  request critical-path latency.
+* `replenishment_restore_ms`: restore time paid by a prewarmed owner before it
+  advertised readiness.
 * `snapshot_restore_ms`: clone the immutable snapshot handle and construct a
-  fresh Hyperlight VM from it.
+  fresh Hyperlight VM from it in on-demand mode. This remains zero for a
+  prewarmed request because restore completed before admission to that VM.
 * `request_setup_ms`: validate/serialize the request, clear request state,
   register `HostPrint`, and activate the request ID.
 * `guest_execution_ms`: resume the restored guest and execute `fetch` under
@@ -291,9 +361,15 @@ not issue ordinary vCPU ioctls and is joined before VM destruction. See the
 * `vm_teardown_ms`: drop the per-request VM after the watchdog has joined.
 * `response_finish_ms`: validate/take the completed response, or clear state
   after failure.
+* `total_ms`: owner execution time after the request is paired with a VM. It
+  excludes `ready_wait_ms`, includes `snapshot_restore_ms` in on-demand mode,
+  and excludes prewarm replenishment that completed before execution. Do not
+  sum `ready_wait_ms`, replenishment fields, and `total_ms` as if every field
+  were on the same critical path.
 
-The demo writes this profile as compact JSON to stderr for every request, and
-the memory probe includes profiles for hello, busy-loop timeout, and recovery.
+The demo writes this profile as compact JSON to stderr at the interval selected
+by `--profile-log-every`; the default still logs every request. The memory probe
+includes profiles for hello, busy-loop timeout, and recovery.
 The observed 60–100 ms restore portion is therefore not Worker JavaScript
 execution: it is the intentional cost of constructing a fresh isolated VM,
 restoring mapped snapshot state/page tables, and resuming it. Keeping that

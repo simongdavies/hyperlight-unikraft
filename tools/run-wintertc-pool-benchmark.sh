@@ -13,6 +13,10 @@ output_dir="$(realpath -m "$2")"
 scratch_mib="${3:-344}"
 pool_size="${4:-32}"
 queue_capacity="${WINTERTC_POOL_QUEUE_CAPACITY:-256}"
+restore_mode="${WINTERTC_POOL_RESTORE_MODE:-on-demand}"
+prewarmed_sandboxes="${WINTERTC_POOL_PREWARMED_SANDBOXES:-$pool_size}"
+max_concurrent_restores="${WINTERTC_POOL_MAX_CONCURRENT_RESTORES:-1}"
+profile_log_every="${WINTERTC_POOL_PROFILE_LOG_EVERY:-64}"
 bind="${WINTERTC_POOL_BIND:-127.0.0.1:8787}"
 base_url="http://$bind"
 bundle="examples/workerd-bundles/workerd-pool-benchmark.json"
@@ -30,16 +34,27 @@ test -f "$artifact_dir/rootfs.img"
 test -f "$bundle"
 mkdir -p "$output_dir"
 
+server_args=(
+    --executor "$artifact_dir/executor"
+    --rootfs "$artifact_dir/rootfs.img"
+    --bundle "$bundle"
+    --scratch-mb "$scratch_mib"
+    --bind "$bind"
+    --request-timeout-ms 30000
+    --restore-mode "$restore_mode"
+    --max-concurrent-sandboxes "$pool_size"
+    --queue-capacity "$queue_capacity"
+    --profile-log-every "$profile_log_every"
+)
+if [[ "$restore_mode" == "prewarmed" ]]; then
+    server_args+=(
+        --prewarmed-sandboxes "$prewarmed_sandboxes"
+        --max-concurrent-restores "$max_concurrent_restores"
+    )
+fi
+
 cargo run --release --locked --example workerd-demo -- \
-    --executor "$artifact_dir/executor" \
-    --rootfs "$artifact_dir/rootfs.img" \
-    --bundle "$bundle" \
-    --scratch-mb "$scratch_mib" \
-    --bind "$bind" \
-    --request-timeout-ms 30000 \
-    --max-concurrent-sandboxes "$pool_size" \
-    --queue-capacity "$queue_capacity" \
-    >"$server_log" 2>&1 &
+    "${server_args[@]}" >"$server_log" 2>&1 &
 server_pid=$!
 cleanup() {
     if kill -0 "$server_pid" 2>/dev/null; then
@@ -132,6 +147,41 @@ def process_sample():
     cpu_seconds = (int(fields[13]) + int(fields[14])) / clock_ticks
     return {"cpu_seconds": cpu_seconds, "rss_bytes": rss_kib * 1024}
 
+def is_quiescent(pool):
+    if any(
+        pool[field] != 0
+        for field in (
+            "admitted",
+            "active",
+            "queued",
+            "execution_slots_in_use",
+            "restore_slots_in_use",
+            "recycle_queue_depth",
+            "teardown_in_flight",
+            "completion_queue_depth",
+            "completion_in_flight",
+        )
+    ):
+        return False
+    if pool["restore_mode"] != "prewarmed":
+        return True
+    owners = pool["prewarmed_sandboxes"]
+    return (
+        pool["prewarmed_inventory"] == owners
+        and pool["prewarmed_ready"] == owners
+        and pool["prewarmed_replenishing"] == 0
+    )
+
+def wait_for_quiescence(label, timeout=120):
+    started = time.monotonic()
+    while True:
+        pool = get_json("/__hyperlight/pool-status")
+        if is_quiescent(pool):
+            return pool
+        if time.monotonic() - started > timeout:
+            raise SystemExit(f"{label}: pool did not become quiescent: {pool}")
+        time.sleep(0.01)
+
 def percentile(values, fraction):
     if not values:
         return None
@@ -154,6 +204,7 @@ def run_hey(label, args):
             except Exception:
                 pass
 
+    before_pool = wait_for_quiescence(f"{label} pre-run")
     before = process_sample()
     started = time.monotonic()
     sampler = threading.Thread(target=sample, daemon=True)
@@ -165,19 +216,71 @@ def run_hey(label, args):
         capture_output=True,
     )
     elapsed = time.monotonic() - started
-    stop.set()
-    sampler.join()
-    after = process_sample()
     if completed.returncode != 0:
+        stop.set()
+        sampler.join()
         raise SystemExit(
             f"{label}: hey failed with {completed.returncode}: {completed.stderr}"
         )
+    after_pool = wait_for_quiescence(f"{label} post-run")
+    stop.set()
+    sampler.join()
+    after = process_sample()
 
     rows = list(csv.DictReader(completed.stdout.splitlines()))
     latencies_ms = [float(row["response-time"]) * 1000 for row in rows]
     errors = sum(int(row["status-code"]) != 200 for row in rows)
-    peak_active = max((sample["pool"]["active"] for sample in samples), default=0)
-    peak_queued = max((sample["pool"]["queued"] for sample in samples), default=0)
+    pool_samples = [before_pool] + [sample["pool"] for sample in samples] + [after_pool]
+    peak_active = max(sample["active"] for sample in pool_samples)
+    peak_admitted = max(sample["admitted"] for sample in pool_samples)
+    peak_queued = max(sample["queued"] for sample in pool_samples)
+    peak_execution_slots = max(
+        sample["execution_slots_in_use"] for sample in pool_samples
+    )
+    peak_restore_slots = max(sample["restore_slots_in_use"] for sample in pool_samples)
+    peak_completion_in_flight = max(
+        sample["completion_in_flight"] for sample in pool_samples
+    )
+    peak_completion_queue = max(
+        sample["completion_queue_depth"] for sample in pool_samples
+    )
+    peak_recycle_queue = max(
+        sample["recycle_queue_depth"] for sample in pool_samples
+    )
+    peak_teardown_in_flight = max(
+        sample["teardown_in_flight"] for sample in pool_samples
+    )
+    minimum_ready = min(sample["prewarmed_ready"] for sample in pool_samples)
+    peak_replenishing = max(
+        sample["prewarmed_replenishing"] for sample in pool_samples
+    )
+    restore_attempts = (
+        after_pool["restore_attempts"] - before_pool["restore_attempts"]
+    )
+    completed_restores = (
+        after_pool["completed_restores"] - before_pool["completed_restores"]
+    )
+    failed_restores = (
+        after_pool["failed_restores"] - before_pool["failed_restores"]
+    )
+    restore_wait_total_ms = (
+        after_pool["restore_wait_total_ms"] - before_pool["restore_wait_total_ms"]
+    )
+    restore_total_ms = (
+        after_pool["restore_total_ms"] - before_pool["restore_total_ms"]
+    )
+    completed_completions = (
+        after_pool["completed_completions"] - before_pool["completed_completions"]
+    )
+    completion_total_ms = (
+        after_pool["completion_total_ms"] - before_pool["completion_total_ms"]
+    )
+    completed_teardowns = (
+        after_pool["completed_teardowns"] - before_pool["completed_teardowns"]
+    )
+    teardown_total_ms = (
+        after_pool["teardown_total_ms"] - before_pool["teardown_total_ms"]
+    )
     peak_rss = max(
         [before["rss_bytes"], after["rss_bytes"]]
         + [sample["process"]["rss_bytes"] for sample in samples]
@@ -200,10 +303,52 @@ def run_hey(label, args):
         },
         "pool": {
             "configured_pool_size": pool_size,
-            "model": "fixed request workers with restore-on-acquisition",
+            "model": (
+                "central ready-owner mailbox dispatch with bounded recycle"
+                if before_pool["restore_mode"] == "prewarmed"
+                else "fixed owner restore-on-acquisition"
+            ),
             "queue_capacity": queue_capacity,
+            "peak_admitted": peak_admitted,
             "peak_active": peak_active,
             "peak_queued": peak_queued,
+            "peak_execution_slots_in_use": peak_execution_slots,
+            "peak_restore_slots_in_use": peak_restore_slots,
+            "peak_completion_in_flight": peak_completion_in_flight,
+            "peak_completion_queue_depth": peak_completion_queue,
+            "peak_recycle_queue_depth": peak_recycle_queue,
+            "peak_teardown_in_flight": peak_teardown_in_flight,
+            "minimum_prewarmed_ready": minimum_ready,
+            "peak_prewarmed_replenishing": peak_replenishing,
+            "restore_attempts": restore_attempts,
+            "completed_restores": completed_restores,
+            "failed_restores": failed_restores,
+            "restore_wait_total_ms": restore_wait_total_ms,
+            "restore_wait_average_ms": (
+                restore_wait_total_ms / restore_attempts
+                if restore_attempts
+                else None
+            ),
+            "restore_total_ms": restore_total_ms,
+            "restore_average_ms": (
+                restore_total_ms / restore_attempts if restore_attempts else None
+            ),
+            "completed_completions": completed_completions,
+            "completion_total_ms": completion_total_ms,
+            "completion_average_ms": (
+                completion_total_ms / completed_completions
+                if completed_completions
+                else None
+            ),
+            "completed_teardowns": completed_teardowns,
+            "teardown_total_ms": teardown_total_ms,
+            "teardown_average_ms": (
+                teardown_total_ms / completed_teardowns
+                if completed_teardowns
+                else None
+            ),
+            "status_before": before_pool,
+            "status_after": after_pool,
         },
         "process": {
             "cpu_seconds": cpu_seconds,
@@ -213,6 +358,7 @@ def run_hey(label, args):
         "sample_count": len(samples),
     }
 
+wait_for_quiescence("initial prewarm")
 status, payload = get_sync()
 if status != 200 or len(payload) != BASELINE["payload_bytes"]:
     raise SystemExit(
@@ -248,13 +394,7 @@ for concurrency in (32, 64, 128):
     )
 
 refill_started = time.monotonic()
-while True:
-    final_pool = get_json("/__hyperlight/pool-status")
-    if final_pool["active"] == 0 and final_pool["queued"] == 0:
-        break
-    if time.monotonic() - refill_started > 30:
-        raise SystemExit(f"pool did not refill: {final_pool}")
-    time.sleep(0.01)
+final_pool = wait_for_quiescence("final refill")
 refill_seconds = time.monotonic() - refill_started
 recovery_status, recovery_payload = get_sync()
 
@@ -270,7 +410,21 @@ report = {
         "bundle_sha256": hashlib.sha256(open(bundle, "rb").read()).hexdigest(),
         "scratch_mib": scratch_mib,
         "pool_size": pool_size,
-        "pool_model": "fixed request workers with restore-on-acquisition",
+        "pool_model": baseline_run["pool"]["model"],
+        "restore_mode": baseline_run["pool"]["status_before"]["restore_mode"],
+        "owner_count": baseline_run["pool"]["status_before"]["owner_count"],
+        "effective_concurrency": baseline_run["pool"]["status_before"][
+            "effective_concurrency"
+        ],
+        "prewarmed_sandboxes": baseline_run["pool"]["status_before"][
+            "prewarmed_sandboxes"
+        ],
+        "max_concurrent_restores": baseline_run["pool"]["status_before"][
+            "max_concurrent_restores"
+        ],
+        "profile_log_every": baseline_run["pool"]["status_before"][
+            "profile_log_every"
+        ],
         "queue_capacity": queue_capacity,
         "payload_bytes": len(payload),
         "payload_sha256": hashlib.sha256(payload).hexdigest(),

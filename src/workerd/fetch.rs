@@ -224,7 +224,7 @@ impl FetchBroker {
         FetchSession {
             inner: Arc::new(FetchSessionInner {
                 broker: self.clone(),
-                deadline,
+                deadline: Mutex::new(deadline),
                 next_id: AtomicU64::new(1),
                 v2_next_id: AtomicU64::new(1),
                 closed: AtomicBool::new(false),
@@ -569,7 +569,7 @@ pub(crate) struct FetchSession {
 
 struct FetchSessionInner {
     broker: FetchBroker,
-    deadline: Instant,
+    deadline: Mutex<Instant>,
     next_id: AtomicU64,
     v2_next_id: AtomicU64,
     closed: AtomicBool,
@@ -731,6 +731,22 @@ impl PreparedFetchRequest {
 }
 
 impl FetchSession {
+    pub(crate) fn set_deadline(&self, deadline: Instant) {
+        *self
+            .inner
+            .deadline
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = deadline;
+    }
+
+    fn deadline(&self) -> Instant {
+        *self
+            .inner
+            .deadline
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
     fn start_json(&self, json: &str) -> Result<String> {
         let result = self.start(json);
         let value = match result {
@@ -890,7 +906,7 @@ impl FetchSession {
         let result = Arc::new(Mutex::new(None));
         let task_result = result.clone();
         let broker = self.inner.broker.clone();
-        let deadline = self.inner.deadline;
+        let deadline = self.deadline();
         let task = fetch_runtime().spawn(async move {
             let request_id = request.request_id.clone();
             let completed = broker.execute_inner(request, body, deadline).await;
@@ -1221,7 +1237,7 @@ impl FetchSession {
                 let shared = Arc::new(Mutex::new(V2Shared::default()));
                 let broker = self.inner.broker.clone();
                 let task_shared = shared.clone();
-                let deadline = self.inner.deadline;
+                let deadline = self.deadline();
                 let max_read_chunk = operation.max_read_chunk;
                 let task = fetch_runtime().spawn(async move {
                     broker

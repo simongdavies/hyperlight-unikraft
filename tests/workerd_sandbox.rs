@@ -7,7 +7,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use hyperlight_unikraft::workerd::{
     Error, FetchBroker, FetchBrokerConfig, FetchLimits, FetchPolicy, Header, MAX_BODY_BYTES,
     PROTOCOL_VERSION, RequestEnvelope, SnapshotBinding, VerifiedSnapshot, WorkerBundle,
-    WorkerRequestPool, WorkerVersionId, WorkerVersionSandbox,
+    WorkerPoolRestoreMode, WorkerRequestPool, WorkerVersionId, WorkerVersionSandbox,
 };
 use hyperlight_unikraft::{AllowList, NetworkPolicy};
 use std::fs;
@@ -478,6 +478,175 @@ fn request_pool_parallelism_bounds_queue_isolation_and_timeout_recovery() {
         assert_eq!(response.status, 200, "request VM was reused");
         assert_eq!(STANDARD.decode(response.body_base64).unwrap(), b"1");
     }
+}
+
+#[test]
+fn prewarmed_pool_is_ready_one_shot_bounded_and_replenishes() {
+    #[cfg(windows)]
+    hyperlight_unikraft::configure_surrogates(4);
+    let (rootfs, executor) = artifacts();
+    let (port, stop) = loopback_server();
+    let version = WorkerVersionId::new("prewarmed-worker-v1").unwrap();
+    let fetch_broker = FetchBroker::new(FetchBrokerConfig {
+        policy: FetchPolicy::new(
+            NetworkPolicy::AllowList(AllowList::from_hosts(&["localhost"]).unwrap()),
+            ["http"],
+            [port],
+        )
+        .allow_loopback(true),
+        limits: FetchLimits::default(),
+    })
+    .unwrap();
+    let worker = WorkerVersionSandbox::initialize_with_fetch(
+        bundle(version, "export default {}"),
+        &rootfs,
+        &executor,
+        64,
+        Duration::from_secs(10),
+        fetch_broker,
+    )
+    .expect("real hypervisor must boot the v0.14 fixture");
+    let pool = WorkerRequestPool::with_restore_mode(
+        worker,
+        1,
+        2,
+        WorkerPoolRestoreMode::Prewarmed {
+            sandboxes: 2,
+            max_concurrent_restores: 1,
+        },
+    )
+    .unwrap();
+    wait_for_status(&pool, |status| {
+        status.prewarmed_inventory == 2 && status.ready == 2 && status.replenishing == 0
+    });
+    let initial_status = pool.status();
+    assert_eq!(initial_status.execution_slots_in_use, 0);
+    assert_eq!(initial_status.restore_slots_in_use, 0);
+    assert_eq!(initial_status.admitted, 0);
+    assert_eq!(initial_status.completion_queue_depth, 0);
+    assert_eq!(initial_status.completion_in_flight, 0);
+    assert_eq!(initial_status.completed_restores, 2);
+    assert_eq!(initial_status.failed_restores, 0);
+    assert_eq!(initial_status.restore_attempts, 2);
+    assert_eq!(initial_status.ready_peak, 2);
+    assert_eq!(initial_status.replenishing_peak, 1);
+
+    let (tx, rx) = mpsc::channel();
+    for id in ["burst-a", "burst-b", "burst-c"] {
+        let tx = tx.clone();
+        pool.try_submit(
+            request(id, "delay"),
+            Duration::from_secs(5),
+            move |result| {
+                let _ = tx.send(result);
+            },
+        )
+        .unwrap();
+    }
+    wait_for_status(&pool, |status| status.active == 1 && status.queued == 2);
+    assert_eq!(
+        pool.try_submit(
+            request("overflow", "instance"),
+            Duration::from_secs(5),
+            |_| {},
+        ),
+        Err(hyperlight_unikraft::workerd::PoolSubmitError::Full)
+    );
+    for _ in 0..3 {
+        let execution = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(execution.result.is_ok());
+        assert_eq!(execution.profile.snapshot_restore_ms, 0.0);
+        assert!(execution.profile.replenishment_restore_ms > 0.0);
+        assert!(pool.status().active <= 1);
+        assert!(pool.status().replenishing <= 1);
+    }
+    let status = pool.status();
+    assert_eq!(status.prewarmed_hits, 2);
+    assert_eq!(status.prewarmed_misses, 1);
+    assert!(status.execution_slots_in_use <= 1);
+    assert!(status.restore_slots_in_use <= 1);
+    assert!(status.ready_min <= status.ready);
+    assert!(status.restore_wait_total_ms >= status.restore_wait_max_ms);
+    assert!(status.restore_total_ms >= status.restore_max_ms);
+    wait_for_status(&pool, |status| status.completed_completions >= 3);
+    wait_for_status(&pool, |status| status.completed_teardowns >= 3);
+    wait_for_status(&pool, |status| {
+        status.prewarmed_inventory == 2 && status.ready == 2 && status.replenishing == 0
+    });
+    let replenished_status = pool.status();
+    assert!(replenished_status.completed_restores >= 5);
+    assert_eq!(
+        replenished_status.restore_attempts,
+        replenished_status.completed_restores
+    );
+    assert_eq!(replenished_status.completion_in_flight, 0);
+    assert_eq!(replenished_status.completion_queue_depth, 0);
+    assert_eq!(replenished_status.admitted, 0);
+    assert!(replenished_status.completion_queue_peak >= 1);
+    assert_eq!(replenished_status.teardown_peak, 1);
+    assert!(replenished_status.completion_total_ms >= replenished_status.completion_max_ms);
+    assert!(replenished_status.teardown_total_ms >= replenished_status.teardown_max_ms);
+
+    let teardowns_before_timeout = replenished_status.completed_teardowns;
+    let tx_timeout = tx.clone();
+    pool.try_submit(
+        request("zero-timeout", "instance"),
+        Duration::ZERO,
+        move |result| {
+            let _ = tx_timeout.send(result);
+        },
+    )
+    .unwrap();
+    let timeout = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(matches!(timeout.result, Err(Error::Timeout)));
+    wait_for_status(&pool, |status| {
+        status.completed_teardowns == teardowns_before_timeout + 1
+    });
+    wait_for_status(&pool, |status| {
+        status.prewarmed_inventory == 2 && status.ready == 2 && status.replenishing == 0
+    });
+
+    for id in ["fresh-one", "fresh-two"] {
+        let tx = tx.clone();
+        pool.try_submit(
+            request(id, "instance"),
+            Duration::from_secs(5),
+            move |result| {
+                let _ = tx.send(result);
+            },
+        )
+        .unwrap();
+        let response = rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(STANDARD.decode(response.body_base64).unwrap(), b"1");
+    }
+    wait_for_status(&pool, |status| {
+        status.prewarmed_inventory == 2 && status.ready == 2 && status.replenishing == 0
+    });
+
+    let tx = tx.clone();
+    pool.try_submit(
+        outbound_request(
+            "prewarmed-fetch",
+            "broker",
+            format!("http://localhost:{port}/"),
+        ),
+        Duration::from_secs(5),
+        move |result| {
+            let _ = tx.send(result);
+        },
+    )
+    .unwrap();
+    let response = rx
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap()
+        .result
+        .unwrap();
+    assert_eq!(STANDARD.decode(response.body_base64).unwrap(), b"ok");
+    stop.store(true, Ordering::Release);
 }
 
 #[allow(clippy::permissions_set_readonly_false)]

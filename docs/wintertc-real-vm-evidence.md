@@ -505,9 +505,26 @@ jq -e '.accepted == true and .refill.passed == true' \
   build-elfloader/wintertc-pool-performance/wintertc-pool-performance.json
 ```
 
+For the prewarmed A/B, keep the positional active cap unchanged and select the
+ready-owner pool through environment variables:
+
+```sh
+WINTERTC_POOL_RESTORE_MODE=prewarmed \
+WINTERTC_POOL_PREWARMED_SANDBOXES=48 \
+WINTERTC_POOL_MAX_CONCURRENT_RESTORES=8 \
+WINTERTC_POOL_PROFILE_LOG_EVERY=64 \
+bash tools/run-wintertc-pool-benchmark.sh \
+  build-elfloader/workerd-executor \
+  build-elfloader/wintertc-pool-performance-o48-r8 \
+  343 \
+  32
+```
+
 The machine-readable report records the exact command, payload length and
-hash, configured pool and queue capacity, peak active and queued requests,
-throughput, p50/p95/p99, errors, CPU, RSS, refill time, and post-load recovery.
+hash, resolved mode/owner/restore configuration, peak admitted/active/queued
+requests, ready-owner and recycle pressure, teardown/restore/completion
+activity and timings, throughput, p50/p95/p99, errors, CPU, RSS, refill time,
+and post-load recovery.
 It fails immediately when the exact baseline is not beaten, while retaining
 the JSON and server log for diagnosis. The sustained runs must also have zero
 errors. Preserve the result, server log, and

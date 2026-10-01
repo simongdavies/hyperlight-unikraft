@@ -23,6 +23,9 @@ pub struct InitializationProfile {
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct ExecutionProfile {
+    pub ready_wait_ms: f64,
+    pub replenishment_wait_ms: f64,
+    pub replenishment_restore_ms: f64,
     pub snapshot_restore_ms: f64,
     pub request_setup_ms: f64,
     pub guest_execution_ms: f64,
@@ -221,6 +224,13 @@ pub struct WorkerVersionSandbox {
     image: VerifiedSnapshot,
     fetch_broker: FetchBroker,
     timer_broker: TimerBroker,
+}
+
+pub(super) struct RestoredWorkerVersionSandbox {
+    app: AppSandbox,
+    responses: Responses,
+    fetch_session: super::fetch::FetchSession,
+    timer_session: super::timer::TimerSession,
 }
 
 impl WorkerVersionSandbox {
@@ -496,16 +506,98 @@ impl WorkerVersionSandbox {
     ) -> (Result<ResponseEnvelope>, ExecutionProfile) {
         let total_started = Instant::now();
         let mut profile = ExecutionProfile::default();
+        if version != self.worker_version() {
+            profile.total_ms = Self::elapsed_ms(total_started);
+            return (
+                Err(Error::State(
+                    "sandbox cannot be reassigned across Worker versions".into(),
+                )),
+                profile,
+            );
+        }
+        let (restored, restore_ms) = match self.restore() {
+            Ok(restored) => restored,
+            Err(error) => {
+                profile.total_ms = Self::elapsed_ms(total_started);
+                return (Err(error), profile);
+            }
+        };
+        let (result, mut execution_profile) =
+            restored.execute_profiled(request, timeout, total_started);
+        execution_profile.snapshot_restore_ms = restore_ms;
+        execution_profile.total_ms = Self::elapsed_ms(total_started);
+        (result, execution_profile)
+    }
+
+    pub(super) fn restore(&self) -> Result<(RestoredWorkerVersionSandbox, f64)> {
+        let restore_started = Instant::now();
+        let responses = Responses::default();
+        let fetch_session = self.fetch_broker.session(Instant::now());
+        let timer_session = self.timer_broker.session();
+        let (sandbox, config) = crate::restore_snapshot_with(
+            self.image.snapshot.clone(),
+            vec![],
+            None,
+            None,
+            |functions| {
+                responses.register(functions)?;
+                self.fetch_broker
+                    .register(functions, fetch_session.clone())?;
+                self.timer_broker
+                    .register(functions, timer_session.clone())?;
+                Ok::<(), Error>(())
+            },
+        )?;
+        Ok((
+            RestoredWorkerVersionSandbox {
+                app: AppSandbox {
+                    sandbox,
+                    config,
+                    exited: None,
+                    pending: None,
+                },
+                responses,
+                fetch_session,
+                timer_session,
+            },
+            Self::elapsed_ms(restore_started),
+        ))
+    }
+}
+
+impl RestoredWorkerVersionSandbox {
+    pub(super) fn execute_profiled(
+        self,
+        request: RequestEnvelope,
+        timeout: Duration,
+        total_started: Instant,
+    ) -> (Result<ResponseEnvelope>, ExecutionProfile) {
+        self.execute_profiled_with_teardown_observer(request, timeout, total_started, || {}, || {})
+    }
+
+    pub(super) fn execute_profiled_with_teardown_observer(
+        self,
+        request: RequestEnvelope,
+        timeout: Duration,
+        total_started: Instant,
+        teardown_started: impl FnOnce(),
+        teardown_finished: impl FnOnce(),
+    ) -> (Result<ResponseEnvelope>, ExecutionProfile) {
+        let Self {
+            app,
+            responses,
+            fetch_session,
+            timer_session,
+        } = self;
+        let mut app = ObservedAppTeardown::new(app, teardown_started, teardown_finished);
+        let mut profile = ExecutionProfile::default();
         macro_rules! fail {
             ($error:expr) => {{
-                profile.total_ms = Self::elapsed_ms(total_started);
+                app.teardown();
+                profile.vm_teardown_ms = app.elapsed_ms();
+                profile.total_ms = WorkerVersionSandbox::elapsed_ms(total_started);
                 return (Err($error), profile);
             }};
-        }
-        if version != self.worker_version() {
-            fail!(Error::State(
-                "sandbox cannot be reassigned across Worker versions".into(),
-            ));
         }
         let setup_started = Instant::now();
         let encoded = match request.to_json() {
@@ -519,52 +611,26 @@ impl WorkerVersionSandbox {
             Some(deadline) => deadline,
             None => fail!(Error::State("timeout too large".into())),
         };
-        let fetch_session = self.fetch_broker.session(deadline);
-        let timer_session = self.timer_broker.session();
-        let responses = Responses::default();
-        profile.request_setup_ms += Self::elapsed_ms(setup_started);
-
-        let restore_started = Instant::now();
-        let (sandbox, config) = match crate::restore_snapshot_with(
-            self.image.snapshot.clone(),
-            vec![],
-            None,
-            None,
-            |functions| {
-                responses.register(functions)?;
-                self.fetch_broker
-                    .register(functions, fetch_session.clone())?;
-                self.timer_broker
-                    .register(functions, timer_session.clone())?;
-                Ok::<(), Error>(())
-            },
-        ) {
-            Ok(restored) => restored,
-            Err(error) => fail!(error),
-        };
-        profile.snapshot_restore_ms = Self::elapsed_ms(restore_started);
-
-        let setup_started = Instant::now();
-        let mut app = AppSandbox {
-            sandbox,
-            config,
-            exited: None,
-            pending: None,
-        };
+        fetch_session.set_deadline(deadline);
         if let Err(error) = responses.begin(&request.request_id) {
             fail!(error);
         }
-        profile.request_setup_ms += Self::elapsed_ms(setup_started);
+        profile.request_setup_ms = WorkerVersionSandbox::elapsed_ms(setup_started);
 
         let execution_started = Instant::now();
-        let result = timed_request(&mut app, encoded, deadline, fetch_session, timer_session);
-        profile.guest_execution_ms = Self::elapsed_ms(execution_started);
+        let result = timed_request(
+            app.app_mut(),
+            encoded,
+            deadline,
+            fetch_session.clone(),
+            timer_session.clone(),
+        );
+        profile.guest_execution_ms = WorkerVersionSandbox::elapsed_ms(execution_started);
 
         // Join the watchdog before dropping the VM; no late kill can hit the
         // next request. Dropping also discards timers, threads and guest secrets.
-        let teardown_started = Instant::now();
-        drop(app);
-        profile.vm_teardown_ms = Self::elapsed_ms(teardown_started);
+        app.teardown();
+        profile.vm_teardown_ms = app.elapsed_ms();
 
         let finish_started = Instant::now();
         let result = match result {
@@ -574,9 +640,75 @@ impl WorkerVersionSandbox {
                 Err(clear_error) => Err(clear_error),
             },
         };
-        profile.response_finish_ms = Self::elapsed_ms(finish_started);
-        profile.total_ms = Self::elapsed_ms(total_started);
+        profile.response_finish_ms = WorkerVersionSandbox::elapsed_ms(finish_started);
+        profile.total_ms = WorkerVersionSandbox::elapsed_ms(total_started);
         (result, profile)
+    }
+}
+
+struct ObservedAppTeardown<Started: FnOnce(), Finished: FnOnce()> {
+    app: Option<AppSandbox>,
+    started: Option<Started>,
+    finished: Option<Finished>,
+    elapsed: Duration,
+}
+
+impl<Started: FnOnce(), Finished: FnOnce()> ObservedAppTeardown<Started, Finished> {
+    fn new(app: AppSandbox, started: Started, finished: Finished) -> Self {
+        Self {
+            app: Some(app),
+            started: Some(started),
+            finished: Some(finished),
+            elapsed: Duration::ZERO,
+        }
+    }
+
+    fn app_mut(&mut self) -> &mut AppSandbox {
+        self.app.as_mut().expect("VM has not been torn down")
+    }
+
+    fn teardown(&mut self) {
+        let Some(app) = self.app.take() else {
+            return;
+        };
+        if let Some(started) = self.started.take() {
+            started();
+        }
+        let teardown_started = Instant::now();
+        let observer = ScopeExit::new(self.finished.take().expect("teardown observer is paired"));
+        drop(app);
+        self.elapsed = teardown_started.elapsed();
+        drop(observer);
+    }
+
+    fn elapsed_ms(&self) -> f64 {
+        self.elapsed.as_secs_f64() * 1000.0
+    }
+}
+
+impl<Started: FnOnce(), Finished: FnOnce()> Drop for ObservedAppTeardown<Started, Finished> {
+    fn drop(&mut self) {
+        self.teardown();
+    }
+}
+
+struct ScopeExit<F: FnOnce()> {
+    callback: Option<F>,
+}
+
+impl<F: FnOnce()> ScopeExit<F> {
+    fn new(callback: F) -> Self {
+        Self {
+            callback: Some(callback),
+        }
+    }
+}
+
+impl<F: FnOnce()> Drop for ScopeExit<F> {
+    fn drop(&mut self) {
+        if let Some(callback) = self.callback.take() {
+            callback();
+        }
     }
 }
 
