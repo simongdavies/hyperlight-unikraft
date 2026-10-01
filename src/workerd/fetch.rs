@@ -1164,7 +1164,7 @@ impl FetchSession {
             return -crate::errno::EIO;
         };
         let Some(mut operation) = operations.remove(&operation_id) else {
-            return -crate::errno::ENOENT;
+            return self.v2_missing_operation_errno(operation_id);
         };
         if chunk.len() > operation.max_write_chunk {
             operations.insert(operation_id, operation);
@@ -1342,7 +1342,7 @@ impl FetchSession {
             return -crate::errno::EIO;
         };
         let Some(operation) = operations.get_mut(&operation_id) else {
-            return -crate::errno::ENOENT;
+            return self.v2_missing_operation_errno(operation_id);
         };
         match &mut operation.state {
             V2OperationState::ReceivingHeaders { .. } => -crate::errno::EINVAL,
@@ -1359,6 +1359,14 @@ impl FetchSession {
                 0
             }
             V2OperationState::Failed(_) => -crate::errno::EPIPE,
+        }
+    }
+
+    fn v2_missing_operation_errno(&self, operation_id: u64) -> i32 {
+        if operation_id > 0 && operation_id < self.inner.v2_next_id.load(Ordering::Acquire) {
+            -crate::errno::EPIPE
+        } else {
+            -crate::errno::ENOENT
         }
     }
 
@@ -2550,6 +2558,56 @@ mod tests {
         let _ = request_rx.try_recv().unwrap();
         assert_eq!(session.v2_write(1, vec![2]), 1);
         assert_eq!(session.v2_cancel(1), 0);
+        stop.store(true, Ordering::Release);
+    }
+
+    #[test]
+    fn v2_late_write_and_finish_after_error_collection_return_epipe() {
+        let (port, stop) = serve(|_, _| (200, vec![], vec![]));
+        let broker = broker(port, 1024, 1);
+        let session = broker.session(Instant::now() + Duration::from_secs(5));
+        let (operation_id, _, _) = v2_start(&session, port, "POST", Some(1), 16, 16);
+
+        let (request_tx, _request_rx) = mpsc::channel(V2_QUEUE_CHUNKS);
+        let (_response_tx, response_rx) = mpsc::channel(V2_QUEUE_CHUNKS);
+        let shared = Arc::new(Mutex::new(V2Shared {
+            error: Some(FetchFailure::connect("response failed during upload")),
+            ..V2Shared::default()
+        }));
+        let task = fetch_runtime().spawn(std::future::pending());
+        session
+            .inner
+            .v2_operations
+            .lock()
+            .unwrap()
+            .get_mut(&operation_id)
+            .unwrap()
+            .state = V2OperationState::Streaming {
+            request_tx: Some(request_tx),
+            request_bytes: 0,
+            expected_body_length: Some(1),
+            response_rx,
+            pending_response: VecDeque::new(),
+            shared,
+            task,
+        };
+
+        let poll: serde_json::Value =
+            serde_json::from_str(&session.v2_poll_json(operation_id).unwrap()).unwrap();
+        assert_eq!(poll["error"]["code"], "connect_failed");
+
+        assert_eq!(
+            session.v2_write(operation_id, b"x".to_vec()),
+            -crate::errno::EPIPE
+        );
+        assert_eq!(session.v2_finish(operation_id), -crate::errno::EPIPE);
+        assert_eq!(session.v2_write(0, vec![]), -crate::errno::ENOENT);
+        assert_eq!(session.v2_finish(0), -crate::errno::ENOENT);
+        assert_eq!(
+            session.v2_write(operation_id + 1, vec![]),
+            -crate::errno::ENOENT
+        );
+        assert_eq!(session.v2_finish(operation_id + 1), -crate::errno::ENOENT);
         stop.store(true, Ordering::Release);
     }
 
