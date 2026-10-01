@@ -1,140 +1,70 @@
 # Run Workerd in Hyperlight-Unikraft on Azure KVM
 
-This walkthrough provisions a clean Azure Linux VM, validates native KVM,
-builds and packages a trusted Workerd executor, runs the HTTP demo, exercises
+This walkthrough starts from a clean Azure Linux VM, validates native KVM,
+builds and packages a Workerd executor, runs the HTTP demo, exercises
 the runnable WinterTC routes, and compares on-demand and adaptive prewarmed
 execution.
 
-> [!WARNING]
-> Do not use QEMU for this walkthrough. The runtime path is native Linux KVM
-> through `/dev/kvm`.
+The commands use 384 MiB of guest scratch memory.
 
-> [!WARNING]
-> Workerd by itself is not a hardened sandbox. The boundary described here is
-> the Hyperlight micro-VM plus the explicitly registered host capabilities.
-> Treat the Workerd executor and Worker bundle as trusted build inputs.
+## 1. VM prerequisites
 
-The commands target signed Hyperlight-Unikraft commit
-`d240b022fe677db482a5b10b6cea16d5ab39cf07`. Use 384 MiB of guest scratch
-memory. A previous qualification found 343 MiB to be the minimum complete-pass
-boundary and 342 MiB to fail during boot; do not operate at that cliff.
+- Existing Ubuntu 24.04 x86-64 Azure VM.
+- `Standard_D32s_v5` or equivalent nested-virtualization-capable size.
+- 32 vCPUs and approximately 128 GiB RAM for the concurrency examples.
+- Nested virtualization with `/dev/kvm`.
+- Sufficient ext4 disk space for Rust, Docker, Bazel, Workerd, and build
+  outputs.
+- Outbound access to package repositories and GitHub.
+- SSH access to the VM.
+- Access to the selected demo/benchmark port when the client is remote.
 
-## 1. Provision a dedicated Azure VM
+## 2. Clone the branch with submodules
 
-Use a unique resource group containing no shared resources. The example below
-uses a 32-vCPU `Standard_D32s_v5` VM in UK South, Ubuntu 24.04, Standard
-security, a Premium OS disk, and SSH restricted to one operator address.
+After connecting to the VM:
 
-Run from a machine with Azure CLI authenticated:
-
-```powershell
-$ErrorActionPreference = 'Stop'
-
-$Subscription = '<subscription-name-or-id>'
-$Location = 'uksouth'
-$Stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddHHmmss')
-$ResourceGroup = "hluk-workerd-kvm-$Stamp-rg"
-$VmName = 'workerd-kvm-01'
-$NsgName = "$VmName-nsg"
-$PublicIpName = "$VmName-ip"
-$Size = 'Standard_D32s_v5'
-$Image = 'Canonical:ubuntu-24_04-lts:server:latest'
-$AdminUser = 'azureuser'
-$SshPublicKeyPath = '<path-to-public-key>'
-$AdminSourceCidr = '<operator-public-ip>/32'
-
-az account set --subscription $Subscription
-$SubscriptionId = az account show --query id -o tsv
-
-if ((az group exists --name $ResourceGroup).Trim() -ne 'false') {
-  throw "Resource group already exists: $ResourceGroup"
-}
-
-az group create `
-  --name $ResourceGroup `
-  --location $Location `
-  --tags purpose=workerd-hyperlight-kvm expires=10h
-
-az network nsg create `
-  --resource-group $ResourceGroup `
-  --name $NsgName `
-  --location $Location
-
-az network nsg rule create `
-  --resource-group $ResourceGroup `
-  --nsg-name $NsgName `
-  --name AllowSshFromOperator `
-  --priority 100 `
-  --access Allow `
-  --protocol Tcp `
-  --direction Inbound `
-  --source-address-prefixes $AdminSourceCidr `
-  --destination-port-ranges 22
-
-az vm create `
-  --resource-group $ResourceGroup `
-  --name $VmName `
-  --location $Location `
-  --size $Size `
-  --image $Image `
-  --admin-username $AdminUser `
-  --ssh-key-values $SshPublicKeyPath `
-  --security-type Standard `
-  --storage-sku Premium_LRS `
-  --os-disk-size-gb 512 `
-  --public-ip-address $PublicIpName `
-  --public-ip-sku Standard `
-  --nsg $NsgName
-
-$PublicIp = az vm show `
-  --resource-group $ResourceGroup `
-  --name $VmName `
-  --show-details `
-  --query publicIps `
-  -o tsv
-
-"Subscription: $SubscriptionId"
-"Resource group: $ResourceGroup"
-"VM: $VmName"
-"Public IP: $PublicIp"
+```bash
+mkdir -p "$HOME/src" "$HOME/results"
+cd "$HOME/src"
+git clone --branch simongdavies-adaptive-prewarm-profiling --recurse-submodules https://github.com/simongdavies/hyperlight-unikraft.git && cd hyperlight-unikraft
+git status --short
+git rev-parse --short HEAD
 ```
 
-Expected success indicators:
+Expected: the checkout is on
+`simongdavies-adaptive-prewarm-profiling`, all submodules are initialized, and
+`git status --short` prints nothing.
 
-- `az vm create` returns `powerState: VM running`;
-- the VM size is `Standard_D32s_v5`;
-- only the operator `/32` has inbound SSH access.
-
-Connect:
-
-```powershell
-ssh "$AdminUser@$PublicIp"
-```
-
-Never use `0.0.0.0/0` for SSH. Keep the resource-group variables in the
-control-host shell for the teardown in Section 14.
-
-## 2. Validate the host and `/dev/kvm`
+## 3. Validate the host and install prerequisites
 
 Run on the Azure VM:
 
 ```bash
-set -euo pipefail
-
 uname -a
 lscpu
 findmnt -no FSTYPE,TARGET /
 free -h
 df -h /
 
-grep -qE '(^| )vmx( |$)' /proc/cpuinfo
-test -c /dev/kvm
+grep -E -m1 '(^| )vmx( |$)' /proc/cpuinfo
+ls -l /dev/kvm
 
-if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
-  sudo usermod -aG kvm "$(whoami)"
-  echo "Reconnect SSH, then rerun this section."
-  exit 1
+if id -nG "$USER" | tr ' ' '\n' | grep -qx kvm; then
+  echo "Current user is in the kvm group."
+else
+  sudo usermod -aG kvm "$USER"
+  echo "KVM group membership added."
+  echo "Disconnect and reconnect SSH, then continue with the next block."
 fi
+```
+
+Stop at this point if the command added group membership. After reconnecting,
+run the access and ioctl checks:
+
+```bash
+test -c /dev/kvm && echo "/dev/kvm exists"
+test -r /dev/kvm && echo "/dev/kvm is readable"
+test -w /dev/kvm && echo "/dev/kvm is writable"
 
 python3 - <<'PY'
 import fcntl
@@ -153,13 +83,9 @@ PY
 Expected: an ext4 root filesystem, 32 CPUs for `Standard_D32s_v5`, readable
 and writable `/dev/kvm`, and `{"kvm_api_version": 12}`.
 
-## 3. Install prerequisites and clone the signed tree
-
 Install host dependencies:
 
 ```bash
-set -euo pipefail
-
 sudo apt-get update
 sudo apt-get install -y \
   build-essential \
@@ -169,6 +95,7 @@ sudo apt-get install -y \
   file \
   git \
   jq \
+  patch \
   pkg-config \
   python3 \
   python3-venv \
@@ -192,10 +119,25 @@ Install Rust and `just`:
 
 ```bash
 export HOME="${HOME:-/home/$(whoami)}"
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
+export RUSTUP_HOME="$HOME/.rustup"
+export CARGO_HOME="$HOME/.cargo"
+mkdir -p "$RUSTUP_HOME" "$CARGO_HOME"
+export PATH="$CARGO_HOME/bin:$PATH"
+
+if ! command -v rustup >/dev/null; then
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | env RUSTUP_INIT_SKIP_PATH_CHECK=yes sh -s -- -y --profile minimal
+fi
+
+if [[ -f "$CARGO_HOME/env" ]]; then
+  source "$CARGO_HOME/env"
+fi
 rustup toolchain install 1.98.0 --profile minimal
-cargo install just
+rustup show
+
+if ! command -v just >/dev/null; then
+  cargo install just
+fi
 ```
 
 Install the load generator:
@@ -203,70 +145,44 @@ Install the load generator:
 ```bash
 sudo apt-get install -y golang-go
 go install github.com/rakyll/hey@v0.1.4
-export PATH="$HOME/go/bin:$HOME/.cargo/bin:$PATH"
+export PATH="$HOME/go/bin:$CARGO_HOME/bin:$PATH"
 hey -version
 ```
 
-Clone and verify Hyperlight-Unikraft:
+## 4. Build the Workerd executor
+
+Clone the executor integration branch:
 
 ```bash
-set -euo pipefail
-
-HYPERLIGHT_UNIKRAFT_REF=d240b022fe677db482a5b10b6cea16d5ab39cf07
-
-mkdir -p "$HOME/src" "$HOME/results"
 cd "$HOME/src"
-git clone https://github.com/simongdavies/hyperlight-unikraft.git
-cd hyperlight-unikraft
-git checkout --detach "$HYPERLIGHT_UNIKRAFT_REF"
-git submodule update --init --recursive
-test "$(git rev-parse HEAD)" = "$HYPERLIGHT_UNIKRAFT_REF"
-git verify-commit HEAD
-git status --short
-```
-
-Expected: `git verify-commit` reports a good signature and `git status
---short` prints nothing.
-
-## 4. Build or obtain the Workerd executor
-
-Hyperlight-Unikraft packages a trusted external Workerd-fork executor; it does
-not build stock Workerd. The real executor must be an executable x86-64 Linux
-PIE implementing this repository's Workerd sandbox ABI.
-
-### Option A: use a trusted executor produced by your Workerd build
-
-Copy the executor to the VM and set:
-
-```bash
-WORKERD_EXECUTOR="$HOME/artifacts/workerd-sandbox-executor"
-test -x "$WORKERD_EXECUTOR"
-```
-
-### Option B: build the executor from a public Workerd fork
-
-Pin the exact Workerd revision. Do not build a moving branch:
-
-```bash
-: "${WORKERD_REF:?set WORKERD_REF to the signed Workerd revision}"
-
-cd "$HOME/src"
-git clone https://github.com/simongdavies/workerd.git
+git clone --branch simongdavies-fix-workerd-dev-container --single-branch --recurse-submodules https://github.com/simongdavies/workerd.git
 cd workerd
-git checkout --detach "$WORKERD_REF"
-git submodule update --init --recursive
-test "$(git rev-parse HEAD)" = "$WORKERD_REF"
+git rev-parse HEAD
 ```
 
-The validated build uses a container with LLVM 22 and Bazelisk:
+The current integration commit is
+`627b7bcc8f3cb79bccbb53c8d3f60e5b95af4f6e`.
+Its `.bazelrc` selects the static host-tool C++ runtime with
+`--host_linkopt='-l:libc++.a'`.
+
+Build with a container that provides LLVM 22 and Bazelisk:
 
 ```bash
+cd "$HOME/src/workerd"
+test -f MODULE.bazel
+
 cat > .devcontainer/Dockerfile.hyperlight-executor <<'EOF'
-FROM mcr.microsoft.com/vscode/devcontainers/javascript-node:26
+FROM mcr.microsoft.com/vscode/devcontainers/javascript-node:26-bookworm
 ARG LLVM_VERSION=22
 RUN export DEBIAN_FRONTEND=noninteractive \
     && apt-get update \
-    && apt-get install -y --no-install-recommends curl tcl \
+    && apt-get install -y --no-install-recommends \
+       ca-certificates \
+       curl \
+       gnupg \
+       lsb-release \
+       software-properties-common \
+       tcl \
     && curl -fSsL -o /tmp/llvm.sh https://apt.llvm.org/llvm.sh \
     && bash /tmp/llvm.sh ${LLVM_VERSION} \
     && apt-get install -y --no-install-recommends \
@@ -287,43 +203,24 @@ docker build \
 
 mkdir -p "$HOME/.cache/workerd-bazel/action-cache"
 mkdir -p "$HOME/.cache/workerd-bazel/repository-cache"
-mkdir -p "$HOME/.cache/workerd-libcxx22"
 mkdir -p "$HOME/artifacts"
 
 docker run --rm \
-  -v "$HOME/.cache/workerd-libcxx22:/out" \
-  workerd-hyperlight-builder \
-  bash -lc '
-    cp -a /usr/lib/llvm-22/lib/libc++.so* /out/
-    cp -a /usr/lib/llvm-22/lib/libc++abi.so* /out/
-  '
-
-docker run --rm \
-  -v "$PWD:/workspace" \
+  --mount type=bind,src="$HOME/src/workerd",dst=/workspace \
   -v "$HOME/.cache/workerd-bazel:/root/.cache/bazel" \
-  -v "$HOME/.cache/workerd-libcxx22:/opt/libcxx22:ro" \
   -v "$HOME/artifacts:/artifacts" \
   -w /workspace \
   workerd-hyperlight-builder \
   bash -lc '
-    set -euxo pipefail
     bazel --output_base=/root/.cache/bazel/workerd-hyperlight-output \
       build //src/workerd/server:workerd-sandbox-executor \
       --config=opt \
       --strip=always \
       --//:io_backend=cxx \
-      --workspace_status_command=/bin/true \
-      --jobs="${WORKERD_BAZEL_JOBS:-16}" \
+      --jobs="${WORKERD_BAZEL_JOBS:-$(nproc)}" \
       --disk_cache=/root/.cache/bazel/action-cache \
       --repository_cache=/root/.cache/bazel/repository-cache \
-      --repo_env=CC=/usr/lib/llvm-22/bin/clang \
-      --repo_env=AR=/usr/lib/llvm-22/bin/llvm-ar \
-      --linkopt=--ld-path=/usr/lib/llvm-22/bin/ld.lld \
-      --host_linkopt=--ld-path=/usr/lib/llvm-22/bin/ld.lld \
-      --host_linkopt=-L/opt/libcxx22 \
-      --host_linkopt=-Wl,-rpath,/opt/libcxx22 \
-      --action_env=LD_LIBRARY_PATH=/opt/libcxx22 \
-      --host_action_env=LD_LIBRARY_PATH=/opt/libcxx22
+      --announce_rc
 
     executor=bazel-bin/src/workerd/server/workerd-sandbox-executor
     "$executor" --self-test
@@ -332,14 +229,12 @@ docker run --rm \
     chmod 0755 /artifacts/workerd-sandbox-executor
   '
 
-WORKERD_EXECUTOR="$HOME/artifacts/workerd-sandbox-executor"
+export WORKERD_EXECUTOR="$HOME/artifacts/workerd-sandbox-executor"
 ```
 
-Validate whichever executor you selected:
+Validate the executor:
 
 ```bash
-set -euo pipefail
-
 "$WORKERD_EXECUTOR" --self-test
 file "$WORKERD_EXECUTOR"
 readelf -n "$WORKERD_EXECUTOR" | sed -n '/Build ID/p'
@@ -354,18 +249,19 @@ file "$WORKERD_EXECUTOR" | grep -qi 'pie executable'
 ```
 
 Expected: executor self-test passes; the artifact is a stripped x86-64 static
-PIE with a GNU Build ID and no interpreter or dynamic dependencies. Record the
-Workerd revision, executor Build ID, byte size, and SHA-256.
+PIE with a GNU Build ID and no interpreter or dynamic dependencies.
 
 ## 5. Build Hyperlight-Unikraft and package the rootfs
 
 ```bash
-set -euo pipefail
 cd "$HOME/src/hyperlight-unikraft"
-source "$HOME/.cargo/env"
-
-export CARGO_TARGET_DIR="$HOME/.cache/hyperlight-unikraft-target"
-mkdir -p "$CARGO_TARGET_DIR"
+export RUSTUP_HOME="$HOME/.rustup"
+export CARGO_HOME="$HOME/.cargo"
+mkdir -p "$RUSTUP_HOME" "$CARGO_HOME"
+export PATH="$CARGO_HOME/bin:$PATH"
+if [[ -f "$CARGO_HOME/env" ]]; then
+  source "$CARGO_HOME/env"
+fi
 
 just build-workerd-kernel
 
@@ -382,10 +278,9 @@ sha256sum \
 ```
 
 For a static PIE, `executor` and `rootfs.img` are byte-identical. The packaging
-script rejects a non-executable, non-x86-64, or non-PIE executor and records
-the dependency closure.
+script requires an executable x86-64 PIE and records the dependency closure.
 
-Run focused scheduler and mock-fixture validation:
+Run focused scheduler and mock-fixture tests:
 
 ```bash
 just guests
@@ -393,8 +288,7 @@ cargo test --locked --lib workerd::pool::tests
 cargo test --locked --example workerd-demo
 ```
 
-Expected: all tests pass. The mock fixture validates the host harness; it is
-not a substitute for the real executor probes below.
+Expected: all tests pass.
 
 ## 6. Launch the demo and verify basic behavior
 
@@ -462,8 +356,7 @@ curl --fail-with-body -sS \
 ```
 
 Expected: `/busy` returns HTTP 504. The following `/after` request returns
-HTTP 200 and `{"path":"/after","method":"POST"}`. A timed-out VM does not
-poison the immutable snapshot or a later request.
+HTTP 200 and `{"path":"/after","method":"POST"}`.
 
 Test bounded overload by restarting with one active slot and one queued slot:
 
@@ -504,8 +397,10 @@ kill -TERM "$SERVER_PID"
 wait "$SERVER_PID"
 ```
 
-To demonstrate host reboot recovery, record the hashes, reboot, reconnect,
-rerun Section 2, verify the hashes again, and relaunch the server:
+### Optional host reboot check
+
+This command intentionally disconnects the SSH session. Record the hashes
+first:
 
 ```bash
 sha256sum \
@@ -513,7 +408,11 @@ sha256sum \
   build-elfloader/workerd-executor/rootfs.img \
   target/release/examples/workerd-demo \
   | tee "$HOME/results/pre-reboot-sha256.txt"
+```
 
+Run the reboot command separately:
+
+```bash
 sudo reboot
 ```
 
@@ -526,14 +425,33 @@ sha256sum -c "$HOME/results/pre-reboot-sha256.txt"
 
 ## 7. Run every WinterTC capability demo
 
-Start a deterministic loopback upstream:
+Start a deterministic loopback upstream that accepts the Workerd demo's POST
+upload:
 
 ```bash
 mkdir -p "$HOME/results/upstream"
-printf 'loopback-upstream\n' > "$HOME/results/upstream/index.html"
-python3 -m http.server 18080 \
-  --bind 127.0.0.1 \
-  --directory "$HOME/results/upstream" \
+cat > "$HOME/results/upstream/server.py" <<'PY'
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+BODY = b"loopback-upstream\n"
+
+class Handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        length = int(self.headers.get("content-length", "0"))
+        self.rfile.read(length)
+        self.send_response(200)
+        self.send_header("content-type", "text/plain")
+        self.send_header("content-length", str(len(BODY)))
+        self.end_headers()
+        self.wfile.write(BODY)
+
+    def log_message(self, format, *args):
+        print(format % args, flush=True)
+
+ThreadingHTTPServer(("127.0.0.1", 18080), Handler).serve_forever()
+PY
+
+python3 "$HOME/results/upstream/server.py" \
   >"$HOME/results/upstream/server.log" 2>&1 &
 UPSTREAM_PID=$!
 ```
@@ -571,8 +489,6 @@ done
 Run each independent route:
 
 ```bash
-set -euo pipefail
-
 for route in \
   core \
   timers \
@@ -625,8 +541,7 @@ done
 
 Success means every command returns HTTP 200 and the route JSON reports its
 behavior as passing. The two state requests must both show fresh request state;
-mutable module state must not carry from one request VM to the next. A passing
-core Wasm route does not imply WebAssembly Component Model support.
+mutable module state must not carry from one request VM to the next.
 
 Stop both processes:
 
@@ -701,7 +616,7 @@ hey -z 60s -c 64 \
   | tee "$HOME/results/hey-on-demand/sustained-c64.txt"
 ```
 
-Expected for an ordinary correctness/performance row:
+Expected:
 
 - the `Status code distribution` contains only `[200]`;
 - `Error distribution` is absent or zero;
@@ -792,15 +707,13 @@ kill -TERM "$SERVER_PID"
 wait "$SERVER_PID"
 ```
 
-The warm floor is fully restored but non-dispatchable, and shutdown is the only
-normal path that destroys the final warm VM. Replenishment begins below the
-low watermark and refills toward the high watermark in bounded batches.
+The warm floor is fully restored but non-dispatchable. Stopping the server
+destroys the final warm VM. Replenishment begins below the low watermark and
+refills toward the high watermark in bounded batches.
 
-Do not assume prewarming improves sustained throughput. On the validated KVM
-host, adaptive watermarking preserved correctness but concurrent replacement
-restore increased guest execution time enough to trail the matched on-demand
-control. Near-zero ready misses prove inventory availability, not a throughput
-win. Always retain the on-demand control.
+Run both modes with matched settings. Concurrent replacement restore can
+increase guest execution time, so compare throughput and phase timing rather
+than ready misses alone.
 
 ### Exact no-refill diagnostic wave
 
@@ -849,8 +762,6 @@ curl --fail-with-body -sS \
   | tee "$HOME/results/hey-no-refill-o64/post-wave-status.json" \
   | jq .
 
-kill -TERM "$SERVER_PID"
-wait "$SERVER_PID"
 ```
 
 Expected: all 32 responses are HTTP 200, the diagnostic completion count
@@ -859,7 +770,7 @@ floor is never violated.
 
 ## 10. Inspect pool status and request timing
 
-Query live policy and pressure:
+Query live configuration and pressure:
 
 ```bash
 curl --fail-with-body -sS \
@@ -912,6 +823,13 @@ recycle, teardown, completion, and outstanding restore permits are all zero.
 In prewarmed mode, inventory must equal ready depth, ready depth must remain at
 least the warm floor, and refill/pause state must be inactive.
 
+Stop the no-refill server:
+
+```bash
+kill -TERM "$SERVER_PID"
+wait "$SERVER_PID"
+```
+
 ## 11. Use the repository benchmark wrapper
 
 `tools/run-wintertc-pool-benchmark.sh` automates the same `/sync` workload,
@@ -948,12 +866,11 @@ bash tools/run-wintertc-pool-benchmark.sh \
   32
 ```
 
-The wrapper retains its JSON and server log when a performance acceptance gate
-fails. Treat that as a measured result, not a reason to discard the row.
+The wrapper writes its JSON result and server log to the output directory.
 
 ## 12. Capture 10 ms telemetry and optional `perf` profiles
 
-Build the release binary and calculate clean-tree provenance:
+Build the release binary and set source/diff identifiers:
 
 ```bash
 cd "$HOME/src/hyperlight-unikraft"
@@ -1040,174 +957,23 @@ python3 tools/run-workerd-prewarm-profile.py \
 The runner writes:
 
 - `result.json` with configuration, artifact hashes, correctness, throughput,
-  latency, phase distributions, process/host deltas, and shutdown status;
+  latency, phase distributions, process/host deltas, and server return code;
 - `timeseries.jsonl` with 10 ms process, host load/PSI, and pool samples;
 - raw `hey` CSV and the server log;
 - `perf stat`, CPU, off-CPU, and syscall-trace outputs when supported.
 
-Some Azure kernels or security policies deny hardware counters or call stacks.
-Keep the supported `perf stat`, `/proc`, load, and PSI data and retain
-`profiler_limitations` from `result.json`; do not substitute QEMU.
+If hardware counters or call stacks are unavailable, the result records them
+in `profiler_limitations`.
 
-## 13. Preserve a small reproducible result set
+## 13. Stop application processes
 
-Record the environment and hashes:
-
-```bash
-mkdir -p "$HOME/results/provenance"
-date --iso-8601=seconds \
-  | tee "$HOME/results/provenance/timestamp.txt"
-uname -a \
-  | tee "$HOME/results/provenance/uname.txt"
-lscpu -J \
-  | tee "$HOME/results/provenance/lscpu.json"
-free -b \
-  | tee "$HOME/results/provenance/memory.txt"
-git rev-parse HEAD \
-  | tee "$HOME/results/provenance/hyperlight-unikraft-commit.txt"
-git status --short \
-  | tee "$HOME/results/provenance/git-status.txt"
-sha256sum \
-  build-elfloader/workerd-executor/executor \
-  build-elfloader/workerd-executor/rootfs.img \
-  kernel/workerd_hyperlight-x86_64 \
-  target/release/examples/workerd-demo \
-  examples/workerd-bundles/workerd-pool-benchmark.json \
-  | tee "$HOME/results/provenance/artifact-sha256.txt"
-```
-
-Archive only an explicit allowlist of result directories. Do not archive
-repository checkouts, Cargo/Bazel targets, credentials, SSH keys, or caches:
+Every foreground walkthrough section stops the process it starts, and the two
+repository runners stop their child server before returning. Confirm that no
+demo or loopback process remains:
 
 ```bash
-cd "$HOME/results"
-printf '%s\n' \
-  provenance \
-  on-demand \
-  wintertc-demo \
-  hey-on-demand \
-  hey-adaptive-o48-r1 \
-  hey-no-refill-o64 \
-  profile-on-demand \
-  profile-no-refill-o64 \
-  profile-adaptive-o48-r1 \
-  > archive-allowlist.txt
-
-tar -czf workerd-kvm-results.tar.gz \
-  $(cat archive-allowlist.txt) \
-  archive-allowlist.txt
-
-tar -tzf workerd-kvm-results.tar.gz
-sha256sum workerd-kvm-results.tar.gz
+pgrep -af 'target/release/examples/workerd-demo|results/upstream/server.py' || true
 ```
 
-Inspect the archive member list before copying it off the VM.
-
-## 14. Delete the Azure resource group and prove zero remains
-
-Copy required results off the VM before deletion. Then run from the Azure CLI
-control host:
-
-```powershell
-$ErrorActionPreference = 'Stop'
-
-az group delete `
-  --subscription $SubscriptionId `
-  --name $ResourceGroup `
-  --yes `
-  --no-wait
-
-$Deadline = (Get-Date).AddMinutes(30)
-do {
-  Start-Sleep -Seconds 15
-  $Exists = az group exists `
-    --subscription $SubscriptionId `
-    --name $ResourceGroup `
-    -o tsv
-  "group_exists=$Exists"
-} while ($Exists -eq 'true' -and (Get-Date) -lt $Deadline)
-
-if ($Exists -eq 'true') {
-  throw "Timed out deleting $ResourceGroup"
-}
-
-$MatchingGroups = az group list `
-  --subscription $SubscriptionId `
-  --query "[?name=='$ResourceGroup'].name" `
-  -o tsv
-
-$MatchingResources = az resource list `
-  --subscription $SubscriptionId `
-  --query "[?resourceGroup=='$ResourceGroup'].[resourceGroup,name,type]" `
-  -o tsv
-
-if ($MatchingGroups -or $MatchingResources) {
-  throw "Matching Azure resources remain"
-}
-
-"Azure cleanup verified: zero matching groups and resources"
-```
-
-The walkthrough is incomplete until `az group exists` returns `false` and the
-subscription-wide group/resource queries return no matches.
-
-## 15. Troubleshooting
-
-### `/dev/kvm` exists but is not writable
-
-Add the user to `kvm`, disconnect, reconnect, and rerun Section 2. Do not run
-the benchmark through `sudo` as a workaround.
-
-### The executor is rejected by `build-rootfs.sh`
-
-Run `file`, `readelf -l`, `readelf -d`, and `ldd`. The executor must be an
-executable x86-64 Linux PIE. Static PIE is preferred. Dynamic PIE is supported
-only when its interpreter and dependency closure resolve unambiguously.
-
-### Server startup takes several minutes
-
-Prewarmed startup restores every configured owner before the pool becomes
-fully ready. Watch the server log and
-`/__hyperlight/pool-status`; do not begin a matched row until the expected
-ready depth is reached.
-
-### Requests queue even though ready VMs exist
-
-Inspect `max_concurrent_sandboxes`, `effective_concurrency`, `warm_floor`,
-`admitted`, `active`, and `execution_slots_in_use`. The warm floor is reserved,
-and the active execution cap remains independent of owner count.
-
-### Adaptive throughput is below on-demand
-
-Inspect `guest_execution_ms`, restore-slot use, replenishment restore time,
-context switches, migrations, page faults, CPU PSI, and run queue. Background
-restore consumes the same finite host resources as executing KVM guests. Lower
-restore concurrency or active execution may reduce contention, but accept a
-change only if it beats a matched on-demand control.
-
-### `perf` reports unsupported or permission errors
-
-Keep `perf stat` events that work and retain `/proc`, load, PSI, process CPU,
-fault, context-switch, RSS, thread, and file-descriptor telemetry. Record the
-limitation instead of changing the backend.
-
-### The full test suite depends on external network access
-
-Run focused scheduler and real-guest tests first. If an unrelated external
-endpoint times out, retain the exact failure and rerun only that test. Do not
-misreport an environmental failure as a scheduler failure.
-
-## 16. Optional MSHV note
-
-This runbook is the generally reproducible Linux KVM path. MSHV is a separate
-backend:
-
-```bash
-cargo build --release --locked --features mshv --example workerd-demo
-```
-
-MSHV requires a compatible Azure Linux host, kernel, device access, and image
-provenance. Internal image names or subscriptions are intentionally not part of
-this public walkthrough. If those prerequisites are unavailable, report the
-backend blocker; do not substitute QEMU and do not compare unmatched KVM and
-MSHV measurements.
+Copy the required result files off the VM, then delete the Azure resources
+created for the VM using the same Azure workflow that created them.
