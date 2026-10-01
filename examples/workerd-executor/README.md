@@ -196,6 +196,46 @@ complete ordered-header JSON block preceding body bytes. Reading EOF collects
 a successful handle. Cancel aborts DNS, connect, upload, or download work and
 request-VM teardown cancels every remaining operation.
 
+### Monotonic timer channel v1
+
+The generic host-call bridge also exposes one-shot monotonic deadlines. This is
+the Hyperlight side of the Workerd timer adapter; it adds no timer ioctl, kernel
+mechanism, background host thread or blocking host call:
+
+* `WorkerdTimerV1Start(u64 delay_ns) -> String`
+* `WorkerdTimerV1Read(u64 timer_id) -> String`
+* `WorkerdTimerV1Cancel(u64 timer_id) -> i32`
+
+All JSON objects require exactly their documented keys; key order is not part
+of the contract. Start succeeds with
+`{"protocol_version":1,"timer_id":N,"state":"pending","error":null}`.
+`N` is session-local, never reused and between 1 and 2^53-1. A zero delay is an
+immediately due timer. If adding the full `u64` nanosecond duration to the
+monotonic clock overflows, Start returns timer ID zero, state `error`, and
+`invalid_duration`. Admission failures use `overloaded`.
+
+Read never waits. It returns state `pending`, or terminal state `fired` or
+`cancelled`; a terminal Read releases the handle. Reading an unknown or
+released ID returns state `error` with `unknown_timer`. The error object is
+`{"code":"invalid_duration|overloaded|unknown_timer","message":"..."}`.
+
+Cancel returns zero for any issued, unreleased handle, including one already
+cancelled. Cancellation wins until terminal delivery: even if the deadline has
+elapsed, Cancel marks the timer cancelled when Read has not yet returned and
+released `fired`. A later Cancel on a released or unknown handle returns
+`-ENOENT`. Workerd combines nonblocking Read with the guest monotonic
+sleep/yield path; the existing Hyperlight step model parks the halted VM until
+the guest deadline rather than blocking inside a host call or spinning.
+
+`TimerLimits` defaults to 1,024 active pending timers per Worker version and
+4,096 unreleased handles per request VM. Hosts can supply a configured
+`TimerLimits` through `WorkerVersionSandbox::initialize_with_capabilities`;
+zero limits and an unreleased-handle limit below the active limit are rejected.
+Cancelled handles release active admission immediately but retain session
+handle capacity until terminal Read or VM teardown. Each fresh request VM gets
+an isolated timer session. Watchdog expiry and session/VM drop cancel and
+release every remaining handle before the next request can run.
+
 ## Snapshots, deadlines and trust
 
 `WorkerVersionSandbox::initialize` creates an initialized, version- and
@@ -289,48 +329,49 @@ sha256sum kernel/workerd_hyperlight-x86_64 \
   build-elfloader/workerd-executor/rootfs.img
 ```
 
-Run the 512 MiB real-V8 acceptance probe:
+Run the optimized executor's 344 MiB real-V8 acceptance probe. Use 768 MiB only
+as a diagnostic fallback when a 344 MiB failure is specifically attributable
+to memory, not for functional adapter or bundle failures:
 
 ```sh
 HYPERLIGHT_MAX_SURROGATES=2 HYPERLIGHT_INITIAL_SURROGATES=0 \
 RUST_LOG=hyperlight_unikraft=debug \
-cargo run --release --locked --example workerd-memory-probe -- 512 \
+cargo run --release --locked --example workerd-memory-probe -- 344 \
   --bundle examples/workerd-bundles/acceptance.json \
-  2>build-elfloader/workerd-memory-512-kvm.stderr \
-  | tee build-elfloader/workerd-memory-512-kvm.json
+  2>build-elfloader/workerd-memory-344-kvm.stderr \
+  | tee build-elfloader/workerd-memory-344-kvm.json
 ```
 
-Probe the configured-scratch floor sequentially while retaining the official
-ladder sizes:
-
-```sh
-for mib in 256 320 384 448 512 640 768 1024 1536 2048; do
-  HYPERLIGHT_MAX_SURROGATES=2 HYPERLIGHT_INITIAL_SURROGATES=0 \
-  cargo run --release --locked --example workerd-memory-probe -- "$mib" \
-    --bundle examples/workerd-bundles/acceptance.json
-done | tee build-elfloader/workerd-memory-ladder-kvm.jsonl
-```
+Do not descend to a lower allocator candidate until the complete 344 MiB
+evidence matrix is green. Stop at the first failing candidate and retain every
+machine-readable result.
 
 Run the reproducible real-V8 bundle probes through initialization, snapshot,
 fresh restore, and fetch:
 
 ```sh
 cargo run --release --locked --example workerd-bundle-probe -- \
-  examples/workerd-bundles/helloworld_esm.json https://example.test/ 512
+  examples/workerd-bundles/helloworld_esm.json https://example.test/ 344
 cargo run --release --locked --example workerd-bundle-probe -- \
-  examples/workerd-bundles/web-streams.json https://example.test/sync 512
+  examples/workerd-bundles/web-streams.json https://example.test/sync 344
 cargo run --release --locked --example workerd-bundle-probe -- \
   examples/workerd-bundles/api-smoke.json \
-  https://example.test/wintertc-smoke 512 POST x-smoke:yes
+  https://example.test/wintertc-smoke 344 POST x-smoke:yes
 # Equivalent repeatable compatibility smoke:
-just workerd-api-probe 512
+just workerd-api-probe 344
 ```
 
 `api-smoke.json` is a representative probe derived from Workerd's
 machine-readable ECMA-429/WPT support matrix, not an authoritative conformance
 runner. `api-smoke-matrix.json` records the selected pure Web APIs,
 capability-backed APIs intentionally unavailable in this sandbox, untested
-surfaces, and the expected SHA-256 digest vector.
+surfaces, the Hyperlight/executor ownership boundary, and the expected SHA-256
+digest vector. The timer host channel is covered by the native executor fixture;
+the Workerd KJ adapter and real-V8 timer qualification are separate. No
+additional Hyperlight kernel or host capability is currently identified for
+safe WebAssembly enablement, MessageChannel, File or BYOB streams: those remain
+executor embedder-policy/API verification tasks, followed by this same real-VM
+bundle probe.
 
 For a curlable listener, run the demo in one terminal and issue requests from
 another:
@@ -339,7 +380,7 @@ another:
 HYPERLIGHT_MAX_SURROGATES=2 HYPERLIGHT_INITIAL_SURROGATES=0 \
 cargo run --release --locked --example workerd-demo -- \
   --bundle examples/workerd-bundles/acceptance.json \
-  --bind 0.0.0.0:8787 --scratch-mb 512 --request-timeout-ms 500 \
+  --bind 0.0.0.0:8787 --scratch-mb 344 --request-timeout-ms 500 \
   --max-concurrent-sandboxes 2 --queue-capacity 32
 ```
 

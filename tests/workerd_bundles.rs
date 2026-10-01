@@ -13,6 +13,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+const WORKERD_SCRATCH_MIB: usize = 344;
+
 fn artifact(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("build-elfloader/workerd-executor")
@@ -45,7 +47,7 @@ fn execute(bundle: WorkerBundle, request: RequestEnvelope) -> (WorkerVersionSand
         bundle,
         artifact("rootfs.img"),
         artifact("executor"),
-        512,
+        WORKERD_SCRATCH_MIB,
         Duration::from_secs(90),
     )
     .expect("real Workerd executor must initialize");

@@ -36,6 +36,28 @@
     "timers",
     "WebAssembly compilation"
   ],
+  "hyperlight_readiness": {
+    "timers": {
+      "status": "host channel implemented",
+      "remaining": "Workerd KJ adapter and real-V8 timer qualification"
+    },
+    "WebAssembly": {
+      "status": "no additional Hyperlight work identified",
+      "remaining": "safe executor embedder-policy enablement and real-VM verification"
+    },
+    "MessageChannel": {
+      "status": "no additional Hyperlight work identified",
+      "remaining": "executor API verification and real-VM verification"
+    },
+    "File": {
+      "status": "no additional Hyperlight work identified",
+      "remaining": "executor API verification and real-VM verification"
+    },
+    "ReadableStreamBYOB": {
+      "status": "no additional Hyperlight work identified",
+      "remaining": "executor BYOB behavior verification and real-VM verification"
+    }
+  },
   "upstream_wpt_baseline": [
     {
       "target": "//src/wpt:url@",

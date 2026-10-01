@@ -27,6 +27,7 @@
     { "id": "capability-free-behavior", "category": "behavior", "requirement": "required", "expected": "pass" },
     { "id": "worker-global-handler-properties", "category": "ecma-429-core", "requirement": "required", "expected": "pass" },
     { "id": "webassembly", "category": "verification-only", "requirement": "optional", "expected": "pass_or_unsupported" },
+    { "id": "wasm-component-or-core-fallback", "category": "verification-only", "requirement": "required", "expected": "pass" },
     { "id": "webassembly-eval-denial", "category": "executor-policy", "requirement": "required", "expected": "pass" },
     { "id": "webassembly-hostile-limits-wpt", "category": "compliance-authoritative", "requirement": "external_pending", "expected": "pending_external_artifact" },
     { "id": "message-channel", "category": "verification-only", "requirement": "optional", "expected": "pass_or_unsupported" },
@@ -41,7 +42,7 @@
     { "id": "fetch-v2-large-download", "category": "fetch-v2", "requirement": "required", "expected": "pass" },
     { "id": "fetch-v2-unknown-upload", "category": "fetch-v2", "requirement": "required", "expected": "pass" },
     { "id": "fetch-v2-unknown-download", "category": "fetch-v2", "requirement": "required", "expected": "pass" },
-    { "id": "fetch-v2-slow-producer", "category": "fetch-v2", "requirement": "external_pending", "expected": "pending_timer_branch" },
+    { "id": "fetch-v2-slow-producer", "category": "fetch-v2", "requirement": "required", "expected": "pass" },
     { "id": "fetch-v2-slow-consumer", "category": "fetch-v2", "requirement": "required", "expected": "pass" },
     { "id": "fetch-v2-backpressure", "category": "fetch-v2", "requirement": "required", "expected": "pass" },
     { "id": "fetch-v2-early-response", "category": "fetch-v2", "requirement": "required", "expected": "pass" },
@@ -51,8 +52,17 @@
     { "id": "fetch-dns-denial", "category": "fetch-policy", "requirement": "policy", "expected": "dns_denied" },
     { "id": "fetch-timeout", "category": "fetch-policy", "requirement": "required", "expected": "pass" },
     { "id": "fetch-overload", "category": "fetch-policy", "requirement": "required", "expected": "pass" },
-    { "id": "timer-presence", "category": "timers", "requirement": "external_pending", "expected": "pending_timer_branch" },
-    { "id": "timer-timeout-ordering", "category": "timers", "requirement": "external_pending", "expected": "pending_timer_branch" },
-    { "id": "timer-cancellation", "category": "timers", "requirement": "external_pending", "expected": "pending_timer_branch" }
+    { "id": "timer-presence", "category": "timers", "requirement": "required", "expected": "pass" },
+    { "id": "timer-timeout-ordering", "category": "timers", "requirement": "required", "expected": "pass" },
+    { "id": "timer-cancellation", "category": "timers", "requirement": "required", "expected": "pass" },
+    { "id": "offline-restore-cold-vs-restored-latency", "category": "offline-restore", "requirement": "required", "expected": "pass" },
+    { "id": "offline-restore-repeated-cycles", "category": "offline-restore", "requirement": "required", "expected": "pass" },
+    { "id": "offline-restore-pool-depletion-refill", "category": "offline-restore", "requirement": "required", "expected": "pass" },
+    { "id": "offline-restore-throughput-latency", "category": "offline-restore", "requirement": "required", "expected": "pass" },
+    { "id": "offline-restore-timer-after-restore", "category": "offline-restore", "requirement": "required", "expected": "pass" },
+    { "id": "offline-restore-network-after-restore", "category": "offline-restore", "requirement": "required", "expected": "pass" },
+    { "id": "offline-restore-tenant-isolation", "category": "offline-restore", "requirement": "required", "expected": "pass" },
+    { "id": "offline-restore-cancellation-recovery", "category": "offline-restore", "requirement": "required", "expected": "pass" },
+    { "id": "offline-restore-clean-shutdown", "category": "offline-restore", "requirement": "required", "expected": "pass" }
   ]
 }

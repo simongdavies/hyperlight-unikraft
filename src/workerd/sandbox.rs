@@ -2,8 +2,9 @@
 // Copyright 2026 The Hyperlight Authors.
 
 use super::{
-    Error, FetchBroker, RequestEnvelope, ResponseEnvelope, Result, SnapshotBinding,
+    Error, FetchBroker, RequestEnvelope, ResponseEnvelope, Result, SnapshotBinding, TimerLimits,
     VerifiedSnapshot, WorkerBundle, WorkerVersionId, snapshot::kernel_for_rootfs,
+    timer::TimerBroker,
 };
 use crate::{AppSandbox, Yield};
 use hyperlight_host::func::Registerable;
@@ -219,6 +220,7 @@ impl Responses {
 pub struct WorkerVersionSandbox {
     image: VerifiedSnapshot,
     fetch_broker: FetchBroker,
+    timer_broker: TimerBroker,
 }
 
 impl WorkerVersionSandbox {
@@ -281,7 +283,51 @@ impl WorkerVersionSandbox {
         timeout: Duration,
         fetch_broker: FetchBroker,
     ) -> std::result::Result<(Self, InitializationProfile), InitializationFailure> {
+        Self::initialize_profiled_with_capabilities(
+            bundle,
+            rootfs,
+            executor,
+            scratch_mb,
+            timeout,
+            fetch_broker,
+            TimerLimits::default(),
+        )
+    }
+
+    pub fn initialize_with_capabilities(
+        bundle: WorkerBundle,
+        rootfs: impl AsRef<Path>,
+        executor: impl AsRef<Path>,
+        scratch_mb: usize,
+        timeout: Duration,
+        fetch_broker: FetchBroker,
+        timer_limits: TimerLimits,
+    ) -> Result<Self> {
+        Self::initialize_profiled_with_capabilities(
+            bundle,
+            rootfs,
+            executor,
+            scratch_mb,
+            timeout,
+            fetch_broker,
+            timer_limits,
+        )
+        .map(|(worker, _)| worker)
+        .map_err(|failure| Error::State(failure.to_string()))
+    }
+
+    pub fn initialize_profiled_with_capabilities(
+        bundle: WorkerBundle,
+        rootfs: impl AsRef<Path>,
+        executor: impl AsRef<Path>,
+        scratch_mb: usize,
+        timeout: Duration,
+        fetch_broker: FetchBroker,
+        timer_limits: TimerLimits,
+    ) -> std::result::Result<(Self, InitializationProfile), InitializationFailure> {
         let mut profile = InitializationProfile::default();
+        let timer_broker = TimerBroker::new(timer_limits)
+            .map_err(|error| Self::initialization_failure("assemble", error, &profile))?;
         if scratch_mb == 0 || scratch_mb.checked_mul(1024 * 1024).is_none() {
             return Err(InitializationFailure {
                 stage: "assemble",
@@ -323,6 +369,9 @@ impl WorkerVersionSandbox {
                 })?;
         fetch_broker
             .register(&mut uninitialized, fetch_broker.session(init_deadline))
+            .map_err(|error| Self::initialization_failure("assemble", error, &profile))?;
+        timer_broker
+            .register(&mut uninitialized, timer_broker.session())
             .map_err(|error| Self::initialization_failure("assemble", error, &profile))?;
         profile.assemble_ms = Self::elapsed_ms(started);
         // Evolve's boot is trusted startup. The timed init call below is where
@@ -369,6 +418,7 @@ impl WorkerVersionSandbox {
             Self {
                 image,
                 fetch_broker,
+                timer_broker,
             },
             profile,
         ))
@@ -394,6 +444,7 @@ impl WorkerVersionSandbox {
         Self {
             image,
             fetch_broker: FetchBroker::denied(),
+            timer_broker: TimerBroker::default(),
         }
     }
 
@@ -404,7 +455,20 @@ impl WorkerVersionSandbox {
         Self {
             image,
             fetch_broker,
+            timer_broker: TimerBroker::default(),
         }
+    }
+
+    pub fn from_verified_snapshot_with_capabilities(
+        image: VerifiedSnapshot,
+        fetch_broker: FetchBroker,
+        timer_limits: TimerLimits,
+    ) -> Result<Self> {
+        Ok(Self {
+            image,
+            fetch_broker,
+            timer_broker: TimerBroker::new(timer_limits)?,
+        })
     }
 
     pub fn snapshot(&self) -> &VerifiedSnapshot {
@@ -456,6 +520,7 @@ impl WorkerVersionSandbox {
             None => fail!(Error::State("timeout too large".into())),
         };
         let fetch_session = self.fetch_broker.session(deadline);
+        let timer_session = self.timer_broker.session();
         let responses = Responses::default();
         profile.request_setup_ms += Self::elapsed_ms(setup_started);
 
@@ -469,6 +534,8 @@ impl WorkerVersionSandbox {
                 responses.register(functions)?;
                 self.fetch_broker
                     .register(functions, fetch_session.clone())?;
+                self.timer_broker
+                    .register(functions, timer_session.clone())?;
                 Ok::<(), Error>(())
             },
         ) {
@@ -490,7 +557,7 @@ impl WorkerVersionSandbox {
         profile.request_setup_ms += Self::elapsed_ms(setup_started);
 
         let execution_started = Instant::now();
-        let result = timed_request(&mut app, encoded, deadline, fetch_session);
+        let result = timed_request(&mut app, encoded, deadline, fetch_session, timer_session);
         profile.guest_execution_ms = Self::elapsed_ms(execution_started);
 
         // Join the watchdog before dropping the VM; no late kill can hit the
@@ -518,11 +585,17 @@ fn timed_request(
     encoded: String,
     deadline: Instant,
     fetch_session: super::fetch::FetchSession,
+    timer_session: super::timer::TimerSession,
 ) -> Result<()> {
-    with_watchdog(app, deadline, Some(fetch_session), |app, deadline| {
-        app.resume()?;
-        drive_call(app, "fetch", encoded, deadline)
-    })
+    with_watchdog(
+        app,
+        deadline,
+        Some((fetch_session, timer_session)),
+        |app, deadline| {
+            app.resume()?;
+            drive_call(app, "fetch", encoded, deadline)
+        },
+    )
 }
 
 fn timed_call(app: &mut AppSandbox, name: &str, argument: String, timeout: Duration) -> Result<()> {
@@ -558,7 +631,7 @@ fn drive_call(app: &mut AppSandbox, name: &str, argument: String, deadline: Inst
 fn with_watchdog(
     app: &mut AppSandbox,
     deadline: Instant,
-    fetch_session: Option<super::fetch::FetchSession>,
+    sessions: Option<(super::fetch::FetchSession, super::timer::TimerSession)>,
     run: impl FnOnce(&mut AppSandbox, Instant) -> Result<()>,
 ) -> Result<()> {
     if Instant::now() >= deadline {
@@ -575,8 +648,9 @@ fn with_watchdog(
             {
                 return false;
             }
-            if let Some(fetch_session) = fetch_session {
+            if let Some((fetch_session, timer_session)) = sessions {
                 fetch_session.cancel_all();
+                timer_session.cancel_all();
             }
             interrupt.kill();
             true

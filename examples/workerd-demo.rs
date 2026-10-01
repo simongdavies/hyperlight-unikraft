@@ -21,6 +21,7 @@ const DEFAULT_BUNDLE: &str = "examples/workerd-bundles/helloworld_esm.json";
 const MAX_REQUEST_HEAD_BYTES: usize = MAX_HEADER_BYTES + 8 * 1024;
 const DEFAULT_MAX_CONCURRENT_SANDBOXES: usize = 4;
 const DEFAULT_QUEUE_CAPACITY: usize = 64;
+const DEFAULT_SCRATCH_MIB: usize = 344;
 
 struct Options {
     bind: String,
@@ -48,7 +49,7 @@ impl Options {
             script: None,
             version: WorkerVersionId::new("demo-v1").map_err(|e| e.to_string())?,
             compatibility_date: "2025-01-01".into(),
-            scratch_mb: 512,
+            scratch_mb: DEFAULT_SCRATCH_MIB,
             init_timeout: Duration::from_secs(30),
             request_timeout: Duration::from_secs(2),
             max_concurrent_sandboxes: DEFAULT_MAX_CONCURRENT_SANDBOXES,
@@ -113,7 +114,7 @@ impl Options {
                          defaults: --bind 0.0.0.0:8787 --rootfs {DEFAULT_ROOTFS} \
                          --executor {DEFAULT_EXECUTOR} --version demo-v1 \
                          --bundle {DEFAULT_BUNDLE} \
-                         --scratch-mb 512 --init-timeout-ms 30000 \
+                         --scratch-mb {DEFAULT_SCRATCH_MIB} --init-timeout-ms 30000 \
                          --request-timeout-ms 2000 \
                          --max-concurrent-sandboxes {DEFAULT_MAX_CONCURRENT_SANDBOXES} \
                          --queue-capacity {DEFAULT_QUEUE_CAPACITY}\n\
@@ -238,12 +239,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
         };
+        if request_path(&request.url) == "/__hyperlight/pool-status" {
+            let status = pool.status();
+            let body = serde_json::to_vec(&serde_json::json!({
+                "active": status.active,
+                "queued": status.queued,
+                "queue_capacity": status.queue_capacity,
+                "max_concurrent_sandboxes": options.max_concurrent_sandboxes,
+            }))?;
+            write_response(&mut stream, 200, "application/json", &body)?;
+            continue;
+        }
         let _ = pool.try_submit(request, options.request_timeout, move |execution| {
             if let Err(error) = finish_request(&mut stream, execution) {
                 eprintln!("request response failed: {error}");
             }
         });
     }
+    Ok(())
+}
+
+fn request_path(url: &str) -> &str {
+    let authority_and_path = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let path = authority_and_path
+        .find('/')
+        .map_or("/", |index| &authority_and_path[index..]);
+    path.split_once('?').map_or(path, |(path, _)| path)
+}
+
+fn write_response(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    write!(
+        stream,
+        "HTTP/1.1 {status} {}\r\nContent-Type: {content_type}\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
+        reason(status),
+        body.len()
+    )?;
+    stream.write_all(body)?;
     Ok(())
 }
 
