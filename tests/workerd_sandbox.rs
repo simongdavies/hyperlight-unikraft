@@ -513,6 +513,13 @@ fn prewarmed_pool_is_ready_one_shot_bounded_and_replenishes() {
         WorkerPoolRestoreMode::Prewarmed {
             sandboxes: 2,
             max_concurrent_restores: 1,
+            policy: hyperlight_unikraft::workerd::PrewarmPolicy {
+                warm_floor: 1,
+                ready_low_watermark: 2,
+                ready_high_watermark: 2,
+                max_replenish_batch: 1,
+                diagnostic_no_refill_wave: None,
+            },
         },
     )
     .unwrap();
@@ -552,14 +559,17 @@ fn prewarmed_pool_is_ready_one_shot_bounded_and_replenishes() {
         ),
         Err(hyperlight_unikraft::workerd::PoolSubmitError::Full)
     );
+    let mut replenishment_restore_ms = Vec::new();
     for _ in 0..3 {
         let execution = rx.recv_timeout(Duration::from_secs(10)).unwrap();
         assert!(execution.result.is_ok());
         assert_eq!(execution.profile.snapshot_restore_ms, 0.0);
-        assert!(execution.profile.replenishment_restore_ms > 0.0);
+        replenishment_restore_ms.push(execution.profile.replenishment_restore_ms);
         assert!(pool.status().active <= 1);
         assert!(pool.status().replenishing <= 1);
     }
+    assert_eq!(&replenishment_restore_ms[..2], &[0.0, 0.0]);
+    assert!(replenishment_restore_ms[2] > 0.0);
     let status = pool.status();
     assert_eq!(status.prewarmed_hits, 2);
     assert_eq!(status.prewarmed_misses, 1);

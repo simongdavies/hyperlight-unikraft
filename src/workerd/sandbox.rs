@@ -24,6 +24,9 @@ pub struct InitializationProfile {
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct ExecutionProfile {
     pub ready_wait_ms: f64,
+    pub admission_wait_ms: f64,
+    pub ready_owner_wait_ms: f64,
+    pub replenishment_policy_wait_ms: f64,
     pub replenishment_wait_ms: f64,
     pub replenishment_restore_ms: f64,
     pub snapshot_restore_ms: f64,

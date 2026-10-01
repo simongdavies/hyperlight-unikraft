@@ -19,11 +19,22 @@ struct RequestJob {
     timeout: Duration,
     completion: Completion,
     admitted_at: Instant,
+    ready_wait_started_at: Option<Instant>,
+    diagnostic_wave_member: bool,
 }
 
 struct CompletedJob {
     completion: Completion,
     execution: RequestExecution,
+}
+
+struct PrewarmExecutionTiming {
+    ready_wait_ms: f64,
+    admission_wait_ms: f64,
+    ready_owner_wait_ms: f64,
+    policy_wait_ms: f64,
+    restore_wait_ms: f64,
+    restore_ms: f64,
 }
 
 enum OwnerMessage {
@@ -38,11 +49,21 @@ struct ReadyOwner {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PrewarmPolicy {
+    pub warm_floor: usize,
+    pub ready_low_watermark: usize,
+    pub ready_high_watermark: usize,
+    pub max_replenish_batch: usize,
+    pub diagnostic_no_refill_wave: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WorkerPoolRestoreMode {
     OnDemand,
     Prewarmed {
         sandboxes: usize,
         max_concurrent_restores: usize,
+        policy: PrewarmPolicy,
     },
 }
 
@@ -93,6 +114,17 @@ pub struct WorkerPoolStatus {
     pub completion_total_ms: f64,
     pub completion_max_ms: f64,
     pub prewarmed_inventory: usize,
+    pub warm_floor: usize,
+    pub ready_low_watermark: usize,
+    pub ready_high_watermark: usize,
+    pub max_replenish_batch: usize,
+    pub replenishment_paused: bool,
+    pub replenishment_pause_reason: Option<&'static str>,
+    pub refill_active: bool,
+    pub idle_owners: usize,
+    pub restore_permits_outstanding: usize,
+    pub diagnostic_wave_dispatched: usize,
+    pub diagnostic_wave_completed: usize,
     pub ready: usize,
     pub ready_min: usize,
     pub ready_peak: usize,
@@ -102,6 +134,9 @@ pub struct WorkerPoolStatus {
     pub restore_attempts: usize,
     pub completed_restores: usize,
     pub failed_restores: usize,
+    pub completed_replenishment_policy_waits: usize,
+    pub replenishment_policy_wait_total_ms: f64,
+    pub replenishment_policy_wait_max_ms: f64,
     pub restore_wait_total_ms: f64,
     pub restore_wait_max_ms: f64,
     pub restore_total_ms: f64,
@@ -126,6 +161,7 @@ struct PrewarmScheduler {
     available: Condvar,
     capacity: usize,
     max_active: usize,
+    policy: PrewarmPolicy,
     metrics: Arc<PoolMetrics>,
     prewarmed_hits: Arc<AtomicUsize>,
     prewarmed_misses: Arc<AtomicUsize>,
@@ -136,6 +172,13 @@ struct PrewarmSchedulerState {
     ready_owners: VecDeque<ReadyOwner>,
     active: usize,
     owners_remaining: usize,
+    idle_owners: VecDeque<usize>,
+    restore_granted: Vec<bool>,
+    restore_permits_outstanding: usize,
+    refill_active: bool,
+    diagnostic_wave_started: bool,
+    diagnostic_wave_dispatched: usize,
+    diagnostic_wave_completed: usize,
     terminal_error: Option<PoolSubmitError>,
 }
 
@@ -144,6 +187,12 @@ struct SchedulerStatus {
     active: usize,
     queued: usize,
     ready: usize,
+    replenishment_paused: bool,
+    refill_active: bool,
+    idle_owners: usize,
+    restore_permits_outstanding: usize,
+    diagnostic_wave_dispatched: usize,
+    diagnostic_wave_completed: usize,
 }
 
 impl PrewarmScheduler {
@@ -151,6 +200,7 @@ impl PrewarmScheduler {
         capacity: usize,
         max_active: usize,
         owner_count: usize,
+        policy: PrewarmPolicy,
         metrics: Arc<PoolMetrics>,
         prewarmed_hits: Arc<AtomicUsize>,
         prewarmed_misses: Arc<AtomicUsize>,
@@ -161,11 +211,19 @@ impl PrewarmScheduler {
                 ready_owners: VecDeque::with_capacity(owner_count),
                 active: 0,
                 owners_remaining: owner_count,
+                idle_owners: VecDeque::with_capacity(owner_count),
+                restore_granted: vec![false; owner_count],
+                restore_permits_outstanding: 0,
+                refill_active: false,
+                diagnostic_wave_started: false,
+                diagnostic_wave_dispatched: 0,
+                diagnostic_wave_completed: 0,
                 terminal_error: None,
             }),
             available: Condvar::new(),
             capacity,
             max_active,
+            policy,
             metrics,
             prewarmed_hits,
             prewarmed_misses,
@@ -184,14 +242,18 @@ impl PrewarmScheduler {
             return Err((PoolSubmitError::Full, Box::new(job)));
         }
         state.jobs.push_back(job);
-        self.available.notify_one();
+        self.available.notify_all();
         Ok(())
     }
 
-    fn publish_ready(&self, owner: ReadyOwner) -> bool {
+    fn publish_ready(&self, owner: ReadyOwner, used_replenishment_permit: bool) -> bool {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         if state.terminal_error.is_some() {
             return false;
+        }
+        if used_replenishment_permit {
+            debug_assert!(state.restore_permits_outstanding != 0);
+            state.restore_permits_outstanding -= 1;
         }
         state.ready_owners.push_back(owner);
         record_observation(
@@ -199,7 +261,8 @@ impl PrewarmScheduler {
             &self.metrics.ready_min,
             &self.metrics.ready_peak,
         );
-        self.available.notify_one();
+        self.schedule_replenishment(&mut state);
+        self.available.notify_all();
         true
     }
 
@@ -209,9 +272,14 @@ impl PrewarmScheduler {
             if state.terminal_error.is_some() {
                 return None;
             }
+            if state.active < self.max_active && !state.jobs.is_empty() {
+                let now = Instant::now();
+                let job = state.jobs.front_mut().unwrap();
+                job.ready_wait_started_at.get_or_insert(now);
+            }
             if state.active < self.max_active
                 && !state.jobs.is_empty()
-                && !state.ready_owners.is_empty()
+                && state.ready_owners.len() > self.policy.warm_floor
             {
                 let owner = state.ready_owners.pop_front().unwrap();
                 record_observation(
@@ -219,8 +287,16 @@ impl PrewarmScheduler {
                     &self.metrics.ready_min,
                     &self.metrics.ready_peak,
                 );
-                let job = state.jobs.pop_front().unwrap();
+                let mut job = state.jobs.pop_front().unwrap();
                 state.active += 1;
+                if let Some(wave_size) = self.policy.diagnostic_no_refill_wave {
+                    state.diagnostic_wave_started = true;
+                    if state.diagnostic_wave_dispatched < wave_size {
+                        state.diagnostic_wave_dispatched += 1;
+                        job.diagnostic_wave_member = true;
+                    }
+                }
+                self.schedule_replenishment(&mut state);
                 record_prewarmed_pairing(
                     owner.ready_at,
                     job.admitted_at,
@@ -236,10 +312,87 @@ impl PrewarmScheduler {
         }
     }
 
-    fn finish_execution(&self) {
+    fn finish_execution(&self, owner: usize, diagnostic_wave_member: bool) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         state.active -= 1;
-        self.available.notify_one();
+        state.idle_owners.push_back(owner);
+        if diagnostic_wave_member {
+            state.diagnostic_wave_completed += 1;
+        }
+        self.schedule_replenishment(&mut state);
+        self.available.notify_all();
+    }
+
+    fn finish_failed_dispatch(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.active -= 1;
+        self.available.notify_all();
+    }
+
+    fn wait_for_replenishment(&self, owner: usize) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        loop {
+            if state.terminal_error.is_some() {
+                return false;
+            }
+            if state.restore_granted[owner] {
+                state.restore_granted[owner] = false;
+                return true;
+            }
+            state = self
+                .available
+                .wait(state)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
+
+    fn schedule_replenishment(&self, state: &mut PrewarmSchedulerState) {
+        let paused = self.replenishment_paused(state);
+        let ready_supply = state.ready_owners.len() + state.restore_permits_outstanding;
+        let total_inventory = ready_supply + state.active;
+        let floor_deficit = self.policy.warm_floor.saturating_sub(total_inventory);
+        self.grant_replenishment(state, floor_deficit);
+        if paused {
+            return;
+        }
+        let ready_supply = state.ready_owners.len() + state.restore_permits_outstanding;
+        if ready_supply < self.policy.ready_low_watermark {
+            state.refill_active = true;
+        }
+        if ready_supply >= self.policy.ready_high_watermark {
+            state.refill_active = false;
+        }
+        if state.refill_active
+            && state.restore_permits_outstanding < self.policy.max_replenish_batch
+        {
+            let refill = self
+                .policy
+                .ready_high_watermark
+                .saturating_sub(ready_supply)
+                .min(
+                    self.policy
+                        .max_replenish_batch
+                        .saturating_sub(state.restore_permits_outstanding),
+                );
+            self.grant_replenishment(state, refill);
+        }
+    }
+
+    fn grant_replenishment(&self, state: &mut PrewarmSchedulerState, count: usize) {
+        for _ in 0..count {
+            let Some(owner) = state.idle_owners.pop_front() else {
+                break;
+            };
+            state.restore_granted[owner] = true;
+            state.restore_permits_outstanding += 1;
+        }
+    }
+
+    fn replenishment_paused(&self, state: &PrewarmSchedulerState) -> bool {
+        self.policy.diagnostic_no_refill_wave.is_some()
+            && state.diagnostic_wave_started
+            && state.diagnostic_wave_completed
+                < self.policy.diagnostic_no_refill_wave.unwrap_or_default()
     }
 
     fn wait_for_retry_or_close(&self, duration: Duration) -> bool {
@@ -254,10 +407,16 @@ impl PrewarmScheduler {
         state.terminal_error.is_some()
     }
 
-    fn owner_failed(&self) -> Vec<RequestJob> {
+    fn owner_failed(&self, used_replenishment_permit: bool) -> Vec<RequestJob> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if used_replenishment_permit {
+            debug_assert!(state.restore_permits_outstanding != 0);
+            state.restore_permits_outstanding -= 1;
+        }
         state.owners_remaining -= 1;
         if state.owners_remaining != 0 {
+            self.schedule_replenishment(&mut state);
+            self.available.notify_all();
             return Vec::new();
         }
         state.terminal_error = Some(PoolSubmitError::Unavailable);
@@ -289,6 +448,12 @@ impl PrewarmScheduler {
             active: state.active,
             queued: state.jobs.len(),
             ready: state.ready_owners.len(),
+            replenishment_paused: self.replenishment_paused(&state),
+            refill_active: state.refill_active,
+            idle_owners: state.idle_owners.len(),
+            restore_permits_outstanding: state.restore_permits_outstanding,
+            diagnostic_wave_dispatched: state.diagnostic_wave_dispatched,
+            diagnostic_wave_completed: state.diagnostic_wave_completed,
         }
     }
 }
@@ -404,6 +569,9 @@ struct PoolMetrics {
     restore_attempts: AtomicUsize,
     completed_restores: AtomicUsize,
     failed_restores: AtomicUsize,
+    completed_replenishment_policy_waits: AtomicUsize,
+    replenishment_policy_wait_total_ns: AtomicU64,
+    replenishment_policy_wait_max_ns: AtomicU64,
     restore_wait_total_ns: AtomicU64,
     restore_wait_max_ns: AtomicU64,
     restore_total_ns: AtomicU64,
@@ -434,6 +602,9 @@ impl PoolMetrics {
             restore_attempts: AtomicUsize::new(0),
             completed_restores: AtomicUsize::new(0),
             failed_restores: AtomicUsize::new(0),
+            completed_replenishment_policy_waits: AtomicUsize::new(0),
+            replenishment_policy_wait_total_ns: AtomicU64::new(0),
+            replenishment_policy_wait_max_ns: AtomicU64::new(0),
             restore_wait_total_ns: AtomicU64::new(0),
             restore_wait_max_ns: AtomicU64::new(0),
             restore_total_ns: AtomicU64::new(0),
@@ -528,6 +699,7 @@ pub struct WorkerRequestPool {
     replenishing: Arc<AtomicUsize>,
     prewarmed_hits: Arc<AtomicUsize>,
     prewarmed_misses: Arc<AtomicUsize>,
+    prewarm_policy: Option<PrewarmPolicy>,
     restore_slots: Option<Arc<ExecutionSlots>>,
     metrics: Arc<PoolMetrics>,
     owner_senders: Vec<mpsc::Sender<OwnerMessage>>,
@@ -627,6 +799,7 @@ impl WorkerRequestPool {
                     replenishing,
                     prewarmed_hits,
                     prewarmed_misses,
+                    prewarm_policy: None,
                     restore_slots: None,
                     metrics,
                     owner_senders: Vec::new(),
@@ -638,12 +811,14 @@ impl WorkerRequestPool {
             }
             WorkerPoolRestoreMode::Prewarmed {
                 max_concurrent_restores,
+                policy,
                 ..
             } => {
                 let scheduler = Arc::new(PrewarmScheduler::new(
                     admission_capacity,
                     max_concurrent_sandboxes,
                     owner_count,
+                    policy,
                     metrics.clone(),
                     prewarmed_hits.clone(),
                     prewarmed_misses.clone(),
@@ -744,6 +919,7 @@ impl WorkerRequestPool {
                     replenishing,
                     prewarmed_hits,
                     prewarmed_misses,
+                    prewarm_policy: Some(policy),
                     restore_slots: Some(restore_slots),
                     metrics,
                     owner_senders,
@@ -789,6 +965,8 @@ impl WorkerRequestPool {
             timeout,
             completion: Box::new(completion),
             admitted_at: Instant::now(),
+            ready_wait_started_at: None,
+            diagnostic_wave_member: false,
         };
         let pushed = match &self.dispatch {
             PoolDispatch::OnDemand(queue) => queue.try_push(job),
@@ -810,13 +988,26 @@ impl WorkerRequestPool {
     }
 
     pub fn status(&self) -> WorkerPoolStatus {
-        let (active, queued, ready) = match &self.dispatch {
-            PoolDispatch::OnDemand(queue) => (self.active.load(Ordering::Acquire), queue.len(), 0),
-            PoolDispatch::Prewarmed(scheduler) => {
-                let status = scheduler.status();
+        let scheduler_status = match &self.dispatch {
+            PoolDispatch::OnDemand(_) => None,
+            PoolDispatch::Prewarmed(scheduler) => Some(scheduler.status()),
+        };
+        let (active, queued, ready) = match (&self.dispatch, scheduler_status) {
+            (PoolDispatch::OnDemand(queue), None) => {
+                (self.active.load(Ordering::Acquire), queue.len(), 0)
+            }
+            (PoolDispatch::Prewarmed(_), Some(status)) => {
                 (status.active, status.queued, status.ready)
             }
+            _ => unreachable!("dispatch and scheduler status must agree"),
         };
+        let policy = self.prewarm_policy.unwrap_or(PrewarmPolicy {
+            warm_floor: 0,
+            ready_low_watermark: 0,
+            ready_high_watermark: 0,
+            max_replenish_batch: 0,
+            diagnostic_no_refill_wave: None,
+        });
         WorkerPoolStatus {
             admitted: self.admitted.load(Ordering::Acquire),
             active,
@@ -850,6 +1041,23 @@ impl WorkerRequestPool {
                 self.metrics.completion_max_ns.load(Ordering::Acquire),
             ),
             prewarmed_inventory: self.inventory.load(Ordering::Acquire),
+            warm_floor: policy.warm_floor,
+            ready_low_watermark: policy.ready_low_watermark,
+            ready_high_watermark: policy.ready_high_watermark,
+            max_replenish_batch: policy.max_replenish_batch,
+            replenishment_paused: scheduler_status
+                .is_some_and(|status| status.replenishment_paused),
+            replenishment_pause_reason: scheduler_status
+                .is_some_and(|status| status.replenishment_paused)
+                .then_some("diagnostic-wave"),
+            refill_active: scheduler_status.is_some_and(|status| status.refill_active),
+            idle_owners: scheduler_status.map_or(0, |status| status.idle_owners),
+            restore_permits_outstanding: scheduler_status
+                .map_or(0, |status| status.restore_permits_outstanding),
+            diagnostic_wave_dispatched: scheduler_status
+                .map_or(0, |status| status.diagnostic_wave_dispatched),
+            diagnostic_wave_completed: scheduler_status
+                .map_or(0, |status| status.diagnostic_wave_completed),
             ready,
             ready_min: observed_min(&self.metrics.ready_min),
             ready_peak: self.metrics.ready_peak.load(Ordering::Acquire),
@@ -859,6 +1067,20 @@ impl WorkerRequestPool {
             restore_attempts: self.metrics.restore_attempts.load(Ordering::Acquire),
             completed_restores: self.metrics.completed_restores.load(Ordering::Acquire),
             failed_restores: self.metrics.failed_restores.load(Ordering::Acquire),
+            completed_replenishment_policy_waits: self
+                .metrics
+                .completed_replenishment_policy_waits
+                .load(Ordering::Acquire),
+            replenishment_policy_wait_total_ms: nanoseconds_to_milliseconds(
+                self.metrics
+                    .replenishment_policy_wait_total_ns
+                    .load(Ordering::Acquire),
+            ),
+            replenishment_policy_wait_max_ms: nanoseconds_to_milliseconds(
+                self.metrics
+                    .replenishment_policy_wait_max_ns
+                    .load(Ordering::Acquire),
+            ),
             restore_wait_total_ms: nanoseconds_to_milliseconds(
                 self.metrics.restore_wait_total_ns.load(Ordering::Acquire),
             ),
@@ -949,6 +1171,7 @@ fn run_on_demand_worker(
         };
         let mut profile = profile;
         profile.ready_wait_ms = ready_wait_ms;
+        profile.admission_wait_ms = ready_wait_ms;
         enqueue_completion(
             &completion_sender,
             CompletedJob {
@@ -975,7 +1198,7 @@ fn run_prewarmed_dispatcher(
 ) {
     while let Some((owner, job)) = scheduler.next_dispatch() {
         if let Err(error) = owner_senders[owner.index].send(OwnerMessage::Execute(job)) {
-            scheduler.finish_execution();
+            scheduler.finish_failed_dispatch();
             let OwnerMessage::Execute(job) = error.0 else {
                 unreachable!("dispatcher only sends execute messages")
             };
@@ -987,7 +1210,7 @@ fn run_prewarmed_dispatcher(
                 &admitted,
             );
             enqueue_jobs(
-                scheduler.owner_failed(),
+                scheduler.owner_failed(false),
                 &admitted,
                 PoolSubmitError::Unavailable,
                 Some(&completion_sender),
@@ -1018,6 +1241,24 @@ fn run_prewarmed_owner(
     let mut consecutive_failures = 0usize;
     let mut recycling = false;
     loop {
+        let policy_wait_started = Instant::now();
+        if recycling && !scheduler.wait_for_replenishment(index) {
+            return;
+        }
+        let policy_wait_ms = if recycling {
+            let duration = policy_wait_started.elapsed();
+            record_duration(
+                &metrics.replenishment_policy_wait_total_ns,
+                &metrics.replenishment_policy_wait_max_ns,
+                duration,
+            );
+            metrics
+                .completed_replenishment_policy_waits
+                .fetch_add(1, Ordering::AcqRel);
+            duration.as_secs_f64() * 1000.0
+        } else {
+            0.0
+        };
         let restore_wait_started = Instant::now();
         let acquired = if recycling {
             restore_slots.acquire_with_wait_observer(
@@ -1077,6 +1318,7 @@ fn run_prewarmed_owner(
                     &metrics,
                     &mut consecutive_failures,
                     &RESTORE_RETRY_DELAYS,
+                    recycling,
                 ) {
                     return;
                 }
@@ -1092,6 +1334,7 @@ fn run_prewarmed_owner(
                     &metrics,
                     &mut consecutive_failures,
                     &RESTORE_RETRY_DELAYS,
+                    recycling,
                 ) {
                     return;
                 }
@@ -1100,10 +1343,13 @@ fn run_prewarmed_owner(
         };
         consecutive_failures = 0;
         inventory.fetch_add(1, Ordering::AcqRel);
-        if !scheduler.publish_ready(ReadyOwner {
-            index,
-            ready_at: Instant::now(),
-        }) {
+        if !scheduler.publish_ready(
+            ReadyOwner {
+                index,
+                ready_at: Instant::now(),
+            },
+            recycling,
+        ) {
             inventory.fetch_sub(1, Ordering::AcqRel);
             drop(restored);
             return;
@@ -1116,17 +1362,33 @@ fn run_prewarmed_owner(
                 return;
             }
         };
-        let ready_wait_ms = elapsed_ms(job.admitted_at);
+        let dispatched_at = Instant::now();
+        let ready_wait_started_at = job.ready_wait_started_at.unwrap_or(job.admitted_at);
+        let admission_wait_ms = ready_wait_started_at
+            .saturating_duration_since(job.admitted_at)
+            .as_secs_f64()
+            * 1000.0;
+        let ready_owner_wait_ms = dispatched_at
+            .saturating_duration_since(ready_wait_started_at)
+            .as_secs_f64()
+            * 1000.0;
+        let ready_wait_ms = admission_wait_ms + ready_owner_wait_ms;
+        let diagnostic_wave_member = job.diagnostic_wave_member;
         let completed = execute_prewarmed_job(
             job,
             restored,
-            ready_wait_ms,
-            restore_wait_ms,
-            restore_ms,
+            PrewarmExecutionTiming {
+                ready_wait_ms,
+                admission_wait_ms,
+                ready_owner_wait_ms,
+                policy_wait_ms,
+                restore_wait_ms: if recycling { restore_wait_ms } else { 0.0 },
+                restore_ms: if recycling { restore_ms } else { 0.0 },
+            },
             &metrics,
         );
         inventory.fetch_sub(1, Ordering::AcqRel);
-        scheduler.finish_execution();
+        scheduler.finish_execution(index, diagnostic_wave_member);
         enqueue_completion(&completion_sender, completed, &metrics, &admitted);
         recycling = true;
     }
@@ -1139,10 +1401,11 @@ fn retry_prewarmed_restore(
     metrics: &PoolMetrics,
     consecutive_failures: &mut usize,
     delays: &[Duration],
+    used_replenishment_permit: bool,
 ) -> bool {
     if *consecutive_failures == delays.len() {
         enqueue_jobs(
-            scheduler.owner_failed(),
+            scheduler.owner_failed(used_replenishment_permit),
             admitted,
             PoolSubmitError::Unavailable,
             Some(completion_sender),
@@ -1158,9 +1421,7 @@ fn retry_prewarmed_restore(
 fn execute_prewarmed_job(
     job: RequestJob,
     restored: RestoredWorkerVersionSandbox,
-    ready_wait_ms: f64,
-    restore_wait_ms: f64,
-    restore_ms: f64,
+    timing: PrewarmExecutionTiming,
     metrics: &PoolMetrics,
 ) -> CompletedJob {
     let request_id = job.request.request_id.clone();
@@ -1188,9 +1449,12 @@ fn execute_prewarmed_job(
                 metrics.completed_teardowns.fetch_add(1, Ordering::AcqRel);
             },
         );
-        execution.1.ready_wait_ms = ready_wait_ms;
-        execution.1.replenishment_wait_ms = restore_wait_ms;
-        execution.1.replenishment_restore_ms = restore_ms;
+        execution.1.ready_wait_ms = timing.ready_wait_ms;
+        execution.1.admission_wait_ms = timing.admission_wait_ms;
+        execution.1.ready_owner_wait_ms = timing.ready_owner_wait_ms;
+        execution.1.replenishment_policy_wait_ms = timing.policy_wait_ms;
+        execution.1.replenishment_wait_ms = timing.restore_wait_ms;
+        execution.1.replenishment_restore_ms = timing.restore_ms;
         execution
     }));
     let (result, profile) = match execution {
@@ -1198,9 +1462,12 @@ fn execute_prewarmed_job(
         Err(_) => (
             Err(Error::State("request worker panicked".into())),
             ExecutionProfile {
-                ready_wait_ms,
-                replenishment_wait_ms: restore_wait_ms,
-                replenishment_restore_ms: restore_ms,
+                ready_wait_ms: timing.ready_wait_ms,
+                admission_wait_ms: timing.admission_wait_ms,
+                ready_owner_wait_ms: timing.ready_owner_wait_ms,
+                replenishment_policy_wait_ms: timing.policy_wait_ms,
+                replenishment_wait_ms: timing.restore_wait_ms,
+                replenishment_restore_ms: timing.restore_ms,
                 ..ExecutionProfile::default()
             },
         ),
@@ -1423,6 +1690,44 @@ fn validate_configuration(
             "max concurrent restores must be nonzero".into(),
         ));
     }
+    if let WorkerPoolRestoreMode::Prewarmed {
+        sandboxes, policy, ..
+    } = restore_mode
+    {
+        if policy.warm_floor == 0 {
+            return Err(Error::State("prewarm warm floor must be nonzero".into()));
+        }
+        if policy.warm_floor >= sandboxes {
+            return Err(Error::State(
+                "prewarm warm floor must be smaller than the owner count".into(),
+            ));
+        }
+        if policy.ready_low_watermark <= policy.warm_floor {
+            return Err(Error::State(
+                "ready low watermark must exceed the warm floor".into(),
+            ));
+        }
+        if policy.ready_low_watermark > policy.ready_high_watermark {
+            return Err(Error::State(
+                "ready low watermark must not exceed the high watermark".into(),
+            ));
+        }
+        if policy.ready_high_watermark > sandboxes {
+            return Err(Error::State(
+                "ready high watermark must not exceed the owner count".into(),
+            ));
+        }
+        if policy.max_replenish_batch == 0 {
+            return Err(Error::State(
+                "maximum replenish batch must be nonzero".into(),
+            ));
+        }
+        if policy.diagnostic_no_refill_wave == Some(0) {
+            return Err(Error::State(
+                "diagnostic no-refill wave must be nonzero".into(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1432,9 +1737,11 @@ fn effective_concurrency(
 ) -> usize {
     match restore_mode {
         WorkerPoolRestoreMode::OnDemand => max_concurrent_sandboxes,
-        WorkerPoolRestoreMode::Prewarmed { sandboxes, .. } => {
-            sandboxes.min(max_concurrent_sandboxes)
-        }
+        WorkerPoolRestoreMode::Prewarmed {
+            sandboxes, policy, ..
+        } => sandboxes
+            .saturating_sub(policy.warm_floor)
+            .min(max_concurrent_sandboxes),
     }
 }
 
@@ -1500,14 +1807,20 @@ mod tests {
         let scheduler = test_scheduler(2, 1);
         assert!(scheduler.try_push(test_job("one", |_| {})).is_ok());
         assert!(scheduler.try_push(test_job("two", |_| {})).is_ok());
-        assert!(scheduler.publish_ready(ReadyOwner {
-            index: 0,
-            ready_at: Instant::now(),
-        }));
-        assert!(scheduler.publish_ready(ReadyOwner {
-            index: 1,
-            ready_at: Instant::now(),
-        }));
+        assert!(scheduler.publish_ready(
+            ReadyOwner {
+                index: 0,
+                ready_at: Instant::now(),
+            },
+            false,
+        ));
+        assert!(scheduler.publish_ready(
+            ReadyOwner {
+                index: 1,
+                ready_at: Instant::now(),
+            },
+            false,
+        ));
 
         let (owner, job) = scheduler.next_dispatch().unwrap();
         assert_eq!(owner.index, 0);
@@ -1531,29 +1844,246 @@ mod tests {
             .unwrap();
         });
         assert!(rx.recv_timeout(Duration::from_millis(20)).is_err());
-        scheduler.finish_execution();
+        scheduler.finish_execution(0, false);
         assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), "two");
         blocked.join().unwrap();
+    }
+
+    #[test]
+    fn warm_floor_is_never_dispatched() {
+        let scheduler = PrewarmScheduler::new(
+            4,
+            2,
+            2,
+            PrewarmPolicy {
+                warm_floor: 1,
+                ready_low_watermark: 1,
+                ready_high_watermark: 2,
+                max_replenish_batch: 1,
+                diagnostic_no_refill_wave: None,
+            },
+            Arc::new(PoolMetrics::new()),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        assert!(scheduler.try_push(test_job("one", |_| {})).is_ok());
+        assert!(scheduler.try_push(test_job("two", |_| {})).is_ok());
+        assert!(scheduler.publish_ready(
+            ReadyOwner {
+                index: 0,
+                ready_at: Instant::now(),
+            },
+            false,
+        ));
+        assert!(scheduler.publish_ready(
+            ReadyOwner {
+                index: 1,
+                ready_at: Instant::now(),
+            },
+            false,
+        ));
+
+        assert_eq!(
+            scheduler.next_dispatch().unwrap().1.request.request_id,
+            "one"
+        );
+        let status = scheduler.status();
+        assert_eq!(status.active, 1);
+        assert_eq!(status.queued, 1);
+        assert_eq!(status.ready, 1);
+    }
+
+    #[test]
+    fn adaptive_replenishment_refills_in_bounded_batches_toward_high() {
+        let scheduler = PrewarmScheduler::new(
+            8,
+            4,
+            5,
+            PrewarmPolicy {
+                warm_floor: 1,
+                ready_low_watermark: 2,
+                ready_high_watermark: 4,
+                max_replenish_batch: 2,
+                diagnostic_no_refill_wave: None,
+            },
+            Arc::new(PoolMetrics::new()),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        for index in 0..5 {
+            assert!(scheduler.publish_ready(
+                ReadyOwner {
+                    index,
+                    ready_at: Instant::now(),
+                },
+                false,
+            ));
+            assert!(
+                scheduler
+                    .try_push(test_job(&format!("job-{index}"), |_| {}))
+                    .is_ok()
+            );
+        }
+        let first = scheduler.next_dispatch().unwrap().0.index;
+        let second = scheduler.next_dispatch().unwrap().0.index;
+        let third = scheduler.next_dispatch().unwrap().0.index;
+        let fourth = scheduler.next_dispatch().unwrap().0.index;
+        scheduler.finish_execution(first, false);
+        scheduler.finish_execution(second, false);
+        scheduler.finish_execution(third, false);
+        scheduler.finish_execution(fourth, false);
+
+        let status = scheduler.status();
+        assert!(status.refill_active);
+        assert_eq!(status.ready, 1);
+        assert_eq!(status.restore_permits_outstanding, 2);
+        assert_eq!(status.idle_owners, 2);
+        assert!(scheduler.wait_for_replenishment(first));
+        assert!(scheduler.wait_for_replenishment(second));
+    }
+
+    #[test]
+    fn diagnostic_wave_pauses_refill_until_every_wave_member_finishes() {
+        let scheduler = PrewarmScheduler::new(
+            8,
+            4,
+            5,
+            PrewarmPolicy {
+                warm_floor: 1,
+                ready_low_watermark: 2,
+                ready_high_watermark: 4,
+                max_replenish_batch: 2,
+                diagnostic_no_refill_wave: Some(4),
+            },
+            Arc::new(PoolMetrics::new()),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        for index in 0..5 {
+            assert!(scheduler.publish_ready(
+                ReadyOwner {
+                    index,
+                    ready_at: Instant::now(),
+                },
+                false,
+            ));
+            assert!(
+                scheduler
+                    .try_push(test_job(&format!("job-{index}"), |_| {}))
+                    .is_ok()
+            );
+        }
+        let dispatches = (0..4)
+            .map(|_| scheduler.next_dispatch().unwrap())
+            .collect::<Vec<_>>();
+        for (index, (owner, job)) in dispatches.into_iter().enumerate() {
+            assert!(job.diagnostic_wave_member);
+            scheduler.finish_execution(owner.index, true);
+            let status = scheduler.status();
+            if index < 3 {
+                assert!(status.replenishment_paused);
+                assert_eq!(status.restore_permits_outstanding, 0);
+            }
+        }
+        let status = scheduler.status();
+        assert!(!status.replenishment_paused);
+        assert_eq!(status.diagnostic_wave_dispatched, 4);
+        assert_eq!(status.diagnostic_wave_completed, 4);
+        assert_eq!(status.restore_permits_outstanding, 2);
+    }
+
+    #[test]
+    fn request_wakes_dispatcher_when_idle_owners_are_waiting() {
+        let scheduler = Arc::new(PrewarmScheduler::new(
+            8,
+            2,
+            4,
+            PrewarmPolicy {
+                warm_floor: 1,
+                ready_low_watermark: 2,
+                ready_high_watermark: 2,
+                max_replenish_batch: 1,
+                diagnostic_no_refill_wave: Some(2),
+            },
+            Arc::new(PoolMetrics::new()),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        ));
+        for index in 0..4 {
+            assert!(scheduler.publish_ready(
+                ReadyOwner {
+                    index,
+                    ready_at: Instant::now(),
+                },
+                false,
+            ));
+        }
+        for id in ["wave-one", "wave-two"] {
+            assert!(scheduler.try_push(test_job(id, |_| {})).is_ok());
+        }
+        let dispatches = (0..2)
+            .map(|_| scheduler.next_dispatch().unwrap())
+            .collect::<Vec<_>>();
+        let (waiting_tx, waiting_rx) = mpsc::channel();
+        let mut owners = Vec::new();
+        for (owner, job) in dispatches {
+            assert!(job.diagnostic_wave_member);
+            scheduler.finish_execution(owner.index, true);
+            let waiter = scheduler.clone();
+            let waiting_tx = waiting_tx.clone();
+            owners.push(thread::spawn(move || {
+                waiting_tx.send(()).unwrap();
+                let _ = waiter.wait_for_replenishment(owner.index);
+            }));
+        }
+        waiting_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        waiting_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        thread::sleep(Duration::from_millis(20));
+
+        let dispatcher = scheduler.clone();
+        let (dispatch_tx, dispatch_rx) = mpsc::channel();
+        let dispatch = thread::spawn(move || {
+            dispatch_tx.send(dispatcher.next_dispatch()).unwrap();
+        });
+        thread::sleep(Duration::from_millis(20));
+        assert!(scheduler.try_push(test_job("after-wave", |_| {})).is_ok());
+        let (_, job) = dispatch_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.request.request_id, "after-wave");
+
+        scheduler.shutdown();
+        dispatch.join().unwrap();
+        for owner in owners {
+            owner.join().unwrap();
+        }
     }
 
     #[test]
     fn owner_is_not_ready_again_until_replacement_is_published() {
         let scheduler = test_scheduler(1, 1);
         assert!(scheduler.try_push(test_job("one", |_| {})).is_ok());
-        assert!(scheduler.publish_ready(ReadyOwner {
-            index: 0,
-            ready_at: Instant::now(),
-        }));
+        assert!(scheduler.publish_ready(
+            ReadyOwner {
+                index: 0,
+                ready_at: Instant::now(),
+            },
+            false,
+        ));
         let _ = scheduler.next_dispatch().unwrap();
-        scheduler.finish_execution();
+        scheduler.finish_execution(0, false);
 
         let status = scheduler.status();
         assert_eq!(status.active, 0);
         assert_eq!(status.ready, 0);
-        assert!(scheduler.publish_ready(ReadyOwner {
-            index: 0,
-            ready_at: Instant::now(),
-        }));
+        assert!(scheduler.publish_ready(
+            ReadyOwner {
+                index: 0,
+                ready_at: Instant::now(),
+            },
+            false,
+        ));
         assert_eq!(scheduler.status().ready, 1);
     }
 
@@ -1562,7 +2092,7 @@ mod tests {
         let scheduler = test_scheduler(1, 1);
         assert!(scheduler.try_push(test_job("one", |_| {})).is_ok());
         assert!(scheduler.try_push(test_job("two", |_| {})).is_ok());
-        let drained = scheduler.owner_failed();
+        let drained = scheduler.owner_failed(false);
 
         assert_eq!(drained.len(), 2);
         assert_eq!(
@@ -1627,6 +2157,7 @@ mod tests {
                 WorkerPoolRestoreMode::Prewarmed {
                     sandboxes: 0,
                     max_concurrent_restores: 1,
+                    policy: test_policy(1),
                 }
             )
             .is_err()
@@ -1638,6 +2169,7 @@ mod tests {
                 WorkerPoolRestoreMode::Prewarmed {
                     sandboxes: 2,
                     max_concurrent_restores: 1,
+                    policy: test_policy(2),
                 }
             )
             .is_ok()
@@ -1652,9 +2184,10 @@ mod tests {
                 WorkerPoolRestoreMode::Prewarmed {
                     sandboxes: 2,
                     max_concurrent_restores: 1,
+                    policy: test_policy(2),
                 }
             ),
-            2
+            1
         );
         assert_eq!(
             effective_concurrency(
@@ -1662,6 +2195,7 @@ mod tests {
                 WorkerPoolRestoreMode::Prewarmed {
                     sandboxes: 8,
                     max_concurrent_restores: 1,
+                    policy: test_policy(8),
                 }
             ),
             2
@@ -1698,10 +2232,13 @@ mod tests {
     fn active_capacity_is_released_before_blocked_completion() {
         let scheduler = Arc::new(test_scheduler(1, 1));
         assert!(scheduler.try_push(test_job("one", |_| {})).is_ok());
-        assert!(scheduler.publish_ready(ReadyOwner {
-            index: 0,
-            ready_at: Instant::now(),
-        }));
+        assert!(scheduler.publish_ready(
+            ReadyOwner {
+                index: 0,
+                ready_at: Instant::now(),
+            },
+            false,
+        ));
         let _ = scheduler.next_dispatch().unwrap();
         let metrics = scheduler.metrics.clone();
         let admitted = Arc::new(AtomicUsize::new(1));
@@ -1716,7 +2253,7 @@ mod tests {
             }),
             execution: test_execution("blocked"),
         };
-        scheduler.finish_execution();
+        scheduler.finish_execution(0, false);
         enqueue_completion(&completion_sender, completed, &metrics, &admitted);
 
         entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
@@ -1836,6 +2373,13 @@ mod tests {
             owner_count + 2,
             max_active,
             owner_count,
+            PrewarmPolicy {
+                warm_floor: 0,
+                ready_low_watermark: 1,
+                ready_high_watermark: owner_count,
+                max_replenish_batch: 1,
+                diagnostic_no_refill_wave: None,
+            },
             Arc::new(PoolMetrics::new()),
             Arc::new(AtomicUsize::new(0)),
             Arc::new(AtomicUsize::new(0)),
@@ -1858,6 +2402,18 @@ mod tests {
             timeout: Duration::from_secs(1),
             completion: Box::new(completion),
             admitted_at: Instant::now(),
+            ready_wait_started_at: None,
+            diagnostic_wave_member: false,
+        }
+    }
+
+    fn test_policy(owner_count: usize) -> PrewarmPolicy {
+        PrewarmPolicy {
+            warm_floor: 1,
+            ready_low_watermark: owner_count.min(2),
+            ready_high_watermark: owner_count,
+            max_replenish_batch: 1,
+            diagnostic_no_refill_wave: None,
         }
     }
 }

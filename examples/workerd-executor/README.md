@@ -38,6 +38,8 @@ cargo run --example workerd-demo -- \
   --bind 0.0.0.0:8787 \
   --restore-mode prewarmed --prewarmed-sandboxes 8 \
   --max-concurrent-restores 2 \
+  --warm-floor 1 --ready-low-watermark 4 \
+  --ready-high-watermark 8 --max-replenish-batch 2 \
   --max-concurrent-sandboxes 4 --queue-capacity 64 \
   --profile-log-every 64
 curl http://127.0.0.1:8787/
@@ -64,7 +66,14 @@ number of reserved VMs (and therefore reserved VM/RSS footprint). It may be
 larger than `--max-concurrent-sandboxes`, which remains the active execution cap
 so replenishment can overlap guest execution. In prewarmed mode,
 `--max-concurrent-restores` (default 1) separately bounds restore CPU pressure;
-owners waiting for a restore permit block rather than spin. Restored owners
+owners waiting for a restore permit block rather than spin.
+`--warm-floor` (default 1) reserves that many fully restored ready VMs from
+dispatch, so shutdown is the only path that destroys the final warm VM.
+Crossing below `--ready-low-watermark` starts an adaptive refill toward
+`--ready-high-watermark`; `--max-replenish-batch` bounds scheduler-issued
+restore permits. Owners without a VM sleep until the central scheduler grants
+a permit, and requests never restore on the listener or completion thread.
+Restored owners
 publish a mailbox handle into one bounded central ready queue. A single
 dispatcher atomically pairs a queued request with a ready owner under the
 active cap and sends the request to that owner's mailbox. Owners never compete
@@ -72,20 +81,27 @@ on the request queue and VMs never move between OS threads. Both prewarm-only
 sizing flags are rejected in on-demand mode, where owner and effective
 execution concurrency equal `--max-concurrent-sandboxes`.
 
+`--diagnostic-no-refill-wave N` pre-fills every configured owner, pauses normal
+replacement restores for the first `N` dispatched requests, and resumes
+adaptive replenishment after all `N` complete. The warm floor still overrides
+the pause. Use this only with an exact `-n N -c N` diagnostic wave.
+
 Budget active execution and restore together for the host. For example, a
 32-core host could use 28 active sandboxes plus 4 concurrent restores, subject
 to measured guest CPU and memory headroom. Startup logs report active, owner,
 and restore counts; per-request profiles report ready wait and restore time.
-`/__hyperlight/pool-status` reports the selected mode plus the actual prewarmed
-VM inventory, ready and replenishing counts, and cumulative pairing hits and
-misses. Each restored VM records exactly one result when it takes a request: a
+`/__hyperlight/pool-status` reports the selected mode, warm floor, ready
+watermarks, refill batch, pause state/reason, idle owners, outstanding restore
+permits, diagnostic-wave progress, actual prewarmed VM inventory, ready and
+replenishing counts, and cumulative pairing hits and misses. Each restored VM
+records exactly one result when it takes a request: a
 hit when it was already ready at admission, or a miss when the request arrived
 before that VM finished restoring. Those prewarmed metrics remain zero in
 on-demand mode. Startup and status also distinguish the configured active cap,
 owner count, resolved `prewarmed_sandboxes`, resolved
 `max_concurrent_restores`, and effective concurrency
-(`min(owners, active cap)`). The two prewarm-only configuration fields are
-`null` in on-demand mode.
+(`min(owners - warm floor, active cap)`). The owner and restore configuration
+fields remain `null` in on-demand mode; policy gauges report zero or false.
 
 Status also exposes admitted requests, current execution/restore occupancy,
 recycle queue depth, teardown activity, completion queue depth and callbacks in
@@ -114,6 +130,14 @@ includes the request sequence, request ID, and monotonically increasing sample
 number. Pool status exposes both the configured interval and
 `profile_samples_logged`. Benchmark both `1` and `0` once to quantify logging
 overhead, then use one matched sampled interval for comparative phase evidence.
+
+`ExecutionProfile.ready_wait_ms` remains the total time from bounded admission
+to owner dispatch. It is split into `admission_wait_ms` (waiting behind earlier
+work or the active cap) and `ready_owner_wait_ms` (front-of-queue with an
+execution slot but no dispatchable ready owner). The next request handled by a
+recycled owner reports its scheduler-permit delay separately as
+`replenishment_policy_wait_ms`; `replenishment_wait_ms` remains restore-slot
+waiting.
 
 Requests above the active limit wait in a bounded queue (`--queue-capacity`,
 default 64); admission never waits for queue space, and overflow receives HTTP

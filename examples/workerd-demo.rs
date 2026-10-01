@@ -5,8 +5,8 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use hyperlight_unikraft::workerd::{
     FetchBroker, FetchBrokerConfig, FetchLimits, FetchPolicy, Header, MAX_BODY_BYTES,
-    MAX_HEADER_BYTES, PROTOCOL_VERSION, RequestEnvelope, WorkerBundle, WorkerPoolRestoreMode,
-    WorkerRequestPool, WorkerVersionId, WorkerVersionSandbox,
+    MAX_HEADER_BYTES, PROTOCOL_VERSION, PrewarmPolicy, RequestEnvelope, WorkerBundle,
+    WorkerPoolRestoreMode, WorkerRequestPool, WorkerVersionId, WorkerVersionSandbox,
 };
 use hyperlight_unikraft::{AllowList, NetworkPolicy};
 use std::env;
@@ -24,6 +24,8 @@ const MAX_REQUEST_HEAD_BYTES: usize = MAX_HEADER_BYTES + 8 * 1024;
 const DEFAULT_MAX_CONCURRENT_SANDBOXES: usize = 4;
 const DEFAULT_PREWARMED_SANDBOXES: usize = 4;
 const DEFAULT_MAX_CONCURRENT_RESTORES: usize = 1;
+const DEFAULT_WARM_FLOOR: usize = 1;
+const DEFAULT_MAX_REPLENISH_BATCH: usize = 2;
 const DEFAULT_QUEUE_CAPACITY: usize = 64;
 const DEFAULT_SCRATCH_MIB: usize = 344;
 
@@ -47,6 +49,11 @@ struct Options {
     restore_mode: RestoreMode,
     prewarmed_sandboxes: Option<usize>,
     max_concurrent_restores: Option<usize>,
+    warm_floor: Option<usize>,
+    ready_low_watermark: Option<usize>,
+    ready_high_watermark: Option<usize>,
+    max_replenish_batch: Option<usize>,
+    diagnostic_no_refill_wave: Option<usize>,
     max_concurrent_sandboxes: usize,
     queue_capacity: usize,
     profile_log_every: usize,
@@ -69,6 +76,11 @@ impl Options {
             restore_mode: RestoreMode::OnDemand,
             prewarmed_sandboxes: None,
             max_concurrent_restores: None,
+            warm_floor: None,
+            ready_low_watermark: None,
+            ready_high_watermark: None,
+            max_replenish_batch: None,
+            diagnostic_no_refill_wave: None,
             max_concurrent_sandboxes: DEFAULT_MAX_CONCURRENT_SANDBOXES,
             queue_capacity: DEFAULT_QUEUE_CAPACITY,
             profile_log_every: 1,
@@ -116,6 +128,25 @@ impl Options {
                     options.max_concurrent_restores =
                         Some(nonzero_usize(value()?, "--max-concurrent-restores")?)
                 }
+                "--warm-floor" => {
+                    options.warm_floor = Some(nonzero_usize(value()?, "--warm-floor")?)
+                }
+                "--ready-low-watermark" => {
+                    options.ready_low_watermark =
+                        Some(nonzero_usize(value()?, "--ready-low-watermark")?)
+                }
+                "--ready-high-watermark" => {
+                    options.ready_high_watermark =
+                        Some(nonzero_usize(value()?, "--ready-high-watermark")?)
+                }
+                "--max-replenish-batch" => {
+                    options.max_replenish_batch =
+                        Some(nonzero_usize(value()?, "--max-replenish-batch")?)
+                }
+                "--diagnostic-no-refill-wave" => {
+                    options.diagnostic_no_refill_wave =
+                        Some(nonzero_usize(value()?, "--diagnostic-no-refill-wave")?)
+                }
                 "--max-concurrent-sandboxes" => {
                     options.max_concurrent_sandboxes =
                         nonzero_usize(value()?, "--max-concurrent-sandboxes")?
@@ -141,6 +172,9 @@ impl Options {
                          [--init-timeout-ms MS] [--request-timeout-ms MS] \
                          [--restore-mode on-demand|prewarmed] [--prewarmed-sandboxes N] \
                          [--max-concurrent-restores N] \
+                         [--warm-floor N] [--ready-low-watermark N] \
+                         [--ready-high-watermark N] [--max-replenish-batch N] \
+                         [--diagnostic-no-refill-wave N] \
                          [--max-concurrent-sandboxes N] [--queue-capacity N] \
                          [--profile-log-every N]\n\
                          [--fetch-loopback-port PORT]\n\
@@ -152,6 +186,10 @@ impl Options {
                          --restore-mode on-demand \
                          --prewarmed-sandboxes {DEFAULT_PREWARMED_SANDBOXES} \
                          --max-concurrent-restores {DEFAULT_MAX_CONCURRENT_RESTORES} (prewarmed) \
+                         --warm-floor {DEFAULT_WARM_FLOOR} \
+                         --ready-low-watermark active/2 \
+                         --ready-high-watermark active \
+                         --max-replenish-batch {DEFAULT_MAX_REPLENISH_BATCH} \
                          --max-concurrent-sandboxes {DEFAULT_MAX_CONCURRENT_SANDBOXES} \
                          --queue-capacity {DEFAULT_QUEUE_CAPACITY} \
                          --profile-log-every 1\n\
@@ -159,7 +197,8 @@ impl Options {
                          allows HTTP fetches to localhost on exactly PORT for the demo.\n\
                          On-demand owners restore one fresh VM per request. Prewarmed owners restore \
                          before advertising readiness, execute at most one request, drop the VM, and \
-                         replenish. --max-concurrent-restores bounds restore CPU pressure and \
+                         replenish adaptively below explicit ready watermarks. The warm floor is \
+                         never dispatched. --max-concurrent-restores bounds restore CPU pressure and \
                          --max-concurrent-sandboxes remains the active execution cap; \
                          requests above it queue up to --queue-capacity and overflow receives HTTP 503."
                     ));
@@ -169,8 +208,18 @@ impl Options {
         }
         validate_restore_options(
             options.restore_mode,
-            options.prewarmed_sandboxes,
-            options.max_concurrent_restores,
+            &[
+                ("--prewarmed-sandboxes", options.prewarmed_sandboxes),
+                ("--max-concurrent-restores", options.max_concurrent_restores),
+                ("--warm-floor", options.warm_floor),
+                ("--ready-low-watermark", options.ready_low_watermark),
+                ("--ready-high-watermark", options.ready_high_watermark),
+                ("--max-replenish-batch", options.max_replenish_batch),
+                (
+                    "--diagnostic-no-refill-wave",
+                    options.diagnostic_no_refill_wave,
+                ),
+            ],
         )?;
         Ok(options)
     }
@@ -186,18 +235,16 @@ fn parse_restore_mode(value: &str) -> Result<RestoreMode, String> {
 
 fn validate_restore_options(
     mode: RestoreMode,
-    prewarmed_sandboxes: Option<usize>,
-    max_concurrent_restores: Option<usize>,
+    prewarm_options: &[(&str, Option<usize>)],
 ) -> Result<(), String> {
-    if mode == RestoreMode::OnDemand && prewarmed_sandboxes.is_some() {
-        return Err(
-            "--prewarmed-sandboxes is only valid with --restore-mode prewarmed".to_string(),
-        );
-    }
-    if mode == RestoreMode::OnDemand && max_concurrent_restores.is_some() {
-        return Err(
-            "--max-concurrent-restores is only valid with --restore-mode prewarmed".to_string(),
-        );
+    if mode == RestoreMode::OnDemand {
+        for (flag, value) in prewarm_options {
+            if value.is_some() {
+                return Err(format!(
+                    "{flag} is only valid with --restore-mode prewarmed"
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -280,7 +327,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .prewarmed_sandboxes
             .unwrap_or(DEFAULT_PREWARMED_SANDBOXES),
     };
-    let effective_concurrency = owner_count.min(options.max_concurrent_sandboxes);
     let prewarmed_sandboxes =
         (options.restore_mode == RestoreMode::Prewarmed).then_some(owner_count);
     let max_concurrent_restores = match options.restore_mode {
@@ -291,11 +337,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or(DEFAULT_MAX_CONCURRENT_RESTORES),
         ),
     };
+    let prewarm_policy = (options.restore_mode == RestoreMode::Prewarmed).then(|| {
+        let warm_floor = options.warm_floor.unwrap_or(DEFAULT_WARM_FLOOR);
+        let ready_high_watermark = options
+            .ready_high_watermark
+            .unwrap_or(options.max_concurrent_sandboxes)
+            .min(owner_count);
+        PrewarmPolicy {
+            warm_floor,
+            ready_low_watermark: options.ready_low_watermark.unwrap_or(
+                (ready_high_watermark / 2)
+                    .max(warm_floor.saturating_add(1))
+                    .min(ready_high_watermark),
+            ),
+            ready_high_watermark,
+            max_replenish_batch: options
+                .max_replenish_batch
+                .unwrap_or(DEFAULT_MAX_REPLENISH_BATCH),
+            diagnostic_no_refill_wave: options.diagnostic_no_refill_wave,
+        }
+    });
+    let effective_concurrency = prewarm_policy.map_or(options.max_concurrent_sandboxes, |policy| {
+        owner_count
+            .saturating_sub(policy.warm_floor)
+            .min(options.max_concurrent_sandboxes)
+    });
     let restore_mode = match options.restore_mode {
         RestoreMode::OnDemand => WorkerPoolRestoreMode::OnDemand,
         RestoreMode::Prewarmed => WorkerPoolRestoreMode::Prewarmed {
             sandboxes: owner_count,
             max_concurrent_restores: max_concurrent_restores.unwrap(),
+            policy: prewarm_policy.unwrap(),
         },
     };
     let pool = WorkerRequestPool::with_restore_mode(
@@ -306,7 +378,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let listener = TcpListener::bind(&options.bind)?;
     eprintln!(
-        "workerd demo listening on http://{} (Worker {}, bundle {}, restore {}, {} active cap, {} owners, {} effective concurrency, {} restores, queue {})",
+        "workerd demo listening on http://{} (Worker {}, bundle {}, restore {}, {} active cap, {} owners, {} effective concurrency, {} restores, warm floor {}, ready low/high {}/{}, refill batch {}, queue {})",
         listener.local_addr()?,
         version.as_str(),
         bundle_sha256,
@@ -318,6 +390,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         owner_count,
         effective_concurrency,
         max_concurrent_restores.unwrap_or(options.max_concurrent_sandboxes),
+        prewarm_policy.map_or(0, |policy| policy.warm_floor),
+        prewarm_policy.map_or(0, |policy| policy.ready_low_watermark),
+        prewarm_policy.map_or(0, |policy| policy.ready_high_watermark),
+        prewarm_policy.map_or(0, |policy| policy.max_replenish_batch),
         options.queue_capacity
     );
     let sequence = AtomicU64::new(1);
@@ -389,6 +465,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "prewarmed_sandboxes": prewarmed_sandboxes,
                 "max_concurrent_restores": max_concurrent_restores,
                 "prewarmed_inventory": status.prewarmed_inventory,
+                "warm_floor": status.warm_floor,
+                "ready_low_watermark": status.ready_low_watermark,
+                "ready_high_watermark": status.ready_high_watermark,
+                "max_replenish_batch": status.max_replenish_batch,
+                "replenishment_paused": status.replenishment_paused,
+                "replenishment_pause_reason": status.replenishment_pause_reason,
+                "refill_active": status.refill_active,
+                "idle_owners": status.idle_owners,
+                "restore_permits_outstanding": status.restore_permits_outstanding,
+                "diagnostic_wave_dispatched": status.diagnostic_wave_dispatched,
+                "diagnostic_wave_completed": status.diagnostic_wave_completed,
                 "prewarmed_ready": status.ready,
                 "prewarmed_ready_min": status.ready_min,
                 "prewarmed_ready_peak": status.ready_peak,
@@ -398,6 +485,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "restore_attempts": status.restore_attempts,
                 "completed_restores": status.completed_restores,
                 "failed_restores": status.failed_restores,
+                "completed_replenishment_policy_waits": status.completed_replenishment_policy_waits,
+                "replenishment_policy_wait_total_ms": status.replenishment_policy_wait_total_ms,
+                "replenishment_policy_wait_average_ms": average_ms(
+                    status.replenishment_policy_wait_total_ms,
+                    status.completed_replenishment_policy_waits,
+                ),
+                "replenishment_policy_wait_max_ms": status.replenishment_policy_wait_max_ms,
                 "restore_wait_total_ms": status.restore_wait_total_ms,
                 "restore_wait_average_ms": average_ms(
                     status.restore_wait_total_ms,
@@ -661,16 +755,42 @@ mod tests {
 
     #[test]
     fn restore_limit_is_prewarmed_only() {
-        assert!(validate_restore_options(RestoreMode::OnDemand, None, None).is_ok());
-        assert!(validate_restore_options(RestoreMode::Prewarmed, None, None).is_ok());
-        assert!(validate_restore_options(RestoreMode::Prewarmed, None, Some(2)).is_ok());
-        assert!(validate_restore_options(RestoreMode::OnDemand, None, Some(1)).is_err());
+        assert!(
+            validate_restore_options(
+                RestoreMode::OnDemand,
+                &[("--max-concurrent-restores", None)]
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_restore_options(
+                RestoreMode::Prewarmed,
+                &[("--max-concurrent-restores", Some(2))],
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_restore_options(
+                RestoreMode::OnDemand,
+                &[("--max-concurrent-restores", Some(1))],
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn prewarmed_sandbox_count_is_prewarmed_only() {
-        assert!(validate_restore_options(RestoreMode::Prewarmed, Some(2), None).is_ok());
-        assert!(validate_restore_options(RestoreMode::OnDemand, Some(2), None).is_err());
+        assert!(
+            validate_restore_options(
+                RestoreMode::Prewarmed,
+                &[("--prewarmed-sandboxes", Some(2))],
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_restore_options(RestoreMode::OnDemand, &[("--prewarmed-sandboxes", Some(2))],)
+                .is_err()
+        );
     }
 
     #[test]

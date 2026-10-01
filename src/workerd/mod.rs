@@ -26,7 +26,8 @@ pub use fetch::{
     FetchResponse,
 };
 pub use pool::{
-    PoolSubmitError, RequestExecution, WorkerPoolRestoreMode, WorkerPoolStatus, WorkerRequestPool,
+    PoolSubmitError, PrewarmPolicy, RequestExecution, WorkerPoolRestoreMode, WorkerPoolStatus,
+    WorkerRequestPool,
 };
 pub use protocol::*;
 pub use sandbox::{

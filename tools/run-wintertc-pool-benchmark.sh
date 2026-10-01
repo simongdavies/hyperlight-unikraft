@@ -16,6 +16,11 @@ queue_capacity="${WINTERTC_POOL_QUEUE_CAPACITY:-256}"
 restore_mode="${WINTERTC_POOL_RESTORE_MODE:-on-demand}"
 prewarmed_sandboxes="${WINTERTC_POOL_PREWARMED_SANDBOXES:-$pool_size}"
 max_concurrent_restores="${WINTERTC_POOL_MAX_CONCURRENT_RESTORES:-1}"
+warm_floor="${WINTERTC_POOL_WARM_FLOOR:-1}"
+ready_low_watermark="${WINTERTC_POOL_READY_LOW_WATERMARK:-$((pool_size / 2))}"
+ready_high_watermark="${WINTERTC_POOL_READY_HIGH_WATERMARK:-$pool_size}"
+max_replenish_batch="${WINTERTC_POOL_MAX_REPLENISH_BATCH:-2}"
+diagnostic_no_refill_wave="${WINTERTC_POOL_DIAGNOSTIC_NO_REFILL_WAVE:-}"
 profile_log_every="${WINTERTC_POOL_PROFILE_LOG_EVERY:-64}"
 bind="${WINTERTC_POOL_BIND:-127.0.0.1:8787}"
 base_url="http://$bind"
@@ -50,7 +55,14 @@ if [[ "$restore_mode" == "prewarmed" ]]; then
     server_args+=(
         --prewarmed-sandboxes "$prewarmed_sandboxes"
         --max-concurrent-restores "$max_concurrent_restores"
+        --warm-floor "$warm_floor"
+        --ready-low-watermark "$ready_low_watermark"
+        --ready-high-watermark "$ready_high_watermark"
+        --max-replenish-batch "$max_replenish_batch"
     )
+    if [[ -n "$diagnostic_no_refill_wave" ]]; then
+        server_args+=(--diagnostic-no-refill-wave "$diagnostic_no_refill_wave")
+    fi
 fi
 
 cargo run --release --locked --example workerd-demo -- \
@@ -165,11 +177,13 @@ def is_quiescent(pool):
         return False
     if pool["restore_mode"] != "prewarmed":
         return True
-    owners = pool["prewarmed_sandboxes"]
     return (
-        pool["prewarmed_inventory"] == owners
-        and pool["prewarmed_ready"] == owners
+        pool["prewarmed_inventory"] == pool["prewarmed_ready"]
+        and pool["prewarmed_ready"] >= pool["warm_floor"]
         and pool["prewarmed_replenishing"] == 0
+        and pool["restore_permits_outstanding"] == 0
+        and not pool["refill_active"]
+        and not pool["replenishment_paused"]
     )
 
 def wait_for_quiescence(label, timeout=120):
@@ -263,6 +277,14 @@ def run_hey(label, args):
     failed_restores = (
         after_pool["failed_restores"] - before_pool["failed_restores"]
     )
+    completed_policy_waits = (
+        after_pool["completed_replenishment_policy_waits"]
+        - before_pool["completed_replenishment_policy_waits"]
+    )
+    policy_wait_total_ms = (
+        after_pool["replenishment_policy_wait_total_ms"]
+        - before_pool["replenishment_policy_wait_total_ms"]
+    )
     restore_wait_total_ms = (
         after_pool["restore_wait_total_ms"] - before_pool["restore_wait_total_ms"]
     )
@@ -323,6 +345,13 @@ def run_hey(label, args):
             "restore_attempts": restore_attempts,
             "completed_restores": completed_restores,
             "failed_restores": failed_restores,
+            "completed_replenishment_policy_waits": completed_policy_waits,
+            "replenishment_policy_wait_total_ms": policy_wait_total_ms,
+            "replenishment_policy_wait_average_ms": (
+                policy_wait_total_ms / completed_policy_waits
+                if completed_policy_waits
+                else None
+            ),
             "restore_wait_total_ms": restore_wait_total_ms,
             "restore_wait_average_ms": (
                 restore_wait_total_ms / restore_attempts
@@ -421,6 +450,16 @@ report = {
         ],
         "max_concurrent_restores": baseline_run["pool"]["status_before"][
             "max_concurrent_restores"
+        ],
+        "warm_floor": baseline_run["pool"]["status_before"]["warm_floor"],
+        "ready_low_watermark": baseline_run["pool"]["status_before"][
+            "ready_low_watermark"
+        ],
+        "ready_high_watermark": baseline_run["pool"]["status_before"][
+            "ready_high_watermark"
+        ],
+        "max_replenish_batch": baseline_run["pool"]["status_before"][
+            "max_replenish_batch"
         ],
         "profile_log_every": baseline_run["pool"]["status_before"][
             "profile_log_every"
