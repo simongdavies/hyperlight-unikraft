@@ -8,6 +8,11 @@ It grants neither hostfs nor hostsock. The committed general-purpose kernel
 contains those drivers, but the wrapper supplies no mounts/network policy
 and registers no `fs_*` or `net_*` host functions.
 
+For a complete clean-VM Azure KVM walkthrough, including executor packaging,
+WinterTC capability routes, isolation/timeout checks, `hey` load, adaptive
+prewarm diagnostics, profiling, and cost cleanup, see
+[`docs/azure-workerd-hyperlight-runbook.md`](../../docs/azure-workerd-hyperlight-runbook.md).
+
 ## Build
 
 `just guests` builds the native fixture with Linux gcc and cpio (Ubuntu-24.04
