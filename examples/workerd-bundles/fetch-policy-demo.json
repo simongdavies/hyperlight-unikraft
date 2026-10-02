@@ -1,0 +1,13 @@
+{
+  "protocol_version": 1,
+  "worker_version": "fetch-policy-demo-v1",
+  "compatibility_date": "2025-12-31",
+  "main_module": "worker.js",
+  "modules": [
+    {
+      "name": "worker.js",
+      "type": "esModule",
+      "source": "export default {\n  async fetch(request) {\n    const requestUrl = new URL(request.url);\n    if (requestUrl.pathname !== '/fetch-policy') {\n      return Response.json({\n        endpoint: '/fetch-policy?target=<absolute-url>',\n        note: 'The Rust host owns the outbound policy; this Worker can only request a target.',\n      }, { status: 404 });\n    }\n\n    const target = requestUrl.searchParams.get('target');\n    if (target === null) {\n      return Response.json({ outcome: 'invalid', message: 'target query parameter is required' }, { status: 400 });\n    }\n\n    try {\n      const response = await fetch(target, { redirect: 'manual' });\n      return Response.json({\n        outcome: 'success',\n        target,\n        status: response.status,\n        location: response.headers.get('location'),\n        body: await response.text(),\n      });\n    } catch (error) {\n      return Response.json({\n        outcome: 'error',\n        target,\n        error: {\n          name: error?.name ?? 'Error',\n          message: error?.message ?? String(error),\n        },\n      });\n    }\n  },\n};\n"
+    }
+  ]
+}

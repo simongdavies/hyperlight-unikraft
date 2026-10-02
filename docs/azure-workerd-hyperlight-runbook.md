@@ -692,6 +692,157 @@ SERVER_PID=
 UPSTREAM_PID=
 ```
 
+### Policy-constrained outbound fetch evidence
+
+This focused demo proves that outbound authority belongs to the Rust host.
+The Worker accepts a target URL, but cannot add hosts, schemes, ports, or
+address classes to the broker policy. Redirects are returned to the Worker and
+are not followed. Loopback, private, and metadata destinations are separately
+gated.
+
+Start a deterministic local upstream with one success route and one redirect:
+
+```bash
+mkdir -p "$HOME/results/fetch-policy/upstream"
+cat >"$HOME/results/fetch-policy/upstream/server.py" <<'PY'
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+BODY = b"allowed-upstream\n"
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/ok":
+            self.send_response(200)
+            self.send_header("content-type", "text/plain")
+            self.send_header("content-length", str(len(BODY)))
+            self.end_headers()
+            self.wfile.write(BODY)
+            return
+        if self.path == "/redirect":
+            self.send_response(302)
+            self.send_header("location", "/ok")
+            self.send_header("content-length", "0")
+            self.end_headers()
+            return
+        self.send_error(404)
+
+    def log_message(self, format, *args):
+        print(format % args, flush=True)
+
+ThreadingHTTPServer(("127.0.0.1", 18080), Handler).serve_forever()
+PY
+
+if [[ -n "${UPSTREAM_PID:-}" ]] && kill -0 "$UPSTREAM_PID" 2>/dev/null; then
+  kill -TERM "$UPSTREAM_PID" 2>/dev/null || true
+  wait "$UPSTREAM_PID" 2>/dev/null || true
+fi
+UPSTREAM_PID=
+python3 "$HOME/results/fetch-policy/upstream/server.py" \
+  >"$HOME/results/fetch-policy/upstream/server.log" 2>&1 &
+UPSTREAM_PID=$!
+```
+
+Start the dedicated Worker with an explicit general policy. Only HTTP to
+`localhost:18080` is listed, and loopback is the only address-class opt-in:
+
+```bash
+cd "$HOME/src/hyperlight-unikraft"
+mkdir -p "$HOME/results/fetch-policy"
+
+if [[ -n "${SERVER_PID:-}" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
+  kill -TERM "$SERVER_PID" 2>/dev/null || true
+  wait "$SERVER_PID" 2>/dev/null || true
+fi
+SERVER_PID=
+SERVER_LOG="$HOME/results/fetch-policy/server.log"
+
+RUST_LOG=info \
+target/release/examples/workerd-demo \
+  --executor build-elfloader/workerd-executor/executor \
+  --rootfs build-elfloader/workerd-executor/rootfs.img \
+  --bundle examples/workerd-bundles/fetch-policy-demo.json \
+  --bind 127.0.0.1:8787 \
+  --scratch-mb 384 \
+  --request-timeout-ms 5000 \
+  --restore-mode on-demand \
+  --max-concurrent-sandboxes 4 \
+  --queue-capacity 32 \
+  --fetch-allow-host localhost \
+  --fetch-allow-scheme http \
+  --fetch-allow-port 18080 \
+  --fetch-allow-loopback \
+  --fetch-max-request-bytes 1048576 \
+  --fetch-max-response-bytes 4194304 \
+  --fetch-max-concurrent-requests 8 \
+  --fetch-timeout-ms 5000 \
+  >"$SERVER_LOG" 2>&1 &
+SERVER_PID=$!
+
+SERVER_READY=false
+for _ in $(seq 1 600); do
+  if curl --silent --fail \
+    http://127.0.0.1:8787/__hyperlight/pool-status >/dev/null; then
+    SERVER_READY=true
+    break
+  fi
+  if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+    wait "$SERVER_PID" 2>/dev/null || true
+    echo "Fetch-policy server stopped before readiness. Recent log output:"
+    tail -n 100 "$SERVER_LOG"
+    break
+  fi
+  sleep 1
+done
+if [[ "$SERVER_READY" != true ]]; then
+  echo "Fetch-policy server is not ready; do not continue this section."
+fi
+```
+
+List the stable checks and the policy boundary each one demonstrates:
+
+```bash
+bash tools/run-workerd-fetch-policy-demo.sh --list
+```
+
+Run all policy checks and preserve their raw JSON:
+
+```bash
+bash tools/run-workerd-fetch-policy-demo.sh all
+```
+
+Pause between checks in an interactive walkthrough:
+
+```bash
+bash tools/run-workerd-fetch-policy-demo.sh --pause all
+```
+
+Run one denial check:
+
+```bash
+bash tools/run-workerd-fetch-policy-demo.sh metadata-denied
+```
+
+The complete run requires the allowed endpoint to succeed; wrong port,
+`example.com`, HTTPS, `169.254.169.254`, and `10.0.0.1` to be rejected by
+policy before connection; and the redirect route to return HTTP 302 with its
+`Location` header instead of following it. Raw JSON is stored under
+`$HOME/results/workerd-fetch-policy`.
+
+Stop both processes:
+
+```bash
+if [[ -n "${SERVER_PID:-}" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
+  kill -TERM "$SERVER_PID" 2>/dev/null || true
+fi
+if [[ -n "${UPSTREAM_PID:-}" ]] && kill -0 "$UPSTREAM_PID" 2>/dev/null; then
+  kill -TERM "$UPSTREAM_PID" 2>/dev/null || true
+fi
+wait "${SERVER_PID:-}" 2>/dev/null || true
+wait "${UPSTREAM_PID:-}" 2>/dev/null || true
+SERVER_PID=
+UPSTREAM_PID=
+```
+
 ## 8. Run a simple parallel `hey` benchmark
 
 Use the 9,441-byte `/sync` response from

@@ -215,7 +215,11 @@ below.
 Outbound access is denied by default. A configured `WorkerVersionSandbox`
 registers a host-owned broker; no policy is sent to, visible to, or mutable by
 the guest. The demo's `--fetch-loopback-port PORT` option allows only HTTP to
-`localhost:PORT`. Production callers must construct an explicit `FetchPolicy`.
+`localhost:PORT`. The demo also accepts repeatable `--fetch-allow-host`,
+`--fetch-allow-scheme`, and `--fetch-allow-port` options, with separate
+loopback, private, and metadata opt-ins and bounded broker-limit overrides.
+The shorthand and general policy forms are intentionally mutually exclusive.
+Production callers must construct an explicit `FetchPolicy`.
 
 The executor invokes registered host functions through the generic
 `HLCALL_IOC_HOSTCALL` ioctl on `/dev/hlcall`. `drivers/hl_driver.h` defines the

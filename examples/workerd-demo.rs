@@ -10,6 +10,7 @@ use hyperlight_unikraft::workerd::{
 };
 use hyperlight_unikraft::{AllowList, NetworkPolicy};
 use std::env;
+use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -28,6 +29,10 @@ const DEFAULT_WARM_FLOOR: usize = 1;
 const DEFAULT_MAX_REPLENISH_BATCH: usize = 2;
 const DEFAULT_QUEUE_CAPACITY: usize = 64;
 const DEFAULT_SCRATCH_MIB: usize = 344;
+const MAX_FETCH_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+const MAX_FETCH_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_FETCH_CONCURRENT_REQUESTS: usize = 64;
+const MAX_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RestoreMode {
@@ -58,10 +63,24 @@ struct Options {
     queue_capacity: usize,
     profile_log_every: usize,
     fetch_loopback_port: Option<u16>,
+    fetch_allow_hosts: Vec<String>,
+    fetch_allow_schemes: Vec<String>,
+    fetch_allow_ports: Vec<u16>,
+    fetch_allow_loopback: bool,
+    fetch_allow_private: bool,
+    fetch_allow_metadata: bool,
+    fetch_max_request_bytes: Option<usize>,
+    fetch_max_response_bytes: Option<usize>,
+    fetch_max_concurrent_requests: Option<usize>,
+    fetch_timeout: Option<Duration>,
 }
 
 impl Options {
     fn parse() -> Result<Self, String> {
+        Self::parse_from(env::args().skip(1))
+    }
+
+    fn parse_from(args: impl IntoIterator<Item = impl Into<OsString>>) -> Result<Self, String> {
         let mut options = Self {
             bind: "0.0.0.0:8787".into(),
             rootfs: DEFAULT_ROOTFS.into(),
@@ -85,11 +104,26 @@ impl Options {
             queue_capacity: DEFAULT_QUEUE_CAPACITY,
             profile_log_every: 1,
             fetch_loopback_port: None,
+            fetch_allow_hosts: Vec::new(),
+            fetch_allow_schemes: Vec::new(),
+            fetch_allow_ports: Vec::new(),
+            fetch_allow_loopback: false,
+            fetch_allow_private: false,
+            fetch_allow_metadata: false,
+            fetch_max_request_bytes: None,
+            fetch_max_response_bytes: None,
+            fetch_max_concurrent_requests: None,
+            fetch_timeout: None,
         };
-        let mut args = env::args().skip(1);
-        while let Some(arg) = args.next() {
+        let mut args = args.into_iter().map(|arg| {
+            arg.into()
+                .into_string()
+                .map_err(|_| "arguments must be valid UTF-8".to_string())
+        });
+        while let Some(arg) = args.next().transpose()? {
             let mut value = || {
                 args.next()
+                    .transpose()?
                     .ok_or_else(|| format!("missing value for {arg}"))
             };
             match arg.as_str() {
@@ -158,11 +192,55 @@ impl Options {
                     options.profile_log_every = usize_value(value()?, "--profile-log-every")?
                 }
                 "--fetch-loopback-port" => {
-                    options.fetch_loopback_port = Some(
-                        value()?
-                            .parse()
-                            .map_err(|_| "invalid --fetch-loopback-port".to_string())?,
-                    )
+                    options.fetch_loopback_port =
+                        Some(nonzero_u16(value()?, "--fetch-loopback-port")?)
+                }
+                "--fetch-allow-host" => options.fetch_allow_hosts.push(value()?),
+                "--fetch-allow-scheme" => {
+                    let scheme = value()?.to_ascii_lowercase();
+                    if !matches!(scheme.as_str(), "http" | "https") {
+                        return Err("--fetch-allow-scheme must be http or https".to_string());
+                    }
+                    if !options.fetch_allow_schemes.contains(&scheme) {
+                        options.fetch_allow_schemes.push(scheme);
+                    }
+                }
+                "--fetch-allow-port" => options
+                    .fetch_allow_ports
+                    .push(nonzero_u16(value()?, "--fetch-allow-port")?),
+                "--fetch-allow-loopback" => options.fetch_allow_loopback = true,
+                "--fetch-allow-private" => options.fetch_allow_private = true,
+                "--fetch-allow-metadata" => options.fetch_allow_metadata = true,
+                "--fetch-max-request-bytes" => {
+                    options.fetch_max_request_bytes = Some(bounded_usize(
+                        value()?,
+                        "--fetch-max-request-bytes",
+                        MAX_FETCH_REQUEST_BYTES,
+                    )?)
+                }
+                "--fetch-max-response-bytes" => {
+                    options.fetch_max_response_bytes = Some(bounded_usize(
+                        value()?,
+                        "--fetch-max-response-bytes",
+                        MAX_FETCH_RESPONSE_BYTES,
+                    )?)
+                }
+                "--fetch-max-concurrent-requests" => {
+                    options.fetch_max_concurrent_requests = Some(bounded_usize(
+                        value()?,
+                        "--fetch-max-concurrent-requests",
+                        MAX_FETCH_CONCURRENT_REQUESTS,
+                    )?)
+                }
+                "--fetch-timeout-ms" => {
+                    let timeout = duration(value()?, "--fetch-timeout-ms")?;
+                    if timeout > MAX_FETCH_TIMEOUT {
+                        return Err(format!(
+                            "--fetch-timeout-ms must not exceed {}",
+                            MAX_FETCH_TIMEOUT.as_millis()
+                        ));
+                    }
+                    options.fetch_timeout = Some(timeout);
                 }
                 "--help" | "-h" => {
                     return Err(format!(
@@ -177,7 +255,14 @@ impl Options {
                          [--diagnostic-no-refill-wave N] \
                          [--max-concurrent-sandboxes N] [--queue-capacity N] \
                          [--profile-log-every N]\n\
-                         [--fetch-loopback-port PORT]\n\
+                         [--fetch-loopback-port PORT | \
+                         --fetch-allow-host HOST --fetch-allow-scheme http|https \
+                         --fetch-allow-port PORT [--fetch-allow-loopback] \
+                         [--fetch-allow-private] [--fetch-allow-metadata]] \
+                         [--fetch-max-request-bytes BYTES] \
+                         [--fetch-max-response-bytes BYTES] \
+                         [--fetch-max-concurrent-requests N] \
+                         [--fetch-timeout-ms MS]\n\
                          defaults: --bind 0.0.0.0:8787 --rootfs {DEFAULT_ROOTFS} \
                          --executor {DEFAULT_EXECUTOR} --version demo-v1 \
                          --bundle {DEFAULT_BUNDLE} \
@@ -194,7 +279,9 @@ impl Options {
                          --queue-capacity {DEFAULT_QUEUE_CAPACITY} \
                          --profile-log-every 1\n\
                          Outbound fetch is denied by default. --fetch-loopback-port explicitly \
-                         allows HTTP fetches to localhost on exactly PORT for the demo.\n\
+                         allows HTTP fetches to localhost on exactly PORT for compatibility. \
+                         General policy requires at least one explicit host, scheme, and port; \
+                         loopback, private, and metadata addresses remain denied unless opted in.\n\
                          On-demand owners restore one fresh VM per request. Prewarmed owners restore \
                          before advertising readiness, execute at most one request, drop the VM, and \
                          replenish adaptively below explicit ready watermarks. The warm floor is \
@@ -221,6 +308,7 @@ impl Options {
                 ),
             ],
         )?;
+        validate_fetch_options(&options)?;
         Ok(options)
     }
 }
@@ -257,6 +345,193 @@ fn nonzero_usize(value: String, flag: &str) -> Result<usize, String> {
         return Err(format!("{flag} must be nonzero"));
     }
     Ok(value)
+}
+
+fn bounded_usize(value: String, flag: &str, maximum: usize) -> Result<usize, String> {
+    let value = nonzero_usize(value, flag)?;
+    if value > maximum {
+        return Err(format!("{flag} must not exceed {maximum}"));
+    }
+    Ok(value)
+}
+
+fn nonzero_u16(value: String, flag: &str) -> Result<u16, String> {
+    let value = value
+        .parse::<u16>()
+        .map_err(|_| format!("invalid {flag}"))?;
+    if value == 0 {
+        return Err(format!("{flag} must be nonzero"));
+    }
+    Ok(value)
+}
+
+fn has_general_fetch_policy(options: &Options) -> bool {
+    !options.fetch_allow_hosts.is_empty()
+        || !options.fetch_allow_schemes.is_empty()
+        || !options.fetch_allow_ports.is_empty()
+        || options.fetch_allow_loopback
+        || options.fetch_allow_private
+        || options.fetch_allow_metadata
+}
+
+fn has_fetch_limit_overrides(options: &Options) -> bool {
+    options.fetch_max_request_bytes.is_some()
+        || options.fetch_max_response_bytes.is_some()
+        || options.fetch_max_concurrent_requests.is_some()
+        || options.fetch_timeout.is_some()
+}
+
+fn validate_fetch_options(options: &Options) -> Result<(), String> {
+    let general = has_general_fetch_policy(options);
+    if options.fetch_loopback_port.is_some() && general {
+        return Err(
+            "--fetch-loopback-port cannot be combined with general fetch policy flags".to_string(),
+        );
+    }
+    if has_fetch_limit_overrides(options) && !general && options.fetch_loopback_port.is_none() {
+        return Err(
+            "fetch limit overrides require --fetch-loopback-port or a general policy with \
+             --fetch-allow-host, --fetch-allow-scheme, and --fetch-allow-port"
+                .to_string(),
+        );
+    }
+    if general
+        && (options.fetch_allow_hosts.is_empty()
+            || options.fetch_allow_schemes.is_empty()
+            || options.fetch_allow_ports.is_empty())
+    {
+        return Err(
+            "general fetch policy requires at least one --fetch-allow-host, \
+             --fetch-allow-scheme, and --fetch-allow-port"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn fetch_limits(options: &Options) -> FetchLimits {
+    let mut limits = FetchLimits::default();
+    if let Some(value) = options.fetch_max_request_bytes {
+        limits.max_request_bytes = value;
+    }
+    if let Some(value) = options.fetch_max_response_bytes {
+        limits.max_response_bytes = value;
+    }
+    if let Some(value) = options.fetch_max_concurrent_requests {
+        limits.max_concurrent_requests = value;
+    }
+    if let Some(value) = options.fetch_timeout {
+        limits.total_timeout = value;
+        limits.connect_timeout = limits.connect_timeout.min(value);
+    }
+    limits
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct FetchPolicySummary {
+    mode: &'static str,
+    hosts: Vec<String>,
+    schemes: Vec<String>,
+    ports: Vec<u16>,
+    allow_loopback: bool,
+    allow_private: bool,
+    allow_metadata: bool,
+    max_request_bytes: usize,
+    max_response_bytes: usize,
+    max_concurrent_requests: usize,
+    timeout: Duration,
+}
+
+fn build_fetch_broker(options: &Options) -> Result<(FetchBroker, FetchPolicySummary), String> {
+    if let Some(port) = options.fetch_loopback_port {
+        let limits = fetch_limits(options);
+        let broker = FetchBroker::new(FetchBrokerConfig {
+            policy: FetchPolicy::new(
+                NetworkPolicy::AllowList(
+                    AllowList::from_hosts(&["localhost"]).map_err(|error| error.to_string())?,
+                ),
+                ["http"],
+                [port],
+            )
+            .allow_loopback(true),
+            limits: limits.clone(),
+        })
+        .map_err(|error| error.to_string())?;
+        return Ok((
+            broker,
+            FetchPolicySummary {
+                mode: "loopback-shorthand",
+                hosts: vec!["localhost".to_string()],
+                schemes: vec!["http".to_string()],
+                ports: vec![port],
+                allow_loopback: true,
+                allow_private: false,
+                allow_metadata: false,
+                max_request_bytes: limits.max_request_bytes,
+                max_response_bytes: limits.max_response_bytes,
+                max_concurrent_requests: limits.max_concurrent_requests,
+                timeout: limits.total_timeout,
+            },
+        ));
+    }
+    if !has_general_fetch_policy(options) {
+        let limits = FetchLimits::default();
+        return Ok((
+            FetchBroker::denied(),
+            FetchPolicySummary {
+                mode: "deny-all",
+                hosts: Vec::new(),
+                schemes: Vec::new(),
+                ports: Vec::new(),
+                allow_loopback: false,
+                allow_private: false,
+                allow_metadata: false,
+                max_request_bytes: limits.max_request_bytes,
+                max_response_bytes: limits.max_response_bytes,
+                max_concurrent_requests: limits.max_concurrent_requests,
+                timeout: limits.total_timeout,
+            },
+        ));
+    }
+
+    let mut hosts = options.fetch_allow_hosts.clone();
+    hosts.sort();
+    hosts.dedup();
+    let mut schemes = options.fetch_allow_schemes.clone();
+    schemes.sort();
+    let mut ports = options.fetch_allow_ports.clone();
+    ports.sort_unstable();
+    ports.dedup();
+    let limits = fetch_limits(options);
+    let policy = FetchPolicy::new(
+        NetworkPolicy::AllowList(AllowList::from_hosts(&hosts).map_err(|error| error.to_string())?),
+        schemes.clone(),
+        ports.clone(),
+    )
+    .allow_loopback(options.fetch_allow_loopback)
+    .allow_private(options.fetch_allow_private)
+    .allow_metadata(options.fetch_allow_metadata);
+    let broker = FetchBroker::new(FetchBrokerConfig {
+        policy,
+        limits: limits.clone(),
+    })
+    .map_err(|error| error.to_string())?;
+    Ok((
+        broker,
+        FetchPolicySummary {
+            mode: "explicit",
+            hosts,
+            schemes,
+            ports,
+            allow_loopback: options.fetch_allow_loopback,
+            allow_private: options.fetch_allow_private,
+            allow_metadata: options.fetch_allow_metadata,
+            max_request_bytes: limits.max_request_bytes,
+            max_response_bytes: limits.max_response_bytes,
+            max_concurrent_requests: limits.max_concurrent_requests,
+            timeout: limits.total_timeout,
+        },
+    ))
 }
 
 fn usize_value(value: String, flag: &str) -> Result<usize, String> {
@@ -300,19 +575,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let bundle_sha256 = bundle.sha256()?;
     let version = bundle.worker_version.clone();
-    let fetch_broker = if let Some(port) = options.fetch_loopback_port {
-        FetchBroker::new(FetchBrokerConfig {
-            policy: FetchPolicy::new(
-                NetworkPolicy::AllowList(AllowList::from_hosts(&["localhost"])?),
-                ["http"],
-                [port],
-            )
-            .allow_loopback(true),
-            limits: FetchLimits::default(),
-        })?
-    } else {
-        FetchBroker::denied()
-    };
+    let (fetch_broker, fetch_policy) =
+        build_fetch_broker(&options).map_err(|error| format!("fetch policy: {error}"))?;
     let worker = WorkerVersionSandbox::initialize_with_fetch(
         bundle,
         &options.rootfs,
@@ -395,6 +659,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         prewarm_policy.map_or(0, |policy| policy.ready_high_watermark),
         prewarm_policy.map_or(0, |policy| policy.max_replenish_batch),
         options.queue_capacity
+    );
+    eprintln!(
+        "outbound fetch policy: {} hosts={:?} schemes={:?} ports={:?} \
+         loopback={} private={} metadata={} request_bytes<={} response_bytes<={} \
+         concurrent<={} timeout_ms={}",
+        fetch_policy.mode,
+        fetch_policy.hosts,
+        fetch_policy.schemes,
+        fetch_policy.ports,
+        fetch_policy.allow_loopback,
+        fetch_policy.allow_private,
+        fetch_policy.allow_metadata,
+        fetch_policy.max_request_bytes,
+        fetch_policy.max_response_bytes,
+        fetch_policy.max_concurrent_requests,
+        fetch_policy.timeout.as_millis(),
     );
     let sequence = AtomicU64::new(1);
     let profile_sequence = AtomicU64::new(1);
@@ -746,6 +1026,10 @@ fn reason(status: u16) -> &'static str {
 mod tests {
     use super::*;
 
+    fn options(args: &[&str]) -> Result<Options, String> {
+        Options::parse_from(args.iter().copied())
+    }
+
     #[test]
     fn restore_mode_switch_accepts_only_documented_values() {
         assert_eq!(parse_restore_mode("on-demand"), Ok(RestoreMode::OnDemand));
@@ -827,5 +1111,157 @@ mod tests {
             submit_error_message(PoolSubmitError::ShuttingDown),
             "Worker request pool is shutting down"
         );
+    }
+
+    #[test]
+    fn fetch_policy_defaults_to_deny_all() {
+        let options = options(&[]).unwrap();
+        let (_, summary) = build_fetch_broker(&options).unwrap();
+        assert_eq!(summary.mode, "deny-all");
+        assert!(summary.hosts.is_empty());
+        assert!(!summary.allow_loopback);
+    }
+
+    #[test]
+    fn fetch_loopback_shorthand_is_compatible_and_exclusive() {
+        let parsed = options(&[
+            "--fetch-loopback-port",
+            "18080",
+            "--fetch-max-concurrent-requests",
+            "2",
+        ])
+        .unwrap();
+        let (_, summary) = build_fetch_broker(&parsed).unwrap();
+        assert_eq!(summary.mode, "loopback-shorthand");
+        assert_eq!(summary.hosts, ["localhost"]);
+        assert_eq!(summary.schemes, ["http"]);
+        assert_eq!(summary.ports, [18080]);
+        assert!(summary.allow_loopback);
+        assert_eq!(summary.max_concurrent_requests, 2);
+
+        let error = options(&[
+            "--fetch-loopback-port",
+            "18080",
+            "--fetch-allow-host",
+            "localhost",
+            "--fetch-allow-scheme",
+            "http",
+            "--fetch-allow-port",
+            "18080",
+        ])
+        .err()
+        .unwrap();
+        assert!(error.contains("cannot be combined"));
+    }
+
+    #[test]
+    fn fetch_general_policy_accepts_multiple_values_limits_and_opt_ins() {
+        let options = options(&[
+            "--fetch-allow-host",
+            "localhost",
+            "--fetch-allow-host",
+            "127.0.0.1",
+            "--fetch-allow-scheme",
+            "HTTP",
+            "--fetch-allow-scheme",
+            "http",
+            "--fetch-allow-port",
+            "18080",
+            "--fetch-allow-port",
+            "18081",
+            "--fetch-allow-loopback",
+            "--fetch-allow-private",
+            "--fetch-allow-metadata",
+            "--fetch-max-request-bytes",
+            "4096",
+            "--fetch-max-response-bytes",
+            "8192",
+            "--fetch-max-concurrent-requests",
+            "2",
+            "--fetch-timeout-ms",
+            "1500",
+        ])
+        .unwrap();
+        let (_, summary) = build_fetch_broker(&options).unwrap();
+        assert_eq!(summary.mode, "explicit");
+        assert_eq!(summary.schemes, ["http"]);
+        assert_eq!(summary.ports, [18080, 18081]);
+        assert!(summary.allow_loopback);
+        assert!(summary.allow_private);
+        assert!(summary.allow_metadata);
+        assert_eq!(summary.max_request_bytes, 4096);
+        assert_eq!(summary.max_response_bytes, 8192);
+        assert_eq!(summary.max_concurrent_requests, 2);
+        assert_eq!(summary.timeout, Duration::from_millis(1500));
+    }
+
+    #[test]
+    fn fetch_general_policy_rejects_incomplete_and_invalid_values() {
+        for args in [
+            vec!["--fetch-allow-host", "localhost"],
+            vec!["--fetch-allow-scheme", "http"],
+            vec!["--fetch-allow-port", "18080"],
+            vec!["--fetch-allow-loopback"],
+        ] {
+            assert!(
+                options(&args)
+                    .err()
+                    .unwrap()
+                    .contains("requires at least one")
+            );
+        }
+        assert!(
+            options(&["--fetch-allow-scheme", "ftp"])
+                .err()
+                .unwrap()
+                .contains("http or https")
+        );
+        assert!(
+            options(&["--fetch-allow-port", "0"])
+                .err()
+                .unwrap()
+                .contains("must be nonzero")
+        );
+        assert!(
+            options(&["--fetch-loopback-port", "70000"])
+                .err()
+                .unwrap()
+                .contains("invalid")
+        );
+        assert!(
+            options(&[
+                "--fetch-allow-host",
+                "localhost",
+                "--fetch-allow-scheme",
+                "http",
+                "--fetch-allow-port",
+                "18080",
+                "--fetch-max-concurrent-requests",
+                "65",
+            ])
+            .err()
+            .unwrap()
+            .contains("must not exceed")
+        );
+        assert!(
+            options(&["--fetch-timeout-ms", "1000"])
+                .err()
+                .unwrap()
+                .contains("require --fetch-loopback-port")
+        );
+    }
+
+    #[test]
+    fn fetch_general_policy_rejects_malformed_hosts_through_allow_list() {
+        let options = options(&[
+            "--fetch-allow-host",
+            "http://localhost",
+            "--fetch-allow-scheme",
+            "http",
+            "--fetch-allow-port",
+            "18080",
+        ])
+        .unwrap();
+        assert!(build_fetch_broker(&options).is_err());
     }
 }
