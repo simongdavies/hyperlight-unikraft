@@ -1,0 +1,207 @@
+{
+  "schema_version": 1,
+  "status": "qualified_and_locally_validated_with_preserved_repository_failures",
+  "source": {
+    "signed_workerd_commit": "1d7a127908d4aca098bdad2e0caf904b9f1ffe82",
+    "executor_rootfs_sha256": "cbc6ac02d041d552e871a58c99a7c62e09969d6b8e53540692d7b03b89892bd3",
+    "source_manifest_sha256": "4f2a3cba603e4f3a84747151380e6437f7f1d4aa761abf2f6277958d2e798029",
+    "source_manifest_file_count": 42,
+    "tracked_diff_sha256": "86bb53721d00a739ff4cf1303ae3666bfa1b0814410e620851ea3c8f7693f658",
+    "combined_provenance_sha256": "a38a617d38a57e05c3a5959c346ebe9c7dff3025df62562dc8e051583dbcecd9"
+  },
+  "workerd_capability_results": {
+    "storage_vfs": {
+      "passed": 18,
+      "total": 18,
+      "result_sha256": "67350ac547973f671bb8c51b5b085a2894b5c3fdacb71b281d89ebe40b818a3e"
+    },
+    "packaged_workloads": {
+      "passed": 25,
+      "total": 25,
+      "result_sha256": "5406c1b30a80234e7b02b1eb0898b2129cc0e38ec6a623224b2252aeedf00447"
+    }
+  },
+  "node_qualification": {
+    "discovered": 522,
+    "selected": 518,
+    "initial": {
+      "passed": 498,
+      "failed": 20,
+      "skipped": 0,
+      "duration_seconds": 293.700305743,
+      "bep_sha256": "5f54d35a1654a8d9551013a8d4510f57501e258dd6b538629a4235d29e14993a"
+    },
+    "exact_uncached_retries": {
+      "passed": 20,
+      "failed": 0,
+      "duration_seconds": 75.724202257,
+      "bep_sha256": "7023fd459306f8c6c970a9fd2aa2c887c5a035a56dda2d3ed1ab8e492df44bbc"
+    },
+    "effective": {
+      "passed": 518,
+      "failed": 0,
+      "skipped": 0,
+      "duration_seconds": 369.424508
+    },
+    "excluded_external_network_targets": [
+      "//src/workerd/api/node/tests:http-nodejs-test@",
+      "//src/workerd/api/node/tests:http-nodejs-test@all-autogates",
+      "//src/workerd/api/node/tests:http-nodejs-test@all-compat-flags",
+      "//src/workerd/api/node/tests:http-nodejs-test@gc-stress"
+    ],
+    "exclusion_reason": "Each runtime variant contacts external cloudflare.com:80.",
+    "target_manifest_sha256": "b56ad9f67893d85595a80b17a8dd1668fed94d0bbdc120ddf2fb68f87539d961",
+    "result_sha256": "6248ee6d5b4b78391a89d0ba4bb010d1260c3e6dd45abddfdefa2b00e7bb0a01",
+    "sha256sums_sha256": "c97c7177897a47a6317c4e05d2414d6c29995a0095f818dc2d6a5ed55cbd6c8b"
+  },
+  "repository_non_node_qualification": {
+    "selected": 2138,
+    "executed": 2128,
+    "passed": 2044,
+    "failed": 94,
+    "skipped": 0,
+    "not_executed": 10,
+    "retried": 94,
+    "retry_passed": 0,
+    "retry_failed": 94,
+    "duration_seconds": {
+      "initial": 5301.316543806,
+      "retry": 3622.221737482,
+      "total": 8923.538281288
+    },
+    "completion_marker_utc": "2026-10-02T21:47:33Z",
+    "target_manifest_sha256": "d0462aec31abdfe4a2ab5598e0aa3db01f5354cbdef7170494a294f37d48cedd",
+    "initial_bep_sha256": "1838cb48edf173ba7974e8423c9358768cad6027c06c1bd3eeb796e1267bd162",
+    "retry_bep_sha256": "7ca89ac012bc4d5dbfe613743cb4d349fea009d2cdee19fada733c9552b769c4",
+    "result_sha256": "2e8536306a807b319ee8003ca1da183f781933028819399ae6442a4c984d5357",
+    "sha256sums_sha256": "ae32d3c03115d33f7cd7fa5f658affd9682046ec5e3bedf2bbd3c87af7e7f992",
+    "classification": {
+      "source_regressions": {
+        "total": 80,
+        "streams_conformance_oracle": 42,
+        "byob_pending_read": 8,
+        "byob_tee_invalidation_or_error_type": 4,
+        "gc_stress_runtime_or_assertion": 10,
+        "encoding_wpt": 6,
+        "cpp_compile": 6,
+        "other_deterministic_runtime_or_oracle": 3,
+        "eslint": 1
+      },
+      "bounded_timeouts": {
+        "total": 9,
+        "wpt_1800_seconds": 5,
+        "container_client_3600_seconds": 4
+      },
+      "selection_query_artifacts": 4,
+      "external_container_dependency": 1,
+      "environment_tooling_or_setup": 0,
+      "classification_json_sha256": "0f76a3561a37d18cf6f0694ec0142b8072ca8daf780f6350e518e678f607f262",
+      "classification_csv_sha256": "e9c00a8acf64a5a315866261b463cbc482145788d7701107dee5ea0dc7e919ff"
+    },
+    "scope_boundary": {
+      "failures_belonging_directly_to_four_approved_commits": 0,
+      "remediation_plan_sha256": "476982376c33e2943009f37f6009dcaf58fbb873e86b940cbcd76b3279b0ebd1"
+    }
+  },
+  "evidence_archive": {
+    "file_name": "workerd-qualification-cbc6ac-evidence.tar.gz",
+    "size_bytes": 5779921,
+    "sha256": "89965d622c9b6cfd8fe410a25b0192032d8c509ad75863a9a54edff60551ebcb",
+    "payload_files": 134,
+    "payload_files_verified": 134,
+    "verification_errors": 0,
+    "archive_file_entries": 139,
+    "allowlist_roots": 23,
+    "allowlist_violations": 0,
+    "payload_sha256sums_sha256": "bd23fa08d7084b9313230c6deae054d8983bbb4a08efc485026c307a58a3718c",
+    "allowlist_sha256": "354f557608367ff88948c6dcdbad88471642095b5d0e534a5e5796621ab124b1"
+  },
+  "azure_cleanup": {
+    "resource_group": "workerd-node-522-20261002-cf07-rg",
+    "deletion_submitted_utc": "2026-10-02T21:58:22Z",
+    "group_absent_utc": "2026-10-02T22:02:37Z",
+    "group_exists": false,
+    "tagged_groups": [],
+    "tagged_resources": [],
+    "matching_groups": [],
+    "matching_resources": [],
+    "cleanup_proof_sha256": "1d4c31f721c4064940abf9886bf14bdce4de719bec532eaf1dfb711c1b8231ef"
+  },
+  "hyperlight_validation": {
+    "passed": [
+      "just guests",
+      "just fmt-apply",
+      "just build",
+      "just clippy",
+      "Ubuntu-24.04 WSL just clippyw",
+      "complete just test",
+      "focused Rust and runner tests",
+      "git diff --check"
+    ],
+    "latest_standard_full_test": {
+      "library": {
+        "passed": 137,
+        "failed": 0
+      },
+      "cli_unit": {
+        "passed": 18,
+        "failed": 0
+      },
+      "agent": {
+        "passed": 8,
+        "failed": 0
+      },
+      "bash": {
+        "passed": 9,
+        "failed": 0
+      },
+      "cli_integration": {
+        "passed": 3,
+        "failed": 0
+      },
+      "compiled_language_integration": {
+        "passed": 18,
+        "failed": 0
+      },
+      "dotnet_jit": {
+        "passed": 13,
+        "failed": 1,
+        "failure": "dotnet_jit_http_get"
+      }
+    },
+    "full_test_status": "passed",
+    "full_test_failure": null,
+    "full_test_log": {
+      "file_name": "post-guests-standard-full-2-20261003-011335.log",
+      "size_bytes": 22647,
+      "sha256": "a3849220836664f22b056a555442991e51538c92bcb03190abed11fa9b5120e1"
+    },
+    "source_change_attributed": false,
+    "latest_attempt_oom_test_passed": true,
+    "latest_attempt_http_test_passed": true,
+    "stale_guest_fixture_rebuilt": true,
+    "prior_external_flake": "Earlier attempts reproduced the unchanged external dotnet_jit_http_get timeout on pristine and current source; the final standard run passed without source changes."
+  },
+  "safety": {
+    "commit_created": false,
+    "pushed": false,
+    "qemu_invoked": false,
+    "wsl_lifecycle_action": false
+  },
+  "remaining_gates": {
+    "signed_commits": {
+      "state": "blocked_only_on_fresh_just_in_time_yubikey_confirmation",
+      "staging_and_review_eta_minutes": "15-25",
+      "interactive_signing_eta_minutes_per_commit": "2-5"
+    },
+    "exact_workerd_pin": {
+      "state": "workerd_signed_at_1d7a127908d4aca098bdad2e0caf904b9f1ffe82_awaiting_final_signed_hyperlight_commit",
+      "eta_minutes_after_signed_commits": "30-60"
+    },
+    "final_384_mib_scaling_and_profiling_campaign": {
+      "state": "blocked_on_signed_revisions_and_push_direction",
+      "campaign_eta_hours": "4-8",
+      "evidence_sealing_and_cleanup_eta_minutes": "30-60"
+    }
+  }
+}

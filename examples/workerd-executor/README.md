@@ -4,14 +4,20 @@ This harness packages a **trusted external workerd-fork executor** or a tiny
 native mock, not stock workerd. Static executors use the dedicated v0.14
 direct-initrd elfloader; dynamic executors retain the general CPIO/VFS kernel.
 Both use the existing 64 KiB transport and Hyperlight 0.17 without feature changes.
-It grants neither hostfs nor hostsock. The committed general-purpose kernel
-contains those drivers, but the wrapper supplies no mounts/network policy
-and registers no `fs_*` or `net_*` host functions.
+It grants neither hostfs nor hostsock by default. The committed
+general-purpose kernel contains those drivers, but the wrapper registers no
+`fs_*` or `net_*` host functions unless the Rust host supplies an explicit
+storage or network policy.
 
 For a complete clean-VM Azure KVM walkthrough, including executor packaging,
 WinterTC capability routes, isolation/timeout checks, `hey` load, adaptive
 prewarm diagnostics, profiling, and cost cleanup, see
 [`docs/azure-workerd-hyperlight-runbook.md`](../../docs/azure-workerd-hyperlight-runbook.md).
+Pinned package tarballs and deterministic assertions for the representative
+Node compatibility workloads are recorded in
+[`workerd-node-workload-pins.json`](workerd-node-workload-pins.json) and
+[`workerd-node-workload-acceptance.json`](workerd-node-workload-acceptance.json).
+These manifests define acceptance; they do not claim the workloads passed.
 
 ## Build
 
@@ -158,10 +164,14 @@ Use `drivers/hl_driver.h` and `drivers/hl_fc.h`, as the fixture does. Open
 size-prefixed Hyperlight FunctionCall FlatBuffers. Returning to the next read
 completes the call; write an `int32_t` nonzero status to fail it.
 
-* `init(bundle_json)` loads exactly one Worker version from canonical protocol
-  1 JSON. Startup before this call is trusted and must not execute tenant code.
-  The wrapper snapshots only after successful init; the initialized driver
-  remains alive. The source bundle is never sent again.
+* `init(init_json)` loads exactly one Worker version. Without named storage,
+  the argument is canonical `WorkerBundle` JSON with `protocol_version: 1`.
+  With named storage, it is canonical `ExecutorInit` JSON with
+  `protocol_version: 2` and a required sorted `storage` array containing only
+  logical `name` and `mode` values. Startup before this call is trusted and
+  must not execute tenant code. The wrapper snapshots only after successful
+  init; the initialized driver remains alive. The source bundle is never sent
+  again.
 * `fetch(request_json)` carries protocol 1, `request_id`, `method`, `url`,
   ordered `headers` (`name`, `value`), and `body_base64`.
 * During fetch, stdout is **protocol-only**: exactly one JSON response followed
@@ -177,7 +187,7 @@ completes the call; write an `int32_t` nonzero status to fail it.
 {"protocol_version":1,"request_id":"r-1","status":200,"headers":[],"body_base64":"b2s="}
 ```
 
-The init bundle has exact top-level field order
+The `WorkerBundle` JSON object has exact top-level field order
 `protocol_version`, `worker_version`, `compatibility_date`,
 `compatibility_flags`, `main_module`, `modules`. Module field order is
 `name`, `type`, `source`:
@@ -186,13 +196,22 @@ The init bundle has exact top-level field order
 {"protocol_version":1,"worker_version":"hello-v1","compatibility_date":"2025-01-01","compatibility_flags":[],"main_module":"worker.js","modules":[{"name":"worker.js","type":"esModule","source":"export default { fetch() { return new Response('ok') } }"}]}
 ```
 
+The `ExecutorInit` JSON object has the same fields in the same order, followed
+by `storage`. Each storage entry has exact field order `name`, `mode`; entries
+are sorted by `name`, and `mode` is exactly `ro` or `rw`:
+
+```json
+{"protocol_version":2,"worker_version":"hello-v1","compatibility_date":"2025-01-01","compatibility_flags":[],"main_module":"worker.js","modules":[{"name":"worker.js","type":"esModule","source":"export default { fetch() { return new Response('ok') } }"}],"storage":[{"name":"readonly","mode":"ro"},{"name":"scratch","mode":"rw"}]}
+```
+
 The host parses trusted JSON, rejects unknown/duplicate/invalid values, sorts
 flags, places the main ES module first, sorts remaining modules by name, and
-serializes compact canonical JSON. Types are exactly `esModule`, `text`, and
-`json`. There are at most 32 flags and 32 modules; each module is at most
-32 KiB and aggregate decoded source is at most 48 KiB. Module names are safe
-relative import paths. The final escaped JSON and Hyperlight FlatBuffer remain
-within the unchanged 64 KiB transport (60 KiB JSON limit).
+serializes compact canonical JSON. Types are exactly `esModule`,
+`commonJsModule`, `text`, and `json`; the main module remains an ES module.
+There are at most 32 flags and 32 modules; each module is at most 32 KiB and
+aggregate decoded source is at most 48 KiB. Module names are safe relative
+import paths. The final escaped JSON and Hyperlight FlatBuffer remain within
+the unchanged 64 KiB transport (60 KiB JSON limit).
 
 This replaces the old callback-pointer and JSON `/dev/hcall` ABI, which the
 v0.14 kernel does not provide. `HostPrint` transports stdout in chunks; there
@@ -289,6 +308,78 @@ is EOF, each exactly one byte. Tag `1` is followed by response bytes, with the
 complete ordered-header JSON block preceding body bytes. Reading EOF collects
 a successful handle. Cancel aborts DNS, connect, upload, or download work and
 request-VM teardown cancels every remaining operation.
+
+### Named storage policy
+
+Workerd storage is denied by default: no mounts means no `fs_*` host
+functions. The demo accepts repeatable `--storage-ro NAME=HOST_DIR` and
+`--storage-rw NAME=HOST_DIR` options. The Rust host canonicalizes each
+directory before VM construction, validates the logical name, and mounts it
+only at `/mnt/workerd-storage/NAME`. Worker input never supplies a host path.
+Duplicate names, nonexistent/non-directory host paths, malformed names, and
+limits for unknown bindings fail launch. Policies contain at most eight
+bindings; names are lowercase ASCII letters, digits, and `-`, start with a
+letter, and are at most 32 bytes.
+
+Each binding has per-sandbox host-side budgets. Defaults are 128 operations,
+1 MiB read, and 64 KiB write; repeatable
+`--storage-max-operations NAME=N`, `--storage-max-read-bytes NAME=N`, and
+`--storage-max-write-bytes NAME=N` options override them within launcher
+caps. Valid-mount calls consume one operation before filesystem access.
+Successful reads charge bytes actually returned. Writes reserve and charge
+the submitted payload before I/O, including a payload whose underlying I/O
+later fails. Extending a file with `truncate` charges the requested growth;
+shrinking it charges no write bytes. A denied read-only mutation returns
+`EROFS` before quota accounting. Exhaustion returns stable Linux `EDQUOT`.
+Counters are independent per mount and are recreated for every fresh or
+snapshot-restored VM, so every one-request owner begins with the same full
+budget.
+
+`cap_std::fs::Dir` confines every host operation beneath the canonical opened
+directory. The policy does not claim race-free aggregate storage, maximum file
+size, or file-count quotas: the stateless `fs_*` host functions can enforce
+operation and transferred-byte budgets, but concurrent external changes and metadata-only
+operations prevent authoritative capacity accounting. `CHUNK=32768` remains
+only the per-call transfer bound.
+
+The pinned Workerd fork implements a substantial Node compatibility surface
+on V8 when `nodejs_compat` and the required feature flags are enabled; it does
+not embed the Node.js runtime. Its Worker-visible `node:fs` API exposes the
+in-memory Workerd VFS (`/bundle`, `/tmp`, `/dev`). Many npm packages can use
+that compatibility surface, but general Node process/OS, native-addon,
+child-process, and host-filesystem parity is not implied.
+
+Hyperlight hostfs is a different guest-kernel facility. A real Worker can see
+named host-backed storage only when the external `workerd-sandbox-executor`
+attaches `/mnt/workerd-storage/NAME` into Workerd's VFS. The `init` guest call
+receives an `ExecutorInit` JSON object with `protocol_version: 2`; it carries
+only sorted `{name,mode}` entries, never host paths. The executor maps each
+validated guest directory to `/storage/NAME`. The native fixture
+exercises the guest mount and quota boundary directly; final real-Hyperlight
+storage/VFS evidence passes the complete 18/18 suite.
+
+The `ExecutorInit` object is Workerd-specific serialization for bundle, module,
+and named-storage initialization. Per-operation storage access instead invokes
+the registered Hyperlight host functions `fs_stat`, `fs_read_bytes`,
+`fs_write_bytes`, and the other `fs_*` functions; those guest-to-host function
+calls are not `ExecutorInit` fields or messages.
+
+Persistent KV/SQL is not implemented by this mount policy. A future broker
+should keep logical authorization, credentials, connection pools,
+transactions, and quotas in the trusted Rust host. SQLite databases and WALs
+belong on durable host storage, one host-owned database per namespace;
+MySQL/PostgreSQL remain external services reachable only by the broker. Never
+mount a live database into disposable request VMs or enable direct Worker
+database connections by default.
+
+Today the fetch, timer, and hostfs brokers are in-process Rust objects and
+registered host-call closures in the trusted `workerd-demo` process, not
+separate daemons. Immutable policy and process-level backend/concurrency state
+may be shared; each restored one-request VM receives fresh fetch/timer sessions
+and hostfs quota counters that are dropped with that VM. Prewarmed owners
+create them during background restore, while on-demand owners create them
+during request restore. A future database broker should follow the same
+process-level backend plus per-sandbox capability-session model.
 
 ### Monotonic timer channel v1
 

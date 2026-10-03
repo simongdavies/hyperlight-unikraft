@@ -1,0 +1,102 @@
+{
+  "schema_version": 1,
+  "execution_boundary": "packaged workerd-sandbox-executor inside a real one-request Hyperlight-Unikraft VM",
+  "global_requirements": {
+    "compatibility_date": "2025-12-31",
+    "compatibility_flags": [
+      "enable_nodejs_fs_module",
+      "nodejs_compat"
+    ],
+    "fresh_vm_per_request": true,
+    "raw_network_access": false,
+    "record": [
+      "hyperlight_revision",
+      "workerd_revision",
+      "executor_sha256",
+      "bundle_sha256",
+      "package_manifest_sha256",
+      "command",
+      "exit_status",
+      "response",
+      "wall_clock_ms",
+      "peak_memory_bytes"
+    ]
+  },
+  "workloads": [
+    {
+      "id": "graceful-fs",
+      "packages": [
+        "graceful-fs@4.2.11"
+      ],
+      "assertions": [
+        "read packaged files from /bundle",
+        "create, write, read, stat, rename, copy, and delete files in /tmp",
+        "writing /bundle fails with a read-only filesystem error",
+        "a second request cannot observe the first request's /tmp files",
+        "all file contents and metadata match expected values"
+      ]
+    },
+    {
+      "id": "zip",
+      "packages": [
+        "yazl@3.3.1",
+        "buffer-crc32@1.0.0"
+      ],
+      "assertions": [
+        "add deterministic /bundle inputs to a streamed ZIP archive",
+        "write streamed output to /tmp/output.zip",
+        "read the archive as binary data",
+        "validate entry names, bytes, CRC values, and archive structure outside the VM",
+        "response SHA-256 equals the /tmp archive SHA-256"
+      ]
+    },
+    {
+      "id": "streams-zlib-crypto",
+      "packages": [],
+      "assertions": [
+        "stream deterministic input through gzip with bounded chunks",
+        "observe backpressure rather than buffering the complete input eagerly",
+        "decompress to the exact original bytes",
+        "compute the expected SHA-256 before and after the round trip",
+        "record compressed and uncompressed byte counts"
+      ]
+    },
+    {
+      "id": "commonjs-esm",
+      "packages": [
+        "semver@7.7.3",
+        "uuid@9.0.1"
+      ],
+      "assertions": [
+        "load one package through CommonJS",
+        "load one package through ESM",
+        "validate a deterministic semver range result",
+        "parse and validate a fixed UUID value",
+        "do not use random UUID output as the correctness oracle"
+      ]
+    },
+    {
+      "id": "node-http-tls",
+      "packages": [],
+      "network_policy": {
+        "deny_by_default": true,
+        "allowed_destinations": "only the deterministic test upstream",
+        "automatic_redirects": false,
+        "raw_tcp_or_udp_grant": false,
+        "record_limits": [
+          "request_bytes",
+          "response_bytes",
+          "concurrency",
+          "timeout"
+        ]
+      },
+      "assertions": [
+        "allowed HTTP request succeeds through the explicit host policy",
+        "allowed TLS request validates the intended test certificate policy",
+        "unlisted host or port is denied",
+        "redirect to an unlisted destination is denied",
+        "timeout and response-size limits fail with the documented error"
+      ]
+    }
+  ]
+}
