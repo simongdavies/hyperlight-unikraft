@@ -3,9 +3,86 @@
 
 #define _GNU_SOURCE
 #include "hl_driver.h"
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 static int initialized;
 static unsigned int fetch_count;
+
+static const char *storage_check(const char *request_json)
+{
+	if (strstr(request_json, "/storage-allowed-read\"")) {
+		char buf[32] = { 0 };
+		int fd = open("/mnt/workerd-storage/readonly/message.txt", O_RDONLY);
+		ssize_t n = fd < 0 ? -1 : read(fd, buf, sizeof(buf));
+		if (fd >= 0)
+			close(fd);
+		return n == 16 && !memcmp(buf, "fixture-read-ok\n", 16) ?
+			"eyJvdXRjb21lIjoiYWxsb3dlZC1yZWFkIn0=" : NULL;
+	}
+	if (strstr(request_json, "/storage-ro-write-denied\"")) {
+		errno = 0;
+		int fd = open("/mnt/workerd-storage/readonly/denied.txt",
+			      O_WRONLY | O_CREAT, 0600);
+		if (fd >= 0)
+			close(fd);
+		return fd < 0 && errno == EROFS ?
+			"eyJvdXRjb21lIjoicm8td3JpdGUtZGVuaWVkIn0=" : NULL;
+	}
+	if (strstr(request_json, "/storage-rw-write\"")) {
+		static const char payload[] = "rw-ok";
+		char buf[sizeof(payload)] = { 0 };
+		int fd = open("/mnt/workerd-storage/scratch/allowed.txt",
+			      O_RDWR | O_CREAT | O_TRUNC, 0600);
+		if (fd < 0)
+			return NULL;
+		ssize_t written = write(fd, payload, sizeof(payload) - 1);
+		if (lseek(fd, 0, SEEK_SET) < 0) {
+			close(fd);
+			return NULL;
+		}
+		ssize_t read_len = read(fd, buf, sizeof(buf));
+		close(fd);
+		return written == (ssize_t)(sizeof(payload) - 1) &&
+			       read_len == written && !memcmp(buf, payload, written) ?
+			"eyJvdXRjb21lIjoicnctd3JpdGUifQ==" : NULL;
+	}
+	if (strstr(request_json, "/storage-traversal-denied\"")) {
+		errno = 0;
+		int fd = open("/mnt/workerd-storage/readonly/escape/secret.txt",
+			      O_RDONLY);
+		if (fd >= 0)
+			close(fd);
+		return fd < 0 ?
+			"eyJvdXRjb21lIjoidHJhdmVyc2FsLWRlbmllZCJ9" : NULL;
+	}
+	if (strstr(request_json, "/storage-unlisted-denied\"")) {
+		errno = 0;
+		int fd = open("/mnt/workerd-storage/unlisted/secret.txt", O_RDONLY);
+		if (fd >= 0)
+			close(fd);
+		return fd < 0 && errno == ENOENT ?
+			"eyJvdXRjb21lIjoidW5saXN0ZWQtZGVuaWVkIn0=" : NULL;
+	}
+	if (strstr(request_json, "/storage-quota-denied\"")) {
+		char payload[16];
+		memset(payload, 'q', sizeof(payload));
+		int fd = open("/mnt/workerd-storage/scratch/quota.txt",
+			      O_WRONLY | O_CREAT | O_TRUNC, 0600);
+		if (fd < 0)
+			return NULL;
+		ssize_t first = write(fd, payload, sizeof(payload));
+		errno = 0;
+		ssize_t second = write(fd, "x", 1);
+		int saved_errno = errno;
+		close(fd);
+		return first == (ssize_t)sizeof(payload) && second < 0 &&
+			       saved_errno == EDQUOT ?
+			"eyJvdXRjb21lIjoicXVvdGEtZGVuaWVkIn0=" : NULL;
+	}
+	return "";
+}
 
 static int timer_check(int cancel_after_deadline)
 {
@@ -214,7 +291,8 @@ static int dispatch(const uint8_t *fc, size_t fc_len)
 		return -1;
 	if (fc_name_is(fc, fc_len, "init")) {
 		if (len > 60 * 1024 ||
-		    !strstr(arg, "\"protocol_version\":1") ||
+		    (!strstr(arg, "\"protocol_version\":1") &&
+		     !strstr(arg, "\"protocol_version\":2")) ||
 		    !strstr(arg, "\"worker_version\":") ||
 		    !strstr(arg, "\"main_module\":") ||
 		    !strstr(arg, "\"modules\":"))
@@ -256,6 +334,11 @@ static int dispatch(const uint8_t *fc, size_t fc_len)
 	int broker_post = strstr(json, "/broker-post\"") != NULL;
 	int timer = strstr(json, "/timer\"") != NULL;
 	int timer_cancel = strstr(json, "/timer-cancel\"") != NULL;
+	const char *storage = storage_check(json);
+	if (!storage) {
+		free(json);
+		return -1;
+	}
 	if ((broker || broker_post) && broker_fetch(json, id, broker_post)) {
 		free(json);
 		return -1;
@@ -265,8 +348,9 @@ static int dispatch(const uint8_t *fc, size_t fc_len)
 		return -1;
 	}
 	char response[512];
-	const char *body = strstr(json, "/instance\"") ? "MQ==" :
-		(broker_post ? "cG9zdA==" : "b2s=");
+	const char *body = *storage ? storage :
+		(strstr(json, "/instance\"") ? "MQ==" :
+		 (broker_post ? "cG9zdA==" : "b2s="));
 	int size = snprintf(response, sizeof(response),
 		"{\"protocol_version\":1,\"request_id\":\"%s\","
 		"\"status\":200,\"headers\":[],\"body_base64\":\"%s\"}\n", id, body);

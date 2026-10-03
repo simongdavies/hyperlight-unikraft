@@ -33,13 +33,14 @@
 
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
 use hyperlight_host::func::Registerable;
 use tracing::{debug, trace};
 
-use crate::{HOST_CALL_MAX, Mount, errno};
+use crate::{HOST_CALL_MAX, Mount, MountLimits, errno};
 
 /// Maximum bytes per read/write host call.  The guest queries this
 /// value via `GetHostFsChunkSize` at mount time — changing it here
@@ -58,11 +59,13 @@ pub(crate) fn register(target: &mut impl Registerable, mounts: &[Mount]) -> crat
 
     let mut dirs_vec = Vec::with_capacity(mounts.len());
     let mut ro_vec = Vec::with_capacity(mounts.len());
+    let mut budget_vec = Vec::with_capacity(mounts.len());
     for (i, m) in mounts.iter().enumerate() {
         let Mount {
             guest_path,
             host_path,
             readonly,
+            limits,
         } = m;
         let d = Dir::open_ambient_dir(host_path, ambient_authority()).map_err(|source| {
             crate::Error::Mount {
@@ -81,9 +84,11 @@ pub(crate) fn register(target: &mut impl Registerable, mounts: &[Mount]) -> crat
         );
         dirs_vec.push(Arc::new(d));
         ro_vec.push(*readonly);
+        budget_vec.push(Arc::new(MountBudget::new(*limits)));
     }
     let dirs: Arc<Vec<Arc<Dir>>> = Arc::new(dirs_vec);
     let ro_flags: Arc<Vec<bool>> = Arc::new(ro_vec);
+    let budgets: Arc<Vec<Arc<MountBudget>>> = Arc::new(budget_vec);
 
     // ── fs_stat ─────────────────────────────────────────────────
     //
@@ -95,17 +100,21 @@ pub(crate) fn register(target: &mut impl Registerable, mounts: &[Mount]) -> crat
     //   [17]     u8   is_file
     {
         let dirs = dirs.clone();
+        let budgets = budgets.clone();
         target.register_host_function(
             "fs_stat",
             move |mount_idx: i32, path: String| -> hyperlight_host::Result<Vec<u8>> {
                 let Some(d) = dirs.get(mount_idx as usize) else {
                     return Ok({ -errno::EINVAL }.to_le_bytes().to_vec());
                 };
+                if !budgets[mount_idx as usize].charge_operation() {
+                    return Ok({ -errno::EDQUOT }.to_le_bytes().to_vec());
+                }
                 // Empty path = stat the mount root itself.
                 let meta = if path.is_empty() {
                     d.dir_metadata()
                 } else {
-                    d.metadata(&path)
+                    d.symlink_metadata(&path)
                 };
                 Ok(match meta {
                     Ok(m) => {
@@ -136,6 +145,7 @@ pub(crate) fn register(target: &mut impl Registerable, mounts: &[Mount]) -> crat
     // would make a large transfer one open.
     {
         let dirs = dirs.clone();
+        let budgets = budgets.clone();
         target.register_host_function(
             "fs_read_bytes",
             move |mount_idx: i32,
@@ -146,26 +156,41 @@ pub(crate) fn register(target: &mut impl Registerable, mounts: &[Mount]) -> crat
                 let Some(d) = dirs.get(mount_idx as usize) else {
                     return Ok({ -errno::EINVAL }.to_le_bytes().to_vec());
                 };
+                let budget = &budgets[mount_idx as usize];
+                if !budget.charge_operation() {
+                    return Ok({ -errno::EDQUOT }.to_le_bytes().to_vec());
+                }
                 let len = (len.min(CHUNK as u64) as usize).max(1);
+                let Some(reserved) = budget.reserve_read(len as u64) else {
+                    return Ok({ -errno::EDQUOT }.to_le_bytes().to_vec());
+                };
 
                 Ok(match d.open(&path) {
                     Ok(mut file) => {
                         if offset > 0
                             && let Err(e) = file.seek(SeekFrom::Start(offset))
                         {
+                            budget.refund_read(reserved);
                             return Ok(errno_vec(e));
                         }
                         let mut buf = vec![0u8; 4 + len];
                         match file.read(&mut buf[4..]) {
                             Ok(n) => {
+                                budget.refund_read(reserved - n as u64);
                                 buf[..4].copy_from_slice(&0i32.to_le_bytes());
                                 buf.truncate(4 + n);
                                 buf
                             }
-                            Err(e) => errno_vec(e),
+                            Err(e) => {
+                                budget.refund_read(reserved);
+                                errno_vec(e)
+                            }
                         }
                     }
-                    Err(e) => errno_vec(e),
+                    Err(e) => {
+                        budget.refund_read(reserved);
+                        errno_vec(e)
+                    }
                 })
             },
         )?;
@@ -178,6 +203,7 @@ pub(crate) fn register(target: &mut impl Registerable, mounts: &[Mount]) -> crat
     {
         let dirs = dirs.clone();
         let ro = ro_flags.clone();
+        let budgets = budgets.clone();
         target.register_host_function(
             "fs_write_bytes",
             move |mount_idx: i32,
@@ -191,6 +217,10 @@ pub(crate) fn register(target: &mut impl Registerable, mounts: &[Mount]) -> crat
                 };
                 if check_ro(&ro, mount_idx as usize) {
                     return Ok(-errno::EROFS);
+                }
+                let budget = &budgets[mount_idx as usize];
+                if !budget.charge_operation() || !budget.charge_write(data.len() as u64) {
+                    return Ok(-errno::EDQUOT);
                 }
                 let result = if append != 0 {
                     d.open_with(&path, OpenOptions::new().append(true).create(true))
@@ -216,6 +246,7 @@ pub(crate) fn register(target: &mut impl Registerable, mounts: &[Mount]) -> crat
     {
         let dirs = dirs.clone();
         let ro = ro_flags.clone();
+        let budgets = budgets.clone();
         target.register_host_function(
             "fs_mkdir",
             move |mount_idx: i32, path: String| -> hyperlight_host::Result<i32> {
@@ -224,6 +255,9 @@ pub(crate) fn register(target: &mut impl Registerable, mounts: &[Mount]) -> crat
                 };
                 if check_ro(&ro, mount_idx as usize) {
                     return Ok(-errno::EROFS);
+                }
+                if !budgets[mount_idx as usize].charge_operation() {
+                    return Ok(-errno::EDQUOT);
                 }
                 Ok(match d.create_dir(&path) {
                     Ok(()) => 0,
@@ -237,6 +271,7 @@ pub(crate) fn register(target: &mut impl Registerable, mounts: &[Mount]) -> crat
     {
         let dirs = dirs.clone();
         let ro = ro_flags.clone();
+        let budgets = budgets.clone();
         target.register_host_function(
             "fs_unlink",
             move |mount_idx: i32, path: String| -> hyperlight_host::Result<i32> {
@@ -245,6 +280,9 @@ pub(crate) fn register(target: &mut impl Registerable, mounts: &[Mount]) -> crat
                 };
                 if check_ro(&ro, mount_idx as usize) {
                     return Ok(-errno::EROFS);
+                }
+                if !budgets[mount_idx as usize].charge_operation() {
+                    return Ok(-errno::EDQUOT);
                 }
                 // Try file first, then directory.
                 // TODO: removes a file or an empty directory alike; POSIX
@@ -265,6 +303,7 @@ pub(crate) fn register(target: &mut impl Registerable, mounts: &[Mount]) -> crat
     {
         let dirs = dirs.clone();
         let ro = ro_flags.clone();
+        let budgets = budgets.clone();
         target.register_host_function(
             "fs_truncate",
             move |mount_idx: i32, path: String, length: u64| -> hyperlight_host::Result<i32> {
@@ -273,6 +312,17 @@ pub(crate) fn register(target: &mut impl Registerable, mounts: &[Mount]) -> crat
                 };
                 if check_ro(&ro, mount_idx as usize) {
                     return Ok(-errno::EROFS);
+                }
+                if !budgets[mount_idx as usize].charge_operation() {
+                    return Ok(-errno::EDQUOT);
+                }
+                let current_length = match d.metadata(&path) {
+                    Ok(metadata) => metadata.len(),
+                    Err(error) => return Ok(neg_errno(error)),
+                };
+                if !budgets[mount_idx as usize].charge_write(length.saturating_sub(current_length))
+                {
+                    return Ok(-errno::EDQUOT);
                 }
                 Ok(match d.open_with(&path, OpenOptions::new().write(true)) {
                     Ok(f) => match f.set_len(length) {
@@ -302,6 +352,7 @@ pub(crate) fn register(target: &mut impl Registerable, mounts: &[Mount]) -> crat
     // is decoded lossily, neither reported to the guest.
     {
         let dirs = dirs.clone();
+        let budgets = budgets.clone();
         let list_error = |code: i32| {
             let mut buf = Vec::with_capacity(8);
             buf.extend((-code).to_le_bytes());
@@ -314,6 +365,9 @@ pub(crate) fn register(target: &mut impl Registerable, mounts: &[Mount]) -> crat
                 let Some(d) = dirs.get(mount_idx as usize) else {
                     return Ok(list_error(errno::EINVAL));
                 };
+                if !budgets[mount_idx as usize].charge_operation() {
+                    return Ok(list_error(errno::EDQUOT));
+                }
                 let path = if path.is_empty() {
                     ".".to_string()
                 } else {
@@ -353,6 +407,7 @@ pub(crate) fn register(target: &mut impl Registerable, mounts: &[Mount]) -> crat
     {
         let dirs = dirs.clone();
         let ro = ro_flags.clone();
+        let budgets = budgets.clone();
         target.register_host_function(
             "fs_rename",
             move |mount_idx: i32, from: String, to: String| -> hyperlight_host::Result<i32> {
@@ -361,6 +416,9 @@ pub(crate) fn register(target: &mut impl Registerable, mounts: &[Mount]) -> crat
                 };
                 if check_ro(&ro, mount_idx as usize) {
                     return Ok(-errno::EROFS);
+                }
+                if !budgets[mount_idx as usize].charge_operation() {
+                    return Ok(-errno::EDQUOT);
                 }
                 Ok(match d.rename(&from, d, &to) {
                     Ok(()) => 0,
@@ -374,6 +432,7 @@ pub(crate) fn register(target: &mut impl Registerable, mounts: &[Mount]) -> crat
     {
         let dirs = dirs.clone();
         let ro = ro_flags.clone();
+        let budgets = budgets.clone();
         target.register_host_function(
             "fs_symlink",
             move |mount_idx: i32,
@@ -385,6 +444,9 @@ pub(crate) fn register(target: &mut impl Registerable, mounts: &[Mount]) -> crat
                 };
                 if check_ro(&ro, mount_idx as usize) {
                     return Ok(-errno::EROFS);
+                }
+                if !budgets[mount_idx as usize].charge_operation() {
+                    return Ok(-errno::EDQUOT);
                 }
                 #[cfg(unix)]
                 let result = d.symlink(&target_path, &link_path);
@@ -407,12 +469,16 @@ pub(crate) fn register(target: &mut impl Registerable, mounts: &[Mount]) -> crat
     //   [4..]   bytes target path (UTF-8)
     {
         let dirs = dirs.clone();
+        let budgets = budgets.clone();
         target.register_host_function(
             "fs_readlink",
             move |mount_idx: i32, path: String| -> hyperlight_host::Result<Vec<u8>> {
                 let Some(d) = dirs.get(mount_idx as usize) else {
                     return Ok({ -errno::EINVAL }.to_le_bytes().to_vec());
                 };
+                if !budgets[mount_idx as usize].charge_operation() {
+                    return Ok({ -errno::EDQUOT }.to_le_bytes().to_vec());
+                }
                 Ok(match d.read_link(&path) {
                     Ok(target_path) => {
                         let target_bytes = target_path.to_string_lossy().as_bytes().to_vec();
@@ -431,6 +497,7 @@ pub(crate) fn register(target: &mut impl Registerable, mounts: &[Mount]) -> crat
     {
         let dirs = dirs.clone();
         let ro = ro_flags.clone();
+        let budgets = budgets.clone();
         target.register_host_function(
             "fs_link",
             move |mount_idx: i32, src: String, dst: String| -> hyperlight_host::Result<i32> {
@@ -439,6 +506,9 @@ pub(crate) fn register(target: &mut impl Registerable, mounts: &[Mount]) -> crat
                 };
                 if check_ro(&ro, mount_idx as usize) {
                     return Ok(-errno::EROFS);
+                }
+                if !budgets[mount_idx as usize].charge_operation() {
+                    return Ok(-errno::EDQUOT);
                 }
                 Ok(match d.hard_link(&src, d, &dst) {
                     Ok(()) => 0,
@@ -452,6 +522,7 @@ pub(crate) fn register(target: &mut impl Registerable, mounts: &[Mount]) -> crat
     {
         let dirs = dirs.clone();
         let ro = ro_flags.clone();
+        let budgets = budgets.clone();
         target.register_host_function(
             "fs_chmod",
             move |mount_idx: i32, path: String, mode: u32| -> hyperlight_host::Result<i32> {
@@ -460,6 +531,9 @@ pub(crate) fn register(target: &mut impl Registerable, mounts: &[Mount]) -> crat
                 };
                 if check_ro(&ro, mount_idx as usize) {
                     return Ok(-errno::EROFS);
+                }
+                if !budgets[mount_idx as usize].charge_operation() {
+                    return Ok(-errno::EDQUOT);
                 }
                 #[cfg(unix)]
                 {
@@ -493,6 +567,54 @@ pub(crate) fn register(target: &mut impl Registerable, mounts: &[Mount]) -> crat
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
+struct MountBudget {
+    limits: MountLimits,
+    operations: AtomicU64,
+    read_bytes: AtomicU64,
+    write_bytes: AtomicU64,
+}
+
+impl MountBudget {
+    fn new(limits: MountLimits) -> Self {
+        Self {
+            limits,
+            operations: AtomicU64::new(0),
+            read_bytes: AtomicU64::new(0),
+            write_bytes: AtomicU64::new(0),
+        }
+    }
+
+    fn charge_operation(&self) -> bool {
+        charge(&self.operations, 1, self.limits.max_operations)
+    }
+
+    fn reserve_read(&self, amount: u64) -> Option<u64> {
+        charge(&self.read_bytes, amount, self.limits.max_read_bytes).then_some(amount)
+    }
+
+    fn refund_read(&self, amount: u64) {
+        if amount != 0 {
+            self.read_bytes.fetch_sub(amount, Ordering::AcqRel);
+        }
+    }
+
+    fn charge_write(&self, amount: u64) -> bool {
+        charge(&self.write_bytes, amount, self.limits.max_write_bytes)
+    }
+}
+
+fn charge(counter: &AtomicU64, amount: u64, limit: Option<u64>) -> bool {
+    let Some(limit) = limit else {
+        counter.fetch_add(amount, Ordering::Relaxed);
+        return true;
+    };
+    counter
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            current.checked_add(amount).filter(|next| *next <= limit)
+        })
+        .is_ok()
+}
+
 /// Check if a mount is read-only.
 fn check_ro(ro_flags: &[bool], idx: usize) -> bool {
     ro_flags.get(idx).copied().unwrap_or(false)
@@ -525,4 +647,43 @@ fn neg_errno(e: std::io::Error) -> i32 {
     let code = errno::from_io(&e);
     trace!(errno = code, err = %e, "hostfs: operation failed");
     -code
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn limits() -> MountLimits {
+        MountLimits {
+            max_operations: Some(2),
+            max_read_bytes: Some(5),
+            max_write_bytes: Some(4),
+        }
+    }
+
+    #[test]
+    fn mount_budget_enforces_operation_and_byte_limits() {
+        let budget = MountBudget::new(limits());
+        assert!(budget.charge_operation());
+        assert!(budget.charge_operation());
+        assert!(!budget.charge_operation());
+
+        assert_eq!(budget.reserve_read(4), Some(4));
+        budget.refund_read(2);
+        assert_eq!(budget.reserve_read(3), Some(3));
+        assert_eq!(budget.reserve_read(1), None);
+
+        assert!(budget.charge_write(4));
+        assert!(!budget.charge_write(1));
+    }
+
+    #[test]
+    fn mount_budget_is_fresh_per_registration() {
+        let first = MountBudget::new(limits());
+        assert!(first.charge_write(4));
+        assert!(!first.charge_write(1));
+
+        let restored = MountBudget::new(limits());
+        assert!(restored.charge_write(4));
+    }
 }

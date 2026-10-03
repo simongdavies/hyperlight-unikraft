@@ -31,7 +31,8 @@ pub use pool::{
 };
 pub use protocol::*;
 pub use sandbox::{
-    ExecutionProfile, InitializationFailure, InitializationProfile, WorkerVersionSandbox,
+    ExecutionProfile, InitializationFailure, InitializationProfile, StorageBinding, StoragePolicy,
+    WorkerCapabilityPolicy, WorkerVersionSandbox,
 };
 pub use snapshot::{SnapshotBinding, VerifiedSnapshot};
 pub use timer::{TIMER_PROTOCOL_VERSION, TimerLimits};

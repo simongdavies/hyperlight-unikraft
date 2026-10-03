@@ -333,6 +333,16 @@ pub fn configure_surrogates(max: usize) {
 // ── Mount ───────────────────────────────────────────────────────────────
 
 /// A host filesystem mount passed to the guest.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct MountLimits {
+    /// Maximum hostfs calls accepted for this mount in one sandbox lifetime.
+    pub max_operations: Option<u64>,
+    /// Maximum bytes returned by reads in one sandbox lifetime.
+    pub max_read_bytes: Option<u64>,
+    /// Maximum bytes accepted by writes in one sandbox lifetime.
+    pub max_write_bytes: Option<u64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Mount {
     /// Guest-visible mount point (e.g. `/mnt/data`).
@@ -341,6 +351,8 @@ pub struct Mount {
     pub host_path: PathBuf,
     /// Mount read-only (`true` → `MNT_RDONLY`, writes return `EROFS`).
     pub readonly: bool,
+    /// Per-sandbox hostfs budgets for this mount.
+    pub limits: MountLimits,
 }
 
 impl Mount {
@@ -353,6 +365,7 @@ impl Mount {
             guest_path: guest_path.into(),
             host_path: host_path.into(),
             readonly: false,
+            limits: MountLimits::default(),
         }
     }
 
@@ -365,7 +378,14 @@ impl Mount {
             guest_path: guest_path.into(),
             host_path: host_path.into(),
             readonly: true,
+            limits: MountLimits::default(),
         }
+    }
+
+    /// Apply per-sandbox operation and byte budgets.
+    pub fn with_limits(mut self, limits: MountLimits) -> Self {
+        self.limits = limits;
+        self
     }
 }
 

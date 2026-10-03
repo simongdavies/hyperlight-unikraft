@@ -5,10 +5,12 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use hyperlight_unikraft::workerd::{
     FetchBroker, FetchBrokerConfig, FetchLimits, FetchPolicy, Header, MAX_BODY_BYTES,
-    MAX_HEADER_BYTES, PROTOCOL_VERSION, PrewarmPolicy, RequestEnvelope, WorkerBundle,
-    WorkerPoolRestoreMode, WorkerRequestPool, WorkerVersionId, WorkerVersionSandbox,
+    MAX_HEADER_BYTES, PROTOCOL_VERSION, PrewarmPolicy, RequestEnvelope, StorageBinding,
+    StoragePolicy, TimerLimits, WorkerBundle, WorkerCapabilityPolicy, WorkerPoolRestoreMode,
+    WorkerRequestPool, WorkerVersionId, WorkerVersionSandbox,
 };
-use hyperlight_unikraft::{AllowList, NetworkPolicy};
+use hyperlight_unikraft::{AllowList, MountLimits, NetworkPolicy};
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::OsString;
 use std::io::{Read, Write};
@@ -33,6 +35,11 @@ const MAX_FETCH_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_FETCH_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_FETCH_CONCURRENT_REQUESTS: usize = 64;
 const MAX_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_STORAGE_MAX_OPERATIONS: u64 = 128;
+const DEFAULT_STORAGE_MAX_READ_BYTES: u64 = 1024 * 1024;
+const DEFAULT_STORAGE_MAX_WRITE_BYTES: u64 = 64 * 1024;
+const MAX_STORAGE_OPERATIONS: u64 = 10_000;
+const MAX_STORAGE_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RestoreMode {
@@ -73,6 +80,10 @@ struct Options {
     fetch_max_response_bytes: Option<usize>,
     fetch_max_concurrent_requests: Option<usize>,
     fetch_timeout: Option<Duration>,
+    storage_bindings: Vec<(bool, String)>,
+    storage_max_operations: Vec<String>,
+    storage_max_read_bytes: Vec<String>,
+    storage_max_write_bytes: Vec<String>,
 }
 
 impl Options {
@@ -114,6 +125,10 @@ impl Options {
             fetch_max_response_bytes: None,
             fetch_max_concurrent_requests: None,
             fetch_timeout: None,
+            storage_bindings: Vec::new(),
+            storage_max_operations: Vec::new(),
+            storage_max_read_bytes: Vec::new(),
+            storage_max_write_bytes: Vec::new(),
         };
         let mut args = args.into_iter().map(|arg| {
             arg.into()
@@ -242,6 +257,11 @@ impl Options {
                     }
                     options.fetch_timeout = Some(timeout);
                 }
+                "--storage-ro" => options.storage_bindings.push((true, value()?)),
+                "--storage-rw" => options.storage_bindings.push((false, value()?)),
+                "--storage-max-operations" => options.storage_max_operations.push(value()?),
+                "--storage-max-read-bytes" => options.storage_max_read_bytes.push(value()?),
+                "--storage-max-write-bytes" => options.storage_max_write_bytes.push(value()?),
                 "--help" | "-h" => {
                     return Err(format!(
                         "usage: workerd-demo [--bind ADDR] [--rootfs CPIO] \
@@ -263,6 +283,10 @@ impl Options {
                          [--fetch-max-response-bytes BYTES] \
                          [--fetch-max-concurrent-requests N] \
                          [--fetch-timeout-ms MS]\n\
+                         [--storage-ro NAME=HOST_DIR | --storage-rw NAME=HOST_DIR]... \
+                         [--storage-max-operations NAME=N] \
+                         [--storage-max-read-bytes NAME=BYTES] \
+                         [--storage-max-write-bytes NAME=BYTES]\n\
                          defaults: --bind 0.0.0.0:8787 --rootfs {DEFAULT_ROOTFS} \
                          --executor {DEFAULT_EXECUTOR} --version demo-v1 \
                          --bundle {DEFAULT_BUNDLE} \
@@ -281,7 +305,10 @@ impl Options {
                          Outbound fetch is denied by default. --fetch-loopback-port explicitly \
                          allows HTTP fetches to localhost on exactly PORT for compatibility. \
                          General policy requires at least one explicit host, scheme, and port; \
-                         loopback, private, and metadata addresses remain denied unless opted in.\n\
+                         loopback, private, and metadata addresses remain denied unless opted in. \
+                         Storage is denied by default. Each explicit named binding is mounted at \
+                         /mnt/workerd-storage/NAME with per-sandbox operation/read/write budgets; \
+                         Worker input never selects a host path.\n\
                          On-demand owners restore one fresh VM per request. Prewarmed owners restore \
                          before advertising readiness, execute at most one request, drop the VM, and \
                          replenish adaptively below explicit ready watermarks. The warm floor is \
@@ -309,6 +336,7 @@ impl Options {
             ],
         )?;
         validate_fetch_options(&options)?;
+        validate_storage_option_syntax(&options)?;
         Ok(options)
     }
 }
@@ -548,6 +576,152 @@ fn duration(value: String, flag: &str) -> Result<Duration, String> {
     Ok(Duration::from_millis(millis))
 }
 
+fn split_named_value<'a>(value: &'a str, flag: &str) -> Result<(&'a str, &'a str), String> {
+    let (name, value) = value
+        .split_once('=')
+        .ok_or_else(|| format!("{flag} expects NAME=VALUE"))?;
+    if name.is_empty() || value.is_empty() {
+        return Err(format!("{flag} expects nonempty NAME=VALUE"));
+    }
+    Ok((name, value))
+}
+
+fn validate_storage_option_syntax(options: &Options) -> Result<(), String> {
+    let mut names = HashSet::new();
+    for (readonly, raw) in &options.storage_bindings {
+        let flag = if *readonly {
+            "--storage-ro"
+        } else {
+            "--storage-rw"
+        };
+        let (name, _) = split_named_value(raw, flag)?;
+        if !names.insert(name.to_string()) {
+            return Err(format!("duplicate storage binding {name:?}"));
+        }
+    }
+    for (flag, values) in [
+        ("--storage-max-operations", &options.storage_max_operations),
+        ("--storage-max-read-bytes", &options.storage_max_read_bytes),
+        (
+            "--storage-max-write-bytes",
+            &options.storage_max_write_bytes,
+        ),
+    ] {
+        for raw in values {
+            let (name, value) = split_named_value(raw, flag)?;
+            if !names.contains(name) {
+                return Err(format!("{flag} names unknown storage binding {name:?}"));
+            }
+            let parsed = value
+                .parse::<u64>()
+                .map_err(|_| format!("invalid {flag} value for {name:?}"))?;
+            let maximum = if flag == "--storage-max-operations" {
+                MAX_STORAGE_OPERATIONS
+            } else {
+                MAX_STORAGE_BYTES
+            };
+            if parsed == 0 || parsed > maximum {
+                return Err(format!(
+                    "{flag} value for {name:?} must be between 1 and {maximum}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn named_limits(values: &[String], flag: &str) -> Result<HashMap<String, u64>, String> {
+    let mut parsed = HashMap::new();
+    for raw in values {
+        let (name, value) = split_named_value(raw, flag)?;
+        let value = value
+            .parse::<u64>()
+            .map_err(|_| format!("invalid {flag} value for {name:?}"))?;
+        if parsed.insert(name.to_string(), value).is_some() {
+            return Err(format!("duplicate {flag} for storage binding {name:?}"));
+        }
+    }
+    Ok(parsed)
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct StoragePolicySummary {
+    mode: &'static str,
+    bindings: Vec<(String, &'static str, MountLimits)>,
+}
+
+fn build_storage_policy(
+    options: &Options,
+) -> Result<(StoragePolicy, StoragePolicySummary), String> {
+    if options.storage_bindings.is_empty() {
+        return Ok((
+            StoragePolicy::denied(),
+            StoragePolicySummary {
+                mode: "deny-all",
+                bindings: Vec::new(),
+            },
+        ));
+    }
+    let operations = named_limits(&options.storage_max_operations, "--storage-max-operations")?;
+    let reads = named_limits(&options.storage_max_read_bytes, "--storage-max-read-bytes")?;
+    let writes = named_limits(
+        &options.storage_max_write_bytes,
+        "--storage-max-write-bytes",
+    )?;
+    let mut bindings = Vec::with_capacity(options.storage_bindings.len());
+    let mut summary = Vec::with_capacity(options.storage_bindings.len());
+    for (readonly, raw) in &options.storage_bindings {
+        let flag = if *readonly {
+            "--storage-ro"
+        } else {
+            "--storage-rw"
+        };
+        let (name, host_path) = split_named_value(raw, flag)?;
+        let limits = MountLimits {
+            max_operations: Some(
+                operations
+                    .get(name)
+                    .copied()
+                    .unwrap_or(DEFAULT_STORAGE_MAX_OPERATIONS),
+            ),
+            max_read_bytes: Some(
+                reads
+                    .get(name)
+                    .copied()
+                    .unwrap_or(DEFAULT_STORAGE_MAX_READ_BYTES),
+            ),
+            max_write_bytes: Some(if *readonly {
+                writes.get(name).copied().unwrap_or(1)
+            } else {
+                writes
+                    .get(name)
+                    .copied()
+                    .unwrap_or(DEFAULT_STORAGE_MAX_WRITE_BYTES)
+            }),
+        };
+        let binding = if *readonly {
+            StorageBinding::read_only(name, host_path, limits)
+        } else {
+            StorageBinding::read_write(name, host_path, limits)
+        }
+        .map_err(|error| error.to_string())?;
+        summary.push((
+            name.to_string(),
+            if *readonly { "ro" } else { "rw" },
+            limits,
+        ));
+        bindings.push(binding);
+    }
+    summary.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok((
+        StoragePolicy::new(bindings).map_err(|error| error.to_string())?,
+        StoragePolicySummary {
+            mode: "explicit",
+            bindings: summary,
+        },
+    ))
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options = match Options::parse() {
         Ok(options) => options,
@@ -577,13 +751,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let version = bundle.worker_version.clone();
     let (fetch_broker, fetch_policy) =
         build_fetch_broker(&options).map_err(|error| format!("fetch policy: {error}"))?;
-    let worker = WorkerVersionSandbox::initialize_with_fetch(
+    let (storage_policy, storage_summary) =
+        build_storage_policy(&options).map_err(|error| format!("storage policy: {error}"))?;
+    let worker = WorkerVersionSandbox::initialize_with_policy(
         bundle,
         &options.rootfs,
         &options.executor,
         options.scratch_mb,
         options.init_timeout,
-        fetch_broker,
+        WorkerCapabilityPolicy::new(fetch_broker, TimerLimits::default(), storage_policy),
     )?;
     let owner_count = match options.restore_mode {
         RestoreMode::OnDemand => options.max_concurrent_sandboxes,
@@ -659,6 +835,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         prewarm_policy.map_or(0, |policy| policy.ready_high_watermark),
         prewarm_policy.map_or(0, |policy| policy.max_replenish_batch),
         options.queue_capacity
+    );
+    eprintln!(
+        "storage policy: {} bindings={:?}",
+        storage_summary.mode, storage_summary.bindings
     );
     eprintln!(
         "outbound fetch policy: {} hosts={:?} schemes={:?} ports={:?} \
@@ -1263,5 +1443,97 @@ mod tests {
         ])
         .unwrap();
         assert!(build_fetch_broker(&options).is_err());
+    }
+
+    #[test]
+    fn storage_policy_defaults_to_deny_all() {
+        let options = options(&[]).unwrap();
+        let (policy, summary) = build_storage_policy(&options).unwrap();
+        assert!(policy.bindings().is_empty());
+        assert_eq!(summary.mode, "deny-all");
+    }
+
+    #[test]
+    fn storage_policy_builds_named_ro_rw_bindings_and_limits() {
+        let ro = tempfile::tempdir().unwrap();
+        let rw = tempfile::tempdir().unwrap();
+        let parsed = options(&[
+            "--storage-ro",
+            &format!("readonly={}", ro.path().display()),
+            "--storage-rw",
+            &format!("scratch={}", rw.path().display()),
+            "--storage-max-operations",
+            "readonly=12",
+            "--storage-max-read-bytes",
+            "readonly=4096",
+            "--storage-max-write-bytes",
+            "scratch=16",
+        ])
+        .unwrap();
+        let (policy, summary) = build_storage_policy(&parsed).unwrap();
+        assert_eq!(policy.bindings().len(), 2);
+        assert_eq!(summary.mode, "explicit");
+        assert_eq!(summary.bindings[0].0, "readonly");
+        assert_eq!(summary.bindings[0].1, "ro");
+        assert_eq!(summary.bindings[0].2.max_operations, Some(12));
+        assert_eq!(summary.bindings[0].2.max_read_bytes, Some(4096));
+        assert_eq!(summary.bindings[1].0, "scratch");
+        assert_eq!(summary.bindings[1].1, "rw");
+        assert_eq!(summary.bindings[1].2.max_write_bytes, Some(16));
+        assert_eq!(
+            policy.bindings()[0].guest_path(),
+            "/mnt/workerd-storage/readonly"
+        );
+    }
+
+    #[test]
+    fn storage_policy_rejects_invalid_duplicate_and_orphan_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().display().to_string();
+        assert!(
+            options(&["--storage-ro", &format!("bad/name={path}")])
+                .and_then(|parsed| build_storage_policy(&parsed).map(|_| parsed))
+                .is_err()
+        );
+        assert!(
+            options(&[
+                "--storage-ro",
+                &format!("data={path}"),
+                "--storage-rw",
+                &format!("data={path}"),
+            ])
+            .err()
+            .unwrap()
+            .contains("duplicate storage binding")
+        );
+        assert!(
+            options(&["--storage-max-read-bytes", "missing=10"])
+                .err()
+                .unwrap()
+                .contains("unknown storage binding")
+        );
+        assert!(
+            options(&[
+                "--storage-rw",
+                &format!("data={path}"),
+                "--storage-max-write-bytes",
+                "data=0",
+            ])
+            .err()
+            .unwrap()
+            .contains("between 1")
+        );
+        assert!(
+            options(&[
+                "--storage-rw",
+                &format!("data={path}"),
+                "--storage-max-operations",
+                "data=1",
+                "--storage-max-operations",
+                "data=2",
+            ])
+            .and_then(|parsed| build_storage_policy(&parsed).map(|_| parsed))
+            .is_err()
+        );
     }
 }

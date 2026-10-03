@@ -6,10 +6,11 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use hyperlight_unikraft::workerd::{
     Error, FetchBroker, FetchBrokerConfig, FetchLimits, FetchPolicy, Header, MAX_BODY_BYTES,
-    PROTOCOL_VERSION, RequestEnvelope, SnapshotBinding, VerifiedSnapshot, WorkerBundle,
-    WorkerPoolRestoreMode, WorkerRequestPool, WorkerVersionId, WorkerVersionSandbox,
+    PROTOCOL_VERSION, RequestEnvelope, SnapshotBinding, StorageBinding, StoragePolicy, TimerLimits,
+    VerifiedSnapshot, WorkerBundle, WorkerCapabilityPolicy, WorkerPoolRestoreMode,
+    WorkerRequestPool, WorkerVersionId, WorkerVersionSandbox,
 };
-use hyperlight_unikraft::{AllowList, NetworkPolicy};
+use hyperlight_unikraft::{AllowList, MountLimits, NetworkPolicy};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
@@ -112,6 +113,87 @@ fn wait_for_status(
         assert!(Instant::now() < deadline, "pool status wait timed out");
         thread::sleep(Duration::from_millis(5));
     }
+}
+
+#[test]
+fn real_guest_storage_policy_enforces_modes_confinement_quotas_and_reset() {
+    #[cfg(windows)]
+    hyperlight_unikraft::configure_surrogates(4);
+    let (rootfs, executor) = artifacts();
+    let root = tempfile::tempdir().unwrap();
+    let readonly = root.path().join("readonly");
+    let scratch = root.path().join("scratch");
+    let outside = root.path().join("outside");
+    fs::create_dir_all(&readonly).unwrap();
+    fs::create_dir_all(&scratch).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(readonly.join("message.txt"), b"fixture-read-ok\n").unwrap();
+    fs::write(outside.join("secret.txt"), b"must-not-read").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, readonly.join("escape")).unwrap();
+
+    let limits = MountLimits {
+        max_operations: Some(128),
+        max_read_bytes: Some(1024),
+        max_write_bytes: Some(16),
+    };
+    let storage = StoragePolicy::new([
+        StorageBinding::read_only("readonly", &readonly, limits).unwrap(),
+        StorageBinding::read_write("scratch", &scratch, limits).unwrap(),
+    ])
+    .unwrap();
+    let version = WorkerVersionId::new("storage-v1").unwrap();
+    let worker = WorkerVersionSandbox::initialize_with_policy(
+        bundle(version.clone(), "export default {}"),
+        &rootfs,
+        &executor,
+        64,
+        Duration::from_secs(10),
+        WorkerCapabilityPolicy::new(FetchBroker::denied(), TimerLimits::default(), storage),
+    )
+    .unwrap();
+
+    for (path, expected) in [
+        ("storage-allowed-read", "allowed-read"),
+        ("storage-ro-write-denied", "ro-write-denied"),
+        ("storage-rw-write", "rw-write"),
+        ("storage-traversal-denied", "traversal-denied"),
+        ("storage-unlisted-denied", "unlisted-denied"),
+        ("storage-quota-denied", "quota-denied"),
+        ("storage-quota-denied", "quota-denied"),
+    ] {
+        let response = worker
+            .execute(&version, request(path, path), Duration::from_secs(5))
+            .unwrap();
+        let body = STANDARD.decode(response.body_base64).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["outcome"], expected, "{path}");
+    }
+    assert_eq!(fs::read(scratch.join("allowed.txt")).unwrap(), b"rw-ok");
+    assert_eq!(fs::metadata(scratch.join("quota.txt")).unwrap().len(), 16);
+    assert!(!readonly.join("denied.txt").exists());
+
+    let mismatch = WorkerVersionSandbox::from_verified_snapshot_with_storage(
+        worker.snapshot().clone(),
+        FetchBroker::denied(),
+        TimerLimits::default(),
+        StoragePolicy::denied(),
+    );
+    assert!(mismatch.is_err());
+
+    let legacy_mismatch = WorkerVersionSandbox::from_verified_snapshot(worker.snapshot().clone());
+    let error = legacy_mismatch
+        .execute(
+            &version,
+            request("legacy-storage-mismatch", "storage-allowed-read"),
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("snapshot storage policy binding mismatch")
+    );
 }
 
 #[test]

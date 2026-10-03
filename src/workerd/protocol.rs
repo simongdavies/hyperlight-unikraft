@@ -19,6 +19,8 @@ pub const MAX_COMPATIBILITY_FLAGS: usize = 32;
 pub const MAX_HEADERS: usize = 64;
 pub const MAX_HEADER_BYTES: usize = 8 * 1024;
 pub const MAX_REQUEST_ID_BYTES: usize = 64;
+const EXECUTOR_INIT_PROTOCOL_VERSION: u16 = 2;
+const MAX_EXECUTOR_STORAGE_BINDINGS: usize = 8;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -81,6 +83,8 @@ pub struct ResponseEnvelope {
 pub enum ModuleType {
     #[serde(rename = "esModule")]
     EsModule,
+    #[serde(rename = "commonJsModule")]
+    CommonJsModule,
     #[serde(rename = "text")]
     Text,
     #[serde(rename = "json")]
@@ -105,6 +109,23 @@ pub struct WorkerBundle {
     pub compatibility_flags: Vec<String>,
     pub main_module: String,
     pub modules: Vec<WorkerModule>,
+}
+
+#[derive(Serialize)]
+struct ExecutorStorageBinding<'a> {
+    name: &'a str,
+    mode: &'static str,
+}
+
+#[derive(Serialize)]
+struct ExecutorInit<'a> {
+    protocol_version: u16,
+    worker_version: &'a WorkerVersionId,
+    compatibility_date: &'a str,
+    compatibility_flags: &'a [String],
+    main_module: &'a str,
+    modules: &'a [WorkerModule],
+    storage: &'a [ExecutorStorageBinding<'a>],
 }
 
 fn invalid(message: &str) -> Error {
@@ -272,6 +293,50 @@ impl WorkerBundle {
     pub fn to_canonical_json(&self) -> Result<String> {
         self.validate()?;
         let json = serde_json::to_string(self)?;
+        bounded(json.as_bytes())?;
+        Ok(json)
+    }
+
+    pub(super) fn to_executor_init_json<'a>(
+        &self,
+        storage: impl IntoIterator<Item = (&'a str, bool)>,
+    ) -> Result<String> {
+        self.validate()?;
+        let mut storage: Vec<_> = storage
+            .into_iter()
+            .map(|(name, readonly)| ExecutorStorageBinding {
+                name,
+                mode: if readonly { "ro" } else { "rw" },
+            })
+            .collect();
+        storage.sort_by(|left, right| left.name.cmp(right.name));
+        if storage.is_empty() || storage.len() > MAX_EXECUTOR_STORAGE_BINDINGS {
+            return Err(invalid("invalid executor storage binding count"));
+        }
+        let mut previous = None;
+        for binding in &storage {
+            if binding.name.is_empty()
+                || binding.name.len() > 64
+                || !binding
+                    .name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+                || previous.is_some_and(|name| name == binding.name)
+            {
+                return Err(invalid("invalid executor storage binding"));
+            }
+            previous = Some(binding.name);
+        }
+        let init = ExecutorInit {
+            protocol_version: EXECUTOR_INIT_PROTOCOL_VERSION,
+            worker_version: &self.worker_version,
+            compatibility_date: &self.compatibility_date,
+            compatibility_flags: &self.compatibility_flags,
+            main_module: &self.main_module,
+            modules: &self.modules,
+            storage: &storage,
+        };
+        let json = serde_json::to_string(&init)?;
         bounded(json.as_bytes())?;
         Ok(json)
     }
@@ -545,6 +610,11 @@ mod tests {
         let mut input = bundle();
         input.compatibility_flags = vec!["z".into(), "a".into()];
         input.modules.push(WorkerModule {
+            name: "dependency.cjs".into(),
+            module_type: ModuleType::CommonJsModule,
+            source: "module.exports = { value: 1 };".into(),
+        });
+        input.modules.push(WorkerModule {
             name: "data.txt".into(),
             module_type: ModuleType::Text,
             source: "hello".into(),
@@ -554,6 +624,8 @@ mod tests {
         assert_eq!(canonical.compatibility_flags, ["a", "z"]);
         assert_eq!(canonical.modules[0].name, "worker.js");
         assert_eq!(canonical.modules[1].name, "data.txt");
+        assert_eq!(canonical.modules[2].name, "dependency.cjs");
+        assert_eq!(canonical.modules[2].module_type, ModuleType::CommonJsModule);
         assert_eq!(
             WorkerBundle::from_json(canonical.to_canonical_json().unwrap().as_bytes()).unwrap(),
             canonical
@@ -572,6 +644,51 @@ mod tests {
         invalid = bundle();
         invalid.modules[0].source = "x".repeat(MAX_MODULE_SOURCE_BYTES + 1);
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn executor_storage_init_is_v2_sorted_and_bounded() {
+        let init = bundle()
+            .to_executor_init_json([("rw", false), ("ro", true)])
+            .unwrap();
+        assert_eq!(
+            init,
+            concat!(
+                "{\"protocol_version\":2,\"worker_version\":\"v1\",",
+                "\"compatibility_date\":\"2025-01-01\",",
+                "\"compatibility_flags\":[\"nodejs_compat\"],",
+                "\"main_module\":\"worker.js\",\"modules\":[",
+                "{\"name\":\"worker.js\",\"type\":\"esModule\",",
+                "\"source\":\"export default { fetch() { return new Response('ok') } }\"}],",
+                "\"storage\":[{\"name\":\"ro\",\"mode\":\"ro\"},",
+                "{\"name\":\"rw\",\"mode\":\"rw\"}]}"
+            )
+        );
+        assert!(
+            bundle()
+                .to_executor_init_json(std::iter::empty::<(&str, bool)>())
+                .is_err()
+        );
+        assert!(
+            bundle()
+                .to_executor_init_json([("bad_name", true)])
+                .is_err()
+        );
+        assert!(
+            bundle()
+                .to_executor_init_json([
+                    ("m0", true),
+                    ("m1", true),
+                    ("m2", true),
+                    ("m3", true),
+                    ("m4", true),
+                    ("m5", true),
+                    ("m6", true),
+                    ("m7", true),
+                    ("m8", true),
+                ])
+                .is_err()
+        );
     }
 
     #[test]
@@ -608,6 +725,7 @@ mod tests {
             "api-smoke.json",
             "helloworld_esm.json",
             "web-streams.json",
+            "workerd-vfs-evidence.json",
         ] {
             let bundle = WorkerBundle::from_path(root.join(name)).unwrap();
             bundle.to_canonical_json().unwrap();

@@ -6,8 +6,10 @@ use super::{
     VerifiedSnapshot, WorkerBundle, WorkerVersionId, snapshot::kernel_for_rootfs,
     timer::TimerBroker,
 };
-use crate::{AppSandbox, Yield};
+use crate::{AppSandbox, Mount, MountLimits, Yield};
 use hyperlight_host::func::Registerable;
+use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
@@ -227,6 +229,223 @@ pub struct WorkerVersionSandbox {
     image: VerifiedSnapshot,
     fetch_broker: FetchBroker,
     timer_broker: TimerBroker,
+    storage_policy: StoragePolicy,
+}
+
+const STORAGE_GUEST_ROOT: &str = "/mnt/workerd-storage";
+const MAX_STORAGE_BINDINGS: usize = 8;
+
+#[derive(Clone, Debug)]
+pub struct StorageBinding {
+    name: String,
+    host_path: std::path::PathBuf,
+    readonly: bool,
+    limits: MountLimits,
+}
+
+impl StorageBinding {
+    pub fn read_only(
+        name: impl Into<String>,
+        host_path: impl AsRef<Path>,
+        limits: MountLimits,
+    ) -> Result<Self> {
+        Self::new(name.into(), host_path.as_ref(), true, limits)
+    }
+
+    pub fn read_write(
+        name: impl Into<String>,
+        host_path: impl AsRef<Path>,
+        limits: MountLimits,
+    ) -> Result<Self> {
+        Self::new(name.into(), host_path.as_ref(), false, limits)
+    }
+
+    fn new(name: String, host_path: &Path, readonly: bool, limits: MountLimits) -> Result<Self> {
+        validate_storage_name(&name)?;
+        validate_storage_limits(limits)?;
+        let host_path = std::fs::canonicalize(host_path)?;
+        if !host_path.is_dir() {
+            return Err(Error::State(format!(
+                "storage binding {name:?} host path is not a directory"
+            )));
+        }
+        if host_path.to_str().is_none() {
+            return Err(Error::State(format!(
+                "storage binding {name:?} host path must be valid UTF-8"
+            )));
+        }
+        Ok(Self {
+            name,
+            host_path,
+            readonly,
+            limits,
+        })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn guest_path(&self) -> String {
+        format!("{STORAGE_GUEST_ROOT}/{}", self.name)
+    }
+
+    pub fn host_path(&self) -> &Path {
+        &self.host_path
+    }
+
+    pub fn readonly(&self) -> bool {
+        self.readonly
+    }
+
+    pub fn limits(&self) -> MountLimits {
+        self.limits
+    }
+
+    fn mount(&self) -> Mount {
+        let mount = if self.readonly {
+            Mount::ro(&self.host_path, self.guest_path())
+        } else {
+            Mount::rw(&self.host_path, self.guest_path())
+        };
+        mount.with_limits(self.limits)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct StoragePolicy {
+    bindings: Vec<StorageBinding>,
+}
+
+impl StoragePolicy {
+    pub fn denied() -> Self {
+        Self::default()
+    }
+
+    pub fn new(bindings: impl IntoIterator<Item = StorageBinding>) -> Result<Self> {
+        let bindings: Vec<_> = bindings.into_iter().collect();
+        if bindings.len() > MAX_STORAGE_BINDINGS {
+            return Err(Error::State(format!(
+                "storage policy supports at most {MAX_STORAGE_BINDINGS} bindings"
+            )));
+        }
+        let mut names = HashSet::with_capacity(bindings.len());
+        for binding in &bindings {
+            if !names.insert(binding.name.clone()) {
+                return Err(Error::State(format!(
+                    "duplicate storage binding {:?}",
+                    binding.name
+                )));
+            }
+        }
+        Ok(Self { bindings })
+    }
+
+    pub fn bindings(&self) -> &[StorageBinding] {
+        &self.bindings
+    }
+
+    fn mounts(&self) -> Vec<Mount> {
+        self.bindings.iter().map(StorageBinding::mount).collect()
+    }
+
+    fn executor_bindings(&self) -> impl Iterator<Item = (&str, bool)> {
+        self.bindings
+            .iter()
+            .map(|binding| (binding.name.as_str(), binding.readonly))
+    }
+
+    pub(super) fn sha256(&self) -> String {
+        let mut entries: Vec<_> = self
+            .bindings
+            .iter()
+            .map(|binding| {
+                format!(
+                    "{}\0{}\0{}\0{:?}\0{:?}\0{:?}",
+                    binding.name,
+                    binding.host_path.display(),
+                    if binding.readonly { "ro" } else { "rw" },
+                    binding.limits.max_operations,
+                    binding.limits.max_read_bytes,
+                    binding.limits.max_write_bytes
+                )
+            })
+            .collect();
+        entries.sort();
+        let mut digest = Sha256::new();
+        digest.update(b"workerd-storage-policy:v1\0");
+        for entry in entries {
+            digest.update(entry.as_bytes());
+            digest.update(b"\0");
+        }
+        digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+}
+
+#[derive(Clone)]
+pub struct WorkerCapabilityPolicy {
+    fetch_broker: FetchBroker,
+    timer_limits: TimerLimits,
+    storage_policy: StoragePolicy,
+}
+
+impl WorkerCapabilityPolicy {
+    pub fn new(
+        fetch_broker: FetchBroker,
+        timer_limits: TimerLimits,
+        storage_policy: StoragePolicy,
+    ) -> Self {
+        Self {
+            fetch_broker,
+            timer_limits,
+            storage_policy,
+        }
+    }
+}
+
+impl Default for WorkerCapabilityPolicy {
+    fn default() -> Self {
+        Self::new(
+            FetchBroker::denied(),
+            TimerLimits::default(),
+            StoragePolicy::denied(),
+        )
+    }
+}
+
+fn validate_storage_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 32
+        || !name.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_lowercase() || (index != 0 && (byte.is_ascii_digit() || byte == b'-'))
+        })
+    {
+        return Err(Error::State(
+            "storage binding names must be 1-32 lowercase ASCII characters, start with a letter, and contain only letters, digits, or '-'".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_storage_limits(limits: MountLimits) -> Result<()> {
+    if [
+        limits.max_operations,
+        limits.max_read_bytes,
+        limits.max_write_bytes,
+    ]
+    .into_iter()
+    .flatten()
+    .any(|limit| limit == 0)
+    {
+        return Err(Error::State(
+            "storage limits must be nonzero when configured".into(),
+        ));
+    }
+    Ok(())
 }
 
 pub(super) struct RestoredWorkerVersionSandbox {
@@ -338,6 +557,42 @@ impl WorkerVersionSandbox {
         fetch_broker: FetchBroker,
         timer_limits: TimerLimits,
     ) -> std::result::Result<(Self, InitializationProfile), InitializationFailure> {
+        Self::initialize_profiled_with_policy(
+            bundle,
+            rootfs,
+            executor,
+            scratch_mb,
+            timeout,
+            WorkerCapabilityPolicy::new(fetch_broker, timer_limits, StoragePolicy::denied()),
+        )
+    }
+
+    pub fn initialize_with_policy(
+        bundle: WorkerBundle,
+        rootfs: impl AsRef<Path>,
+        executor: impl AsRef<Path>,
+        scratch_mb: usize,
+        timeout: Duration,
+        policy: WorkerCapabilityPolicy,
+    ) -> Result<Self> {
+        Self::initialize_profiled_with_policy(bundle, rootfs, executor, scratch_mb, timeout, policy)
+            .map(|(worker, _)| worker)
+            .map_err(|failure| Error::State(failure.to_string()))
+    }
+
+    pub fn initialize_profiled_with_policy(
+        bundle: WorkerBundle,
+        rootfs: impl AsRef<Path>,
+        executor: impl AsRef<Path>,
+        scratch_mb: usize,
+        timeout: Duration,
+        policy: WorkerCapabilityPolicy,
+    ) -> std::result::Result<(Self, InitializationProfile), InitializationFailure> {
+        let WorkerCapabilityPolicy {
+            fetch_broker,
+            timer_limits,
+            storage_policy,
+        } = policy;
         let mut profile = InitializationProfile::default();
         let timer_broker = TimerBroker::new(timer_limits)
             .map_err(|error| Self::initialization_failure("assemble", error, &profile))?;
@@ -351,11 +606,19 @@ impl WorkerVersionSandbox {
         let started = Instant::now();
         let kernel = kernel_for_rootfs(rootfs.as_ref())
             .map_err(|error| Self::initialization_failure("binding", error, &profile))?;
-        let init_json = bundle
-            .to_canonical_json()
-            .map_err(|error| Self::initialization_failure("binding", error, &profile))?;
-        let binding = SnapshotBinding::from_artifacts(&bundle, &rootfs, executor)
-            .map_err(|error| Self::initialization_failure("binding", error, &profile))?;
+        let init_json = if storage_policy.bindings().is_empty() {
+            bundle.to_canonical_json()
+        } else {
+            bundle.to_executor_init_json(storage_policy.executor_bindings())
+        }
+        .map_err(|error| Self::initialization_failure("binding", error, &profile))?;
+        let binding = SnapshotBinding::from_artifacts_with_storage(
+            &bundle,
+            &rootfs,
+            executor,
+            storage_policy.sha256(),
+        )
+        .map_err(|error| Self::initialization_failure("binding", error, &profile))?;
         profile.binding_ms = Self::elapsed_ms(started);
         let responses = Responses::default();
         let started = Instant::now();
@@ -364,7 +627,7 @@ impl WorkerVersionSandbox {
             &Some(rootfs.as_ref().into()),
             &Some("/bin/workerd-executor".into()),
             scratch_mb,
-            vec![],
+            storage_policy.mounts(),
             None,
             None,
         )
@@ -432,6 +695,7 @@ impl WorkerVersionSandbox {
                 image,
                 fetch_broker,
                 timer_broker,
+                storage_policy,
             },
             profile,
         ))
@@ -458,6 +722,7 @@ impl WorkerVersionSandbox {
             image,
             fetch_broker: FetchBroker::denied(),
             timer_broker: TimerBroker::default(),
+            storage_policy: StoragePolicy::denied(),
         }
     }
 
@@ -469,6 +734,7 @@ impl WorkerVersionSandbox {
             image,
             fetch_broker,
             timer_broker: TimerBroker::default(),
+            storage_policy: StoragePolicy::denied(),
         }
     }
 
@@ -477,10 +743,30 @@ impl WorkerVersionSandbox {
         fetch_broker: FetchBroker,
         timer_limits: TimerLimits,
     ) -> Result<Self> {
+        Self::from_verified_snapshot_with_storage(
+            image,
+            fetch_broker,
+            timer_limits,
+            StoragePolicy::denied(),
+        )
+    }
+
+    pub fn from_verified_snapshot_with_storage(
+        image: VerifiedSnapshot,
+        fetch_broker: FetchBroker,
+        timer_limits: TimerLimits,
+        storage_policy: StoragePolicy,
+    ) -> Result<Self> {
+        if image.binding().storage_policy_sha256() != storage_policy.sha256() {
+            return Err(Error::Snapshot(
+                "snapshot storage policy binding mismatch".into(),
+            ));
+        }
         Ok(Self {
             image,
             fetch_broker,
             timer_broker: TimerBroker::new(timer_limits)?,
+            storage_policy,
         })
     }
 
@@ -533,13 +819,18 @@ impl WorkerVersionSandbox {
     }
 
     pub(super) fn restore(&self) -> Result<(RestoredWorkerVersionSandbox, f64)> {
+        if self.image.binding().storage_policy_sha256() != self.storage_policy.sha256() {
+            return Err(Error::Snapshot(
+                "snapshot storage policy binding mismatch".into(),
+            ));
+        }
         let restore_started = Instant::now();
         let responses = Responses::default();
         let fetch_session = self.fetch_broker.session(Instant::now());
         let timer_session = self.timer_broker.session();
         let (sandbox, config) = crate::restore_snapshot_with(
             self.image.snapshot.clone(),
-            vec![],
+            self.storage_policy.mounts(),
             None,
             None,
             |functions| {
@@ -558,7 +849,7 @@ impl WorkerVersionSandbox {
                     config,
                     exited: None,
                     pending: None,
-                },
+                        },
                 responses,
                 fetch_session,
                 timer_session,
@@ -870,5 +1161,27 @@ mod tests {
         c.output(&format!("{}\r", response("next"))).unwrap();
         c.output("\n").unwrap();
         assert_eq!(c.finish().unwrap().request_id, "next");
+    }
+
+    #[test]
+    fn storage_policy_rejects_executor_incompatible_names_and_excess_bindings() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["Upper", "under_score", "1starts-with-digit"] {
+            assert!(
+                StorageBinding::read_only(name, root.path(), MountLimits::default()).is_err(),
+                "{name}"
+            );
+        }
+        let bindings = (0..=MAX_STORAGE_BINDINGS)
+            .map(|index| {
+                StorageBinding::read_only(
+                    format!("mount-{index}"),
+                    root.path(),
+                    MountLimits::default(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(StoragePolicy::new(bindings).is_err());
     }
 }

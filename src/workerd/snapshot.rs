@@ -11,10 +11,11 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 
-const SCHEMA_VERSION: u16 = 4;
+const SCHEMA_VERSION: u16 = 5;
 const METADATA_FILE: &str = "worker.json";
 const CAPABILITIES: &[u8] = b"stdout:ndjson-response:v1;console:bounded;stdin:denied;\
-hostfs:none;hostsock:none;fetch:hcall:v1,v2;timer:hcall:v1";
+hostfs:named-policy:v1;workerd-init:storage-v2;hostsock:none;\
+fetch:hcall:v1,v2;timer:hcall:v1";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -26,6 +27,7 @@ pub struct SnapshotBinding {
     executor_sha256: String,
     dependency_closure_sha256: String,
     capability_set_sha256: String,
+    storage_policy_sha256: String,
 }
 
 impl SnapshotBinding {
@@ -35,6 +37,20 @@ impl SnapshotBinding {
         bundle: &WorkerBundle,
         rootfs: impl AsRef<Path>,
         executor: impl AsRef<Path>,
+    ) -> Result<Self> {
+        Self::from_artifacts_with_storage(
+            bundle,
+            rootfs,
+            executor,
+            super::StoragePolicy::denied().sha256(),
+        )
+    }
+
+    pub(super) fn from_artifacts_with_storage(
+        bundle: &WorkerBundle,
+        rootfs: impl AsRef<Path>,
+        executor: impl AsRef<Path>,
+        storage_policy_sha256: String,
     ) -> Result<Self> {
         bundle.validate()?;
         let kernel = kernel_for_rootfs(rootfs.as_ref())?;
@@ -46,6 +62,7 @@ impl SnapshotBinding {
             executor_sha256: sha256_file(executor.as_ref())?,
             dependency_closure_sha256: dependency_closure_sha256(executor.as_ref())?,
             capability_set_sha256: sha256(CAPABILITIES),
+            storage_policy_sha256,
         })
     }
 
@@ -57,6 +74,10 @@ impl SnapshotBinding {
         &self.bundle_sha256
     }
 
+    pub fn storage_policy_sha256(&self) -> &str {
+        &self.storage_policy_sha256
+    }
+
     fn validate(&self) -> Result<()> {
         for digest in [
             &self.kernel_sha256,
@@ -65,6 +86,7 @@ impl SnapshotBinding {
             &self.executor_sha256,
             &self.dependency_closure_sha256,
             &self.capability_set_sha256,
+            &self.storage_policy_sha256,
         ] {
             if digest.len() != 64
                 || !digest
