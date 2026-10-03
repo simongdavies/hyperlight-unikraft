@@ -1,0 +1,5 @@
+package hyperlight:component-evaluation@0.1.0;
+
+world arithmetic {
+  export add: func(left: s32, right: s32) -> s32;
+}

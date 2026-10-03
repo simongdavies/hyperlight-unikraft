@@ -1,0 +1,91 @@
+{
+  "schemaVersion": 1,
+  "capturedAt": "2026-10-02T17:15:00+01:00",
+  "decision": "pinned-jco-sync-instantiation",
+  "nativeComponentAcceptedByV8": false,
+  "packages": {
+    "@bytecodealliance/jco@1.35.0": {
+      "bytes": 183100,
+      "sha1": "819be139fc8ad837447cdb9cbea0be1e12d926df",
+      "integrity": "sha512-O53cWIMm/M1SpwLxKRicvAMDnzWf4zWs6I6qFZIGbn3HUovDMCCe9blkGxxYuyocHjVf/cXgNmlMu/x7Tyi77A=="
+    },
+    "workerd@1.20260925.1": {
+      "bytes": 1278861,
+      "sha1": "25d0b6a90fdda322e0bdc0aea950889389e09341",
+      "integrity": "sha512-cl7Mrvhm+xEC9brMBIWIHyfYl7y5dGH3CjQog6CglWhgRwAq+/b+2gHBXNQb4hsjLXQVCuCYExJRYCjEaZmAlA=="
+    },
+    "@cloudflare/workerd-windows-64@1.20260925.1": {
+      "bytes": 34373874,
+      "sha1": "1d6f593b981ff6b935b2f92a175dece32f86f25b",
+      "integrity": "sha512-mG0JYuF6HVCgXSsNeB5os8Vtdprk5jHPysviKNNMHJSLA3Q1djFjSmK4+pnQR/zOAgzNo0HJ+Tpcz+tZj1Q7fQ=="
+    }
+  },
+  "lowering": {
+    "mode": "minified synchronous instantiation with split core Wasm",
+    "runs": 2,
+    "byteIdentical": true,
+    "artifacts": {
+      "component.js": {
+        "bytes": 45194,
+        "sha256": "58c8e472f6916ac46db7debf4baceeca261b306eed910b915e10815dab85f1d7"
+      },
+      "component.core.wasm": {
+        "bytes": 61,
+        "sha256": "fff92a091c4aaa2a13f4581e3b54af26caf1f464070319367a749603703b14b7"
+      },
+      "component.d.ts": {
+        "bytes": 1183,
+        "sha256": "1c7562d976c8409a5bf0737a6810a52055fba3e3518ebb0ab07fdf5b436fd253"
+      }
+    }
+  },
+  "size": {
+    "sourceComponentBytes": 196,
+    "generatedRuntimeBytes": 45255,
+    "overheadBytes": 45059,
+    "ratio": 230.893,
+    "absoluteOverheadGateBytes": 65536,
+    "passed": true
+  },
+  "generatedCodeScan": {
+    "eval": false,
+    "newFunction": false,
+    "dynamicImport": false,
+    "staticImports": 0,
+    "optionalDebugProcessReference": true
+  },
+  "runtime": {
+    "version": "workerd 2026-09-25",
+    "coldProcessReadyMs": {
+      "finalRun": 70.366,
+      "samples": 10,
+      "p50": 73.7862,
+      "p95": 314.3315
+    },
+    "correctness": {
+      "iterations": 1000,
+      "distinctResponseBodies": [
+        "{\"result\":42}"
+      ],
+      "passed": true
+    },
+    "requestLatencyMs": {
+      "min": 0.6284,
+      "mean": 1.1293648,
+      "p50": 0.9812,
+      "p95": 1.8189,
+      "p99": 3.8961,
+      "max": 17.528
+    },
+    "network": {
+      "ambientHttpBlocked": true,
+      "workerdDiagnostic": "connect() blocked by restrictPeers()"
+    }
+  },
+  "bundleIdentity": "e8c31bf92d36273480cc779b4244dfe12b06fc18fada3b41e97c27706d139a1f",
+  "pendingHyperlightEvidence": [
+    "snapshot load plus first named call",
+    "restore plus call distribution inside the Unikraft guest",
+    "kernel, initrd, and snapshot identity binding"
+  ]
+}

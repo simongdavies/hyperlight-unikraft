@@ -1,0 +1,53 @@
+{
+  "schemaVersion": 1,
+  "identityAlgorithm": "sha256",
+  "toolchain": {
+    "wasmTools": "1.252.0",
+    "jco": "1.35.0",
+    "preview2Shim": "0.26.0",
+    "workerd": "1.20260925.1",
+    "compatibilityDate": "2026-09-25"
+  },
+  "artifacts": {
+    "component.wasm": {
+      "bytes": 196,
+      "sha256": "13e632f65bb834419746471bbc3165b51b42dbdf2ee3793724760ea86712f405"
+    },
+    "component.wat": {
+      "bytes": 377,
+      "sha256": "cc50765956253e37d5e60db14b55bd967e063e98faa3deee2890084740bad7ad"
+    },
+    "component.wit": {
+      "bytes": 124,
+      "sha256": "7c67e3911f722830bf92ef4fc5ce71cc1f81910c4a03fd279c00e1a751e37b80"
+    },
+    "package.json": {
+      "bytes": 662,
+      "sha256": "0ebc5822de6d5282780e092ae43f48159ecce8a2f1db0a4d6f877ffa53dc78fa"
+    },
+    "policy.json": {
+      "bytes": 391,
+      "sha256": "481cb11c74c2fff902fafdbeb3f81d32a9f88fd1a90403c5d041a493449163c2"
+    },
+    "worker.mjs": {
+      "bytes": 1847,
+      "sha256": "25d1a1154914d8572d1d8b26c465e584e7fa245ea4cd8f7ee157aeff2822db6b"
+    },
+    "workerd.capnp": {
+      "bytes": 850,
+      "sha256": "d7a3623aa056fdbe7cff9631d74823acc366d14ea0aa14a9a541f167b5b6e0cd"
+    },
+    "generated/component.js": {
+      "bytes": 45194,
+      "sha256": "58c8e472f6916ac46db7debf4baceeca261b306eed910b915e10815dab85f1d7"
+    },
+    "generated/component.d.ts": {
+      "bytes": 1183,
+      "sha256": "1c7562d976c8409a5bf0737a6810a52055fba3e3518ebb0ab07fdf5b436fd253"
+    },
+    "generated/component.core.wasm": {
+      "bytes": 61,
+      "sha256": "fff92a091c4aaa2a13f4581e3b54af26caf1f464070319367a749603703b14b7"
+    }
+  }
+}
