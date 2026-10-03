@@ -35,9 +35,15 @@ pub use hyperlight_host::{HostFunctions, sandbox::snapshot::Snapshot};
 
 use tracing::{debug, info};
 
+pub mod actor;
+pub mod broker;
+pub mod broker_adapter;
+pub mod broker_runtime;
+pub mod broker_wire;
 mod errno;
 mod hostfs;
 mod hostnet;
+pub mod logical_broker;
 pub mod net_policy;
 pub mod workerd;
 
@@ -127,6 +133,15 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
+    /// A registered broker could not reset its request-scoped host state.
+    #[error("broker runtime reset failed: {0}")]
+    BrokerRuntime(#[from] broker_adapter::BrokerHostError),
+    /// Broker resources are host-side and cannot be captured in a VM snapshot.
+    #[error("cannot snapshot a sandbox while a broker runtime is registered")]
+    BrokerSnapshot,
+    /// A restore replaced guest memory but failed to re-establish host state.
+    #[error("the sandbox is unusable after a failed restore")]
+    RestorePoisoned,
     /// The hypervisor layer failed.
     #[error(transparent)]
     Hyperlight(#[from] HyperlightError),
@@ -485,6 +500,8 @@ pub(crate) struct GuestConfig {
     events: Arc<Mutex<Vec<Event>>>,
     /// What those events add up to.
     guest: Mutex<Guest>,
+    /// Optional bounded broker state, absent unless explicitly registered.
+    broker_runtime: Option<broker_runtime::BrokerRuntime>,
 }
 
 impl GuestConfig {
@@ -513,6 +530,7 @@ impl GuestConfig {
             net,
             events: Arc::new(Mutex::new(Vec::new())),
             guest: Mutex::new(Guest::default()),
+            broker_runtime: None,
         }
     }
 
@@ -723,6 +741,7 @@ impl GuestConfig {
         if let Some(net) = &self.net {
             hostnet::register(target, net)?;
         }
+        Self::register_broker_host_functions(target, self.broker_runtime.as_ref())?;
 
         Ok(())
     }
@@ -733,6 +752,34 @@ impl GuestConfig {
     /// guest has said.
     fn has_driver(&self) -> bool {
         self.guest.lock().unwrap().has_driver
+    }
+
+    fn register_broker_host_functions(
+        target: &mut impl Registerable,
+        runtime: Option<&broker_runtime::BrokerRuntime>,
+    ) -> Result<()> {
+        let Some(runtime) = runtime else {
+            return Ok(());
+        };
+        if runtime.has_network() {
+            let runtime = runtime.clone();
+            target.register_host_function(
+                broker_runtime::NETWORK_BROKER_HOST_FUNCTION,
+                move |payload: Vec<u8>| -> hyperlight_host::Result<Vec<u8>> {
+                    Ok(runtime.dispatch_network(&payload))
+                },
+            )?;
+        }
+        if runtime.has_logical() {
+            let runtime = runtime.clone();
+            target.register_host_function(
+                broker_runtime::LOGICAL_BROKER_HOST_FUNCTION,
+                move |payload: Vec<u8>| -> hyperlight_host::Result<Vec<u8>> {
+                    Ok(runtime.dispatch_logical(&payload))
+                },
+            )?;
+        }
+        Ok(())
     }
 
     /// Whether the guest is serving a named call, per what it has said.
@@ -1122,6 +1169,7 @@ pub struct SandboxBuilder {
     mounts: Vec<Mount>,
     network: Option<NetworkPolicy>,
     listen_ports: Option<ListenPorts>,
+    broker_runtime: Option<broker_runtime::BrokerRuntime>,
     env_vars: Vec<(String, String)>,
 }
 
@@ -1137,6 +1185,7 @@ impl SandboxBuilder {
             mounts: Vec::new(),
             network: None,
             listen_ports: None,
+            broker_runtime: None,
             env_vars: Vec::new(),
         }
     }
@@ -1242,6 +1291,14 @@ impl SandboxBuilder {
         self
     }
 
+    /// Register explicitly configured bounded broker host calls.
+    ///
+    /// Without this call, neither broker host function is registered.
+    pub fn broker_runtime(mut self, runtime: broker_runtime::BrokerRuntime) -> Self {
+        self.broker_runtime = Some(runtime);
+        self
+    }
+
     /// Set a guest environment variable (repeatable).
     pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.env_vars.push((key.into(), value.into()));
@@ -1264,6 +1321,7 @@ impl SandboxBuilder {
             mounts,
             network,
             listen_ports,
+            broker_runtime,
             env_vars,
         } = self;
 
@@ -1279,12 +1337,13 @@ impl SandboxBuilder {
             .collect();
         let (sandbox, cfg) = match snapshot {
             Some(snapshot) => {
-                let (sandbox, cfg) = restore_snapshot(snapshot, mounts, network, listen_ports)?;
+                let (sandbox, cfg) =
+                    restore_snapshot(snapshot, mounts, network, listen_ports, broker_runtime)?;
                 cfg.set_env_vars(&env_refs);
                 (sandbox, cfg)
             }
             None => {
-                let (usandbox, cfg) = assemble_sandbox(
+                let (mut usandbox, mut cfg) = assemble_sandbox(
                     &kernel,
                     &initrd,
                     &entry,
@@ -1292,6 +1351,14 @@ impl SandboxBuilder {
                     mounts,
                     network,
                     listen_ports,
+                )?;
+                cfg.broker_runtime = broker_runtime;
+                if let Some(runtime) = &cfg.broker_runtime {
+                    runtime.reset_for_fresh_vm()?;
+                }
+                GuestConfig::register_broker_host_functions(
+                    &mut usandbox,
+                    cfg.broker_runtime.as_ref(),
                 )?;
                 // Before the boot: the kernel fetches the environment once
                 // on its way to main(), so an entry-point program starts
@@ -1330,6 +1397,7 @@ impl SandboxBuilder {
             config: cfg,
             exited,
             pending: None,
+            restore_poisoned: false,
         };
         if restored {
             // Put the image right for this host before anyone can observe
@@ -1383,7 +1451,8 @@ impl From<String> for Exec {
 /// thread is blocked and the vCPU is halted.  Each method here enters the
 /// VM, lets the guest scheduler run until it blocks again, and returns at
 /// the next boundary.  A [`snapshot`](Self::snapshot) taken at any
-/// boundary resumes exactly there.
+/// boundary resumes exactly there unless a broker runtime is registered;
+/// broker resources are host-only and intentionally cannot be captured.
 ///
 /// Two kinds of workload:
 ///
@@ -1417,9 +1486,19 @@ pub struct AppSandbox {
     /// A terminal result produced while delivering a call, handed out by
     /// the next [`step`](Self::step).
     pending: Option<Yield>,
+    /// Guest memory was replaced but host-side restore could not complete.
+    restore_poisoned: bool,
 }
 
 impl AppSandbox {
+    fn ensure_usable(&self) -> Result<()> {
+        if self.restore_poisoned {
+            Err(Error::RestorePoisoned)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Execute code or a script file in the guest and wait for it to finish.
     ///
     /// Accepts inline code (`"print('hi')"`), a file path
@@ -1477,6 +1556,7 @@ impl AppSandbox {
     /// or [`submit`](Self::submit) there.  Also errors if the guest
     /// deadlocks ([`Error::Deadlocked`], see [`run`](Self::run)).
     pub fn join(&mut self) -> Result<i32> {
+        self.ensure_usable()?;
         if self.exited.is_none() && self.has_driver() && !self.config.call_in_flight() {
             return Err(Error::NothingToJoin);
         }
@@ -1518,6 +1598,7 @@ impl AppSandbox {
     /// driver ([`Error::NoDriver`]), or already has a call in flight
     /// ([`Error::CallInFlight`]: the kernel serves one at a time).
     pub fn submit(&mut self, exec: impl Into<Exec>) -> Result<()> {
+        self.ensure_usable()?;
         if let Some(Yield::Exited { status }) = self.exited {
             return Err(Error::GuestExited { status });
         }
@@ -1557,6 +1638,7 @@ impl AppSandbox {
     /// terminal outcome (a call in flight at snapshot time finishing, or
     /// the process exiting) is kept for the next [`step`](Self::step).
     fn resume(&mut self) -> Result<()> {
+        self.ensure_usable()?;
         let yielded = self.config.enter(&mut self.sandbox, "resume", ())?;
         match self.note(yielded) {
             Yield::Blocked { .. } => {}
@@ -1598,6 +1680,7 @@ impl AppSandbox {
     /// guest can run, however long that takes, and returns at once when
     /// nothing could ever wake it (see [`GuestConfig::can_wake`]).
     fn step_with(&mut self, timeout: Option<Duration>) -> Result<Yield> {
+        self.ensure_usable()?;
         if let Some(y) = self.pending.take() {
             return Ok(y);
         }
@@ -1630,10 +1713,15 @@ impl AppSandbox {
     /// itself.
     ///
     /// Errors with [`Error::GuestExited`] once the guest process has
-    /// exited: there is nothing left to resume.
+    /// exited: there is nothing left to resume. Returns
+    /// [`Error::BrokerSnapshot`] when a broker runtime is registered.
     pub fn snapshot(&mut self) -> Result<Arc<Snapshot>> {
+        self.ensure_usable()?;
         if let Some(Yield::Exited { status }) = self.exited {
             return Err(Error::GuestExited { status });
+        }
+        if self.config.broker_runtime.is_some() {
+            return Err(Error::BrokerSnapshot);
         }
         Ok(self.sandbox.snapshot()?)
     }
@@ -1650,16 +1738,27 @@ impl AppSandbox {
     /// guest right for this host with a `resume` entry, as
     /// [`SandboxBuilder::boot`] does.
     pub fn restore(&mut self, snapshot: Arc<Snapshot>) -> Result<()> {
+        self.ensure_usable()?;
         self.sandbox.restore(snapshot)?;
         // The host sockets belong to the guest state just discarded; the
         // restored guest re-creates the ones it holds on its resume entry.
         if let Some(net) = &self.config.net {
             net.reset();
         }
+        if let Some(runtime) = &self.config.broker_runtime
+            && let Err(error) = runtime.reset_for_fresh_vm()
+        {
+            self.restore_poisoned = true;
+            return Err(error.into());
+        }
         self.exited = None;
         self.pending = None;
         self.config.forget();
-        self.resume()
+        if let Err(error) = self.resume() {
+            self.restore_poisoned = true;
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// [`restore`](Self::restore) with the snapshot read from `dir`, where
@@ -1712,10 +1811,21 @@ fn restore_snapshot(
     mounts: Vec<Mount>,
     network: Option<NetworkPolicy>,
     listen_ports: Option<ListenPorts>,
+    broker_runtime: Option<broker_runtime::BrokerRuntime>,
 ) -> Result<(MultiUseSandbox, GuestConfig)> {
-    restore_snapshot_with(snapshot, mounts, network, listen_ports, |_| {
-        Ok::<(), Error>(())
-    })
+    let runtime_for_registration = broker_runtime.clone();
+    let (sandbox, mut config) =
+        restore_snapshot_with(snapshot, mounts, network, listen_ports, |functions| {
+            GuestConfig::register_broker_host_functions(
+                functions,
+                runtime_for_registration.as_ref(),
+            )
+        })?;
+    if let Some(runtime) = &broker_runtime {
+        runtime.reset_for_fresh_vm()?;
+    }
+    config.broker_runtime = broker_runtime;
+    Ok((sandbox, config))
 }
 
 pub(crate) fn restore_snapshot_with<E>(

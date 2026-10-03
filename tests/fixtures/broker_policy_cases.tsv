@@ -1,0 +1,6 @@
+# protocol	host	port	expected_allowed
+tls	api.example.com	443	true
+wss	events.example.com	443	true
+tcp	api.example.com	443	false
+tls	example.com	443	false
+tls	api.example.com	80	false

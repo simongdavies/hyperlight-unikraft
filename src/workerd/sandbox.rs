@@ -672,6 +672,7 @@ impl WorkerVersionSandbox {
             config,
             exited: None,
             pending: None,
+            restore_poisoned: false,
         };
         if !app.has_driver() {
             return Err(InitializationFailure {
@@ -849,7 +850,8 @@ impl WorkerVersionSandbox {
                     config,
                     exited: None,
                     pending: None,
-                        },
+                    restore_poisoned: false,
+                },
                 responses,
                 fetch_session,
                 timer_session,
