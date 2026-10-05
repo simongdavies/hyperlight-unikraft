@@ -259,6 +259,7 @@ builder_cache_key="${builder_image_id#sha256:}"
 builder_cache_root="$cache_root/bazel/builders/$builder_cache_key"
 executor_dir="$root/build-elfloader/workerd-executor"
 executor_path="$executor_dir/workerd-sandbox-executor"
+packaged_executor_path="$executor_dir/executor"
 executor_stamp="$executor_dir/build.stamp"
 expected_executor_stamp="$(
     printf 'workerd=%s\nbuilder=%s\n' "$WORKERD_COMMIT" "$builder_image_id"
@@ -267,6 +268,10 @@ mkdir -p \
     "$builder_cache_root" \
     "$cache_root/bazel/repository-cache" \
     "$executor_dir"
+if [[ ! -x "$executor_path" ]] && [[ -x "$packaged_executor_path" ]]; then
+    step "Restoring the packaged Workerd executor"
+    install -m 0755 "$packaged_executor_path" "$executor_path"
+fi
 if [[ -x "$executor_path" ]] && [[ ! -e "$executor_stamp" ]]; then
     step "Validating the existing Workerd executor"
     "$executor_path" --self-test
