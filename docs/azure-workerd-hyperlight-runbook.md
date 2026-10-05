@@ -42,22 +42,12 @@ sudo apt-get install -y docker-buildx
 Do not install Docker CE's `docker-buildx-plugin`; keep the Docker packages
 on Ubuntu's `docker.io`/`containerd` path.
 
-If a previous run fails while linking a builder tool with an undefined libc++
-symbol such as `std::__1::__hash_memory`, remove only the stale Bazel output
-and action caches, then rerun:
-
-```bash
-rm -rf \
-  "$HOME/.cache/hyperlight-workerd/bazel/output" \
-  "$HOME/.cache/hyperlight-workerd/bazel/action-cache"
-tools/setup-workerd-demo.sh --install-deps
-```
-
-The setup script namespaces new Bazel output and action caches by the exact
-builder image ID so objects built with an earlier Clang/libc++ image cannot be
-reused. Downloaded Bazel repositories remain shared across builder images.
-Before starting the expensive Workerd build, it also verifies Clang 22 and
-links a small libc++ program inside the builder.
+The setup script builds on the same Debian Trixie base used by Workerd's
+release container. It creates a matching libc++ 22 shared runtime from the
+packaged static archive for Bazel host tools, then verifies the
+`std::__1::__hash_memory` link before starting the expensive Workerd build.
+Builder-specific Bazel output and action caches are namespaced by the exact
+builder image ID; downloaded repositories remain shared.
 
 ## 2. Build
 

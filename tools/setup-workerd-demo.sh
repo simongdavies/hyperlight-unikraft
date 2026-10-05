@@ -208,14 +208,15 @@ if ! command -v wasm-tools >/dev/null ||
 fi
 
 cat >"$builder_file" <<EOF
-FROM mcr.microsoft.com/vscode/devcontainers/javascript-node:26-bookworm@sha256:4187a9d50e7a208659e9b56677ae764edb98cb6dc243f21e851aab2ca4d103ba
+FROM node:trixie
 ARG LLVM_VERSION=$LLVM_VERSION
 ARG BAZELISK_VERSION=$BAZELISK_VERSION
 ARG BAZELISK_SHA256=$BAZELISK_SHA256
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
-        ca-certificates curl gnupg lsb-release tcl; \
+        ca-certificates curl dpkg-dev git gnupg lsb-release \
+        software-properties-common tcl wget; \
     curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
         | gpg --dearmor -o /usr/share/keyrings/apt.llvm.org.gpg; \
     codename="\$(. /etc/os-release; printf '%s' "\$VERSION_CODENAME")"; \
@@ -225,9 +226,21 @@ RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
         clang-\$LLVM_VERSION lld-\$LLVM_VERSION llvm-\$LLVM_VERSION \
-        libc++-\$LLVM_VERSION-dev libc++abi-\$LLVM_VERSION-dev \
+        libc++-\$LLVM_VERSION-dev \
         libclang-rt-\$LLVM_VERSION-dev libunwind-\$LLVM_VERSION-dev \
         -o DPkg::options::=--force-overwrite; \
+    multiarch="\$(dpkg-architecture -qDEB_HOST_MULTIARCH)"; \
+    mkdir -p /opt/libcxx22; \
+    /usr/lib/llvm-\$LLVM_VERSION/bin/clang++ -shared \
+        -o /opt/libcxx22/libc++.so.1 \
+        -Wl,-soname,libc++.so.1 \
+        -Wl,--whole-archive "/usr/lib/\$multiarch/libc++.a" \
+        -Wl,--no-whole-archive \
+        -lunwind -lpthread -ldl -lm -lc; \
+    ln -s libc++.so.1 /opt/libcxx22/libc++.so; \
+    /usr/lib/llvm-\$LLVM_VERSION/bin/llvm-nm -D -C \
+        /opt/libcxx22/libc++.so.1 \
+        | grep -F 'std::__1::__hash_memory'; \
     curl -fsSL \
         "https://github.com/bazelbuild/bazelisk/releases/download/v\$BAZELISK_VERSION/bazelisk-linux-amd64" \
         -o /usr/local/bin/bazelisk; \
@@ -284,8 +297,9 @@ docker run --rm \
             "  return values[\"ok\"] == 1 ? 0 : 1;" \
             "}" >/tmp/libcxx-check.cc
         "$CXX" -std=c++20 -stdlib=libc++ -fuse-ld=lld \
+            -L/opt/libcxx22 -Wl,-rpath,/opt/libcxx22 \
             /tmp/libcxx-check.cc -o /tmp/libcxx-check
-        /tmp/libcxx-check
+        LD_LIBRARY_PATH=/opt/libcxx22 /tmp/libcxx-check
         executor=bazel-bin/src/workerd/server/workerd-sandbox-executor
         bazel --output_base=/root/.cache/bazel/builder/output \
             build //src/workerd/server:workerd-sandbox-executor \
@@ -296,7 +310,11 @@ docker run --rm \
             --disk_cache=/root/.cache/bazel/builder/action-cache \
             --repository_cache=/root/.cache/bazel/repository-cache \
             --repo_env=CC="$CC" \
-            --repo_env=CXX="$CXX"
+            --repo_env=CXX="$CXX" \
+            --host_linkopt=-L/opt/libcxx22 \
+            --host_linkopt=-Wl,-rpath,/opt/libcxx22 \
+            --action_env=LD_LIBRARY_PATH=/opt/libcxx22 \
+            --host_action_env=LD_LIBRARY_PATH=/opt/libcxx22
         "$executor" --self-test
         llvm-strip "$executor"
         install -m 0755 "$executor" /output/workerd-sandbox-executor
