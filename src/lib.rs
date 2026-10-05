@@ -38,13 +38,17 @@ use tracing::{debug, info};
 pub mod actor;
 pub mod broker;
 pub mod broker_adapter;
+pub mod broker_network;
 pub mod broker_runtime;
 pub mod broker_wire;
+pub mod data;
 mod errno;
 mod hostfs;
 mod hostnet;
 pub mod logical_broker;
 pub mod net_policy;
+pub mod wasi_p3;
+pub mod wasi_preview2;
 pub mod workerd;
 
 pub use net_policy::{AllowList, BlockList, ListenPorts, NetworkPolicy, ResolveError};

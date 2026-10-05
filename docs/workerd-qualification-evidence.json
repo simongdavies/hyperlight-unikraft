@@ -3,6 +3,11 @@
   "status": "qualified_and_locally_validated_with_preserved_repository_failures",
   "source": {
     "signed_workerd_commit": "1d7a127908d4aca098bdad2e0caf904b9f1ffe82",
+    "delivery_workerd_commit": "621cb07e7d2cf0cb0f49872129d4408f6319acef",
+    "delivery_workerd_tree": "0cd2766a74356a04055510dc327b3646677042e5",
+    "delivery_workerd_ref": "refs/heads/simongdavies-workerd-ingress-bindings",
+    "delivery_workerd_repository": "https://github.com/simongdavies/workerd.git",
+    "delivery_tree_matches_azure_qualified_tree": true,
     "executor_rootfs_sha256": "cbc6ac02d041d552e871a58c99a7c62e09969d6b8e53540692d7b03b89892bd3",
     "source_manifest_sha256": "4f2a3cba603e4f3a84747151380e6437f7f1d4aa761abf2f6277958d2e798029",
     "source_manifest_file_count": 42,
@@ -195,8 +200,8 @@
       "interactive_signing_eta_minutes_per_commit": "2-5"
     },
     "exact_workerd_pin": {
-      "state": "workerd_signed_at_1d7a127908d4aca098bdad2e0caf904b9f1ffe82_awaiting_final_signed_hyperlight_commit",
-      "eta_minutes_after_signed_commits": "30-60"
+      "state": "complete_at_621cb07e7d2cf0cb0f49872129d4408f6319acef",
+      "tree": "0cd2766a74356a04055510dc327b3646677042e5"
     },
     "final_384_mib_scaling_and_profiling_campaign": {
       "state": "blocked_on_signed_revisions_and_push_direction",

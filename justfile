@@ -383,21 +383,27 @@ build-rootfs runtime dockerfile="":
     if [ -n "{{dockerfile}}" ]; then
         # Custom Dockerfile path provided
         df="{{dockerfile}}"
-        if [ ! -f "$df" ]; then
-            echo "error: $df not found" >&2
-            exit 1
-        fi
+    elif [ "{{runtime}}" = "agent-custom" ]; then
+        # agent-custom is an example extension, not a standard driver.
+        df="{{root_dir}}/examples/agent/custom/Dockerfile"
     else
         # Standard driver lookup
         df="{{drivers_dir}}/{{runtime}}/Dockerfile"
-        if [ ! -f "$df" ]; then
-            echo "error: $df not found" >&2
+    fi
+    if [ ! -f "$df" ]; then
+        echo "error: $df not found" >&2
+        if [ "{{runtime}}" != "agent-custom" ]; then
             echo "available runtimes:" >&2
             ls -1 "{{drivers_dir}}" | while read f; do \
                 [ -d "{{drivers_dir}}/$f" ] && echo "  $f"; \
             done >&2
-            exit 1
         fi
+        exit 1
+    fi
+    if [ "{{runtime}}" = "agent-custom" ]; then
+        # The custom image extends this generated standard-runtime image.
+        just build-rootfs python-shell
+        docker image inspect hluk-python-shell-rootfs:latest >/dev/null
     fi
     image="hluk-{{runtime}}-rootfs"
     output="{{build_dir}}/{{runtime}}-rootfs.cpio"

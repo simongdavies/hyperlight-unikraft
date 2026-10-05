@@ -32,11 +32,12 @@ pub enum BrokerWireStatus {
 }
 
 /// Guest-visible result body.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BrokerWireResult {
     None,
     Opened { handle_id: u64 },
     Transferred { bytes: u64 },
+    Received { payload: Vec<u8>, binary: bool },
     Closed,
 }
 
@@ -82,8 +83,8 @@ impl BrokerWireResponse {
     }
 
     /// Typed response body.
-    pub fn result(&self) -> BrokerWireResult {
-        self.result
+    pub fn result(&self) -> &BrokerWireResult {
+        &self.result
     }
 
     /// Stable error category suitable for metrics and guest branching.
@@ -114,10 +115,40 @@ pub fn encode_request(request: &BrokerRequest) -> Result<Vec<u8>, BrokerWireErro
                 output.string(protocol)?;
             }
         }
+        BrokerOperation::StreamSend { stream_id, payload } => {
+            output.u8(7);
+            output.u64(*stream_id);
+            output.bytes(payload)?;
+        }
+        BrokerOperation::StreamReceive {
+            stream_id,
+            max_bytes,
+        } => {
+            output.u8(8);
+            output.u64(*stream_id);
+            output.u32(*max_bytes);
+        }
+        BrokerOperation::UdpOpen { endpoint } => {
+            output.u8(9);
+            output.endpoint(endpoint)?;
+        }
         BrokerOperation::UdpSend { endpoint, payload } => {
             output.u8(3);
             output.endpoint(endpoint)?;
             output.bytes(payload)?;
+        }
+        BrokerOperation::UdpSocketSend { socket_id, payload } => {
+            output.u8(10);
+            output.u64(*socket_id);
+            output.bytes(payload)?;
+        }
+        BrokerOperation::UdpReceive {
+            socket_id,
+            max_bytes,
+        } => {
+            output.u8(11);
+            output.u64(*socket_id);
+            output.u32(*max_bytes);
         }
         BrokerOperation::WebSocketOpen {
             endpoint,
@@ -141,6 +172,14 @@ pub fn encode_request(request: &BrokerRequest) -> Result<Vec<u8>, BrokerWireErro
             output.u64(*socket_id);
             output.u8(u8::from(*binary));
             output.bytes(payload)?;
+        }
+        BrokerOperation::WebSocketReceive {
+            socket_id,
+            max_bytes,
+        } => {
+            output.u8(12);
+            output.u64(*socket_id);
+            output.u32(*max_bytes);
         }
         BrokerOperation::Close { handle_id } => {
             output.u8(6);
@@ -173,9 +212,28 @@ pub fn decode_request(input: &[u8]) -> Result<BrokerRequest, BrokerWireError> {
                 .map_err(|_| BrokerWireError::InvalidField("TLS profile"))?;
             BrokerOperation::TlsConnect { endpoint, profile }
         }
+        7 => BrokerOperation::StreamSend {
+            stream_id: reader.u64()?,
+            payload: reader.bytes()?,
+        },
+        8 => BrokerOperation::StreamReceive {
+            stream_id: reader.u64()?,
+            max_bytes: reader.u32()?,
+        },
+        9 => BrokerOperation::UdpOpen {
+            endpoint: reader.endpoint()?,
+        },
         3 => BrokerOperation::UdpSend {
             endpoint: reader.endpoint()?,
             payload: reader.bytes()?,
+        },
+        10 => BrokerOperation::UdpSocketSend {
+            socket_id: reader.u64()?,
+            payload: reader.bytes()?,
+        },
+        11 => BrokerOperation::UdpReceive {
+            socket_id: reader.u64()?,
+            max_bytes: reader.u32()?,
         },
         4 => {
             let endpoint = reader.endpoint()?;
@@ -192,6 +250,10 @@ pub fn decode_request(input: &[u8]) -> Result<BrokerRequest, BrokerWireError> {
             socket_id: reader.u64()?,
             binary: reader.bool()?,
             payload: reader.bytes()?,
+        },
+        12 => BrokerOperation::WebSocketReceive {
+            socket_id: reader.u64()?,
+            max_bytes: reader.u32()?,
         },
         6 => BrokerOperation::Close {
             handle_id: reader.u64()?,
@@ -222,13 +284,18 @@ pub fn encode_response(response: &BrokerWireResponse) -> Result<Vec<u8>, BrokerW
         BrokerWireResult::None => output.u8(0),
         BrokerWireResult::Opened { handle_id } => {
             output.u8(1);
-            output.u64(handle_id);
+            output.u64(*handle_id);
         }
         BrokerWireResult::Transferred { bytes } => {
             output.u8(2);
-            output.u64(bytes);
+            output.u64(*bytes);
         }
         BrokerWireResult::Closed => output.u8(3),
+        BrokerWireResult::Received { payload, binary } => {
+            output.u8(4);
+            output.u8(u8::from(*binary));
+            output.bytes(payload)?;
+        }
     }
     output.string(response.code().unwrap_or(""))?;
     output.finish()
@@ -260,6 +327,10 @@ pub fn decode_response(input: &[u8]) -> Result<BrokerWireResponse, BrokerWireErr
             bytes: reader.u64()?,
         },
         3 => BrokerWireResult::Closed,
+        4 => BrokerWireResult::Received {
+            binary: reader.bool()?,
+            payload: reader.bytes()?,
+        },
         value => return Err(BrokerWireError::UnknownTag("response result", value)),
     };
     let code = match reader.string()? {
@@ -507,6 +578,12 @@ mod tests {
     use crate::broker::BrokerRequestId;
 
     const TCP_FIXTURE_HEX: &str = include_str!("../tests/fixtures/broker_wire_v1_tcp.hex");
+    const TCP_SEND_FIXTURE_HEX: &str =
+        include_str!("../tests/fixtures/broker_wire_v1_tcp_send.hex");
+    const UDP_OPEN_FIXTURE_HEX: &str =
+        include_str!("../tests/fixtures/broker_wire_v1_udp_open.hex");
+    const WEBSOCKET_RECEIVE_FIXTURE_HEX: &str =
+        include_str!("../tests/fixtures/broker_wire_v1_websocket_receive.hex");
 
     fn decode_hex(value: &str) -> Vec<u8> {
         let value = value.trim();
@@ -540,6 +617,51 @@ mod tests {
     }
 
     #[test]
+    fn tcp_send_fixture_fixes_v1_extension_bytes() {
+        let request = BrokerRequest::new(
+            BrokerRequestId::new("tcp-send").unwrap(),
+            BrokerOperation::StreamSend {
+                stream_id: 42,
+                payload: b"ping".to_vec(),
+            },
+        );
+        assert_eq!(
+            encode_request(&request).unwrap(),
+            decode_hex(TCP_SEND_FIXTURE_HEX)
+        );
+    }
+
+    #[test]
+    fn udp_open_fixture_fixes_v1_extension_bytes() {
+        let request = BrokerRequest::new(
+            BrokerRequestId::new("udp-open").unwrap(),
+            BrokerOperation::UdpOpen {
+                endpoint: BrokerEndpoint::new(EndpointHost::Ip("192.0.2.1".parse().unwrap()), 53)
+                    .unwrap(),
+            },
+        );
+        assert_eq!(
+            encode_request(&request).unwrap(),
+            decode_hex(UDP_OPEN_FIXTURE_HEX)
+        );
+    }
+
+    #[test]
+    fn websocket_receive_fixture_fixes_v1_extension_bytes() {
+        let request = BrokerRequest::new(
+            BrokerRequestId::new("ws-recv").unwrap(),
+            BrokerOperation::WebSocketReceive {
+                socket_id: 42,
+                max_bytes: 1024,
+            },
+        );
+        assert_eq!(
+            encode_request(&request).unwrap(),
+            decode_hex(WEBSOCKET_RECEIVE_FIXTURE_HEX)
+        );
+    }
+
+    #[test]
     fn all_request_variants_roundtrip() {
         let endpoint =
             BrokerEndpoint::new(EndpointHost::Dns("api.example.com".parse().unwrap()), 443)
@@ -559,10 +681,44 @@ mod tests {
                 },
             ),
             BrokerRequest::new(
+                BrokerRequestId::new("stream-send").unwrap(),
+                BrokerOperation::StreamSend {
+                    stream_id: 7,
+                    payload: vec![1, 2],
+                },
+            ),
+            BrokerRequest::new(
+                BrokerRequestId::new("stream-receive").unwrap(),
+                BrokerOperation::StreamReceive {
+                    stream_id: 7,
+                    max_bytes: 32,
+                },
+            ),
+            BrokerRequest::new(
                 BrokerRequestId::new("udp").unwrap(),
                 BrokerOperation::UdpSend {
                     endpoint: endpoint.clone(),
                     payload: vec![1, 2, 3],
+                },
+            ),
+            BrokerRequest::new(
+                BrokerRequestId::new("udp-open").unwrap(),
+                BrokerOperation::UdpOpen {
+                    endpoint: endpoint.clone(),
+                },
+            ),
+            BrokerRequest::new(
+                BrokerRequestId::new("udp-socket-send").unwrap(),
+                BrokerOperation::UdpSocketSend {
+                    socket_id: 7,
+                    payload: vec![1, 2, 3],
+                },
+            ),
+            BrokerRequest::new(
+                BrokerRequestId::new("udp-receive").unwrap(),
+                BrokerOperation::UdpReceive {
+                    socket_id: 7,
+                    max_bytes: 32,
                 },
             ),
             BrokerRequest::new(
@@ -579,6 +735,13 @@ mod tests {
                     socket_id: 7,
                     payload: vec![4, 5],
                     binary: true,
+                },
+            ),
+            BrokerRequest::new(
+                BrokerRequestId::new("ws-receive").unwrap(),
+                BrokerOperation::WebSocketReceive {
+                    socket_id: 7,
+                    max_bytes: 32,
                 },
             ),
             BrokerRequest::new(
@@ -609,6 +772,20 @@ mod tests {
         assert_eq!(
             decode_response(&encode_response(&response).unwrap()).unwrap(),
             response
+        );
+        let received = BrokerWireResponse::new(
+            Some(BrokerRequestId::new("stream-receive").unwrap()),
+            BrokerWireStatus::Ok,
+            BrokerWireResult::Received {
+                payload: b"pong".to_vec(),
+                binary: true,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            decode_response(&encode_response(&received).unwrap()).unwrap(),
+            received
         );
     }
 

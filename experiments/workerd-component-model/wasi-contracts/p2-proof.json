@@ -1,0 +1,60 @@
+{
+  "schemaVersion": 1,
+  "lane": "wasi-preview2-adapters",
+  "signedBaseline": "5560e071f81706488efcab86ad534e80a3a8553d",
+  "wasiRelease": {
+    "version": "0.2.12",
+    "commit": "281ba75fafcd50961ef55f9e52747afcc9b71ede"
+  },
+  "contracts": {
+    "wasi-p2-lock.json": "f4f8227f70056750a91c8ff1712138e3a5ff65dd9586042e2dedf2edd847ce28",
+    "policy-abi.json": "d4f1316d59594640688a2d8a3875fea675dc51196f36e19024d275675e273447",
+    "exclusions.json": "e43209923e1574ac7bd11f3edb1be2348ec39592e9f47d432b1a839b0bad1754",
+    "generation-and-proof.md": "31338f5b571b2b4fa9e8631f2f248f470c6cca49876a63afc60c29561399247d"
+  },
+  "lowering": {
+    "jco": "1.35.0",
+    "requiredFlags": [
+      "--minify",
+      "--instantiation",
+      "sync",
+      "--no-nodejs-compat",
+      "--no-wasi-shim",
+      "--no-namespaced-exports",
+      "--strict"
+    ],
+    "missingImportMapping": "initialization-failure"
+  },
+  "lightweightEvidence": {
+    "state": "policy-boundary-implemented-runtime-adapters-deferred",
+    "covers": [
+      "fail-closed unknown imports",
+      "fail-closed missing typed adapters",
+      "explicit capability grants",
+      "bounded in-memory io stream primitives",
+      "deterministic clock now values and insecure random",
+      "secure random quota",
+      "bounded CLI environment and stdio",
+      "terminal, UDP, listen/accept and ambient authority denial"
+    ],
+    "runtimeGaps": [
+      "pollable wait integration with existing step/yield/timer readiness",
+      "clock subscribe-instant and subscribe-duration pollables",
+      "filesystem descriptor operation and errno translation over hostfs",
+      "socket DNS/TCP connect/send/receive/close translation over BrokerRuntime",
+      "HTTP outgoing-handler request translation over FetchBroker"
+    ]
+  },
+  "kvmEvidence": {
+    "state": "pending-coordinator-heavy-build-slot",
+    "qemuInvoked": false,
+    "required": [
+      "just fmt-apply",
+      "just build",
+      "just clippy",
+      "just clippyw in Ubuntu WSL",
+      "just test",
+      "KVM component fixture execution without QEMU"
+    ]
+  }
+}

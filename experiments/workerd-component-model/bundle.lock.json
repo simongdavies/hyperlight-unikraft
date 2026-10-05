@@ -14,28 +14,28 @@
       "sha256": "13e632f65bb834419746471bbc3165b51b42dbdf2ee3793724760ea86712f405"
     },
     "component.wat": {
-      "bytes": 377,
-      "sha256": "cc50765956253e37d5e60db14b55bd967e063e98faa3deee2890084740bad7ad"
+      "bytes": 364,
+      "sha256": "50221c4c250a68922cf9d174fc7f762ad3c35ce68870eb8e899ba2441bb91032"
     },
     "component.wit": {
-      "bytes": 124,
-      "sha256": "7c67e3911f722830bf92ef4fc5ce71cc1f81910c4a03fd279c00e1a751e37b80"
+      "bytes": 119,
+      "sha256": "5be98e0e3e287f8965be5232c75c8f591cc66ab51542fcaef3e8143f0c7b3697"
     },
     "package.json": {
-      "bytes": 662,
-      "sha256": "0ebc5822de6d5282780e092ae43f48159ecce8a2f1db0a4d6f877ffa53dc78fa"
+      "bytes": 644,
+      "sha256": "1ba7620a07aceb4ba66c7f3a07e0a46e4e23b529b81dd7222ee9b8b669cf5c64"
     },
     "policy.json": {
-      "bytes": 391,
-      "sha256": "481cb11c74c2fff902fafdbeb3f81d32a9f88fd1a90403c5d041a493449163c2"
+      "bytes": 373,
+      "sha256": "2bc7a9fe1b73c1c544d3b21ad47c9768002e242992fa9f7f7bf0272f43f6f2d7"
     },
     "worker.mjs": {
-      "bytes": 1847,
-      "sha256": "25d1a1154914d8572d1d8b26c465e584e7fa245ea4cd8f7ee157aeff2822db6b"
+      "bytes": 1787,
+      "sha256": "142fa3b91f34dac128cee7ce67d445ddefb8be2eaf1ba6f8051606c3eac0ad06"
     },
     "workerd.capnp": {
-      "bytes": 850,
-      "sha256": "d7a3623aa056fdbe7cff9631d74823acc366d14ea0aa14a9a541f167b5b6e0cd"
+      "bytes": 827,
+      "sha256": "53dfb71eb6f1cc6af05d347cd1d745c84f03e58cb357e6b57e3584077f7c9f56"
     },
     "generated/component.js": {
       "bytes": 45194,

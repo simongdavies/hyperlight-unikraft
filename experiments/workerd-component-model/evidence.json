@@ -82,7 +82,16 @@
       "workerdDiagnostic": "connect() blocked by restrictPeers()"
     }
   },
-  "bundleIdentity": "e8c31bf92d36273480cc779b4244dfe12b06fc18fada3b41e97c27706d139a1f",
+  "bundleIdentity": "fbd7e3688a88e647fd0816ccffbff58dcb923e2651093dcee7812e5f70097dff",
+  "hyperlight": {
+    "canonicalWorkerBundleSha256": "13499a5b6c88e082da9f53908b655452dced3bb8bc0d181aeadf1aeb215f520b",
+    "protocolVersion": 1,
+    "wasmWireEncoding": "canonical base64",
+    "expectedHundredResponseSha256": "70f0274a7fe585abc7aca8e430ec2ba8a66d087486d20efac3647d8376ed4fa0",
+    "proofCommand": "cargo run --release --example workerd-component-proof",
+    "hardwareIndependentTests": "cargo test --test workerd_component",
+    "status": "implemented_awaiting_patched_executor_requalification"
+  },
   "pendingHyperlightEvidence": [
     "snapshot load plus first named call",
     "restore plus call distribution inside the Unikraft guest",

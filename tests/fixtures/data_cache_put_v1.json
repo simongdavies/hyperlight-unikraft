@@ -1,0 +1,1 @@
+{"version":1,"request_id":"cache-put","binding":"assets","operation":{"kind":"cache_put","key":"https://example.test/app.js","status":200,"headers":{"content-type":"application/javascript"},"body_base64":"Y29uc29sZS5sb2coMSk=","ttl_ms":60000}}

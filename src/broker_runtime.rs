@@ -1,9 +1,9 @@
 //! Runtime registration surface for raw Hyperlight broker host calls.
 
 use crate::broker::{BrokerRequestId, RequestIdentity};
-use crate::broker_adapter::{BrokerAdapter, BrokerExecutor, BrokerHostError};
+use crate::broker_adapter::{BrokerAdapter, BrokerAuditEvent, BrokerExecutor, BrokerHostError};
 use crate::broker_wire::{BrokerWireResponse, BrokerWireResult, BrokerWireStatus, encode_response};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -14,8 +14,14 @@ pub const NETWORK_BROKER_HOST_FUNCTION: &str = "__hl_broker_v1";
 /// Raw host function used by Workerd's explicit logical-service transport.
 pub const LOGICAL_BROKER_HOST_FUNCTION: &str = "WorkerdLogicalServiceV1Invoke";
 
+const MAX_NETWORK_AUDIT_EVENTS: usize = 1024;
+
 trait NetworkWireService: Send {
-    fn dispatch(&mut self, identity: &RequestIdentity, payload: &[u8]) -> Vec<u8>;
+    fn dispatch(
+        &mut self,
+        identity: &RequestIdentity,
+        payload: &[u8],
+    ) -> Result<(Vec<u8>, BrokerAuditEvent), ()>;
     fn reset_for_fresh_vm(&mut self) -> Result<(), BrokerHostError>;
 }
 
@@ -25,12 +31,16 @@ struct NetworkAdapterService<E> {
 }
 
 impl<E: BrokerExecutor + Send> NetworkWireService for NetworkAdapterService<E> {
-    fn dispatch(&mut self, identity: &RequestIdentity, payload: &[u8]) -> Vec<u8> {
+    fn dispatch(
+        &mut self,
+        identity: &RequestIdentity,
+        payload: &[u8],
+    ) -> Result<(Vec<u8>, BrokerAuditEvent), ()> {
         let elapsed = self.started.elapsed();
         self.adapter
             .handle_wire(payload, identity, elapsed)
-            .map(|output| output.response().to_vec())
-            .unwrap_or_else(|_| network_rejection(None, BrokerWireStatus::HostError, "host_error"))
+            .map(|output| (output.response().to_vec(), output.audit().clone()))
+            .map_err(|_| ())
     }
 
     fn reset_for_fresh_vm(&mut self) -> Result<(), BrokerHostError> {
@@ -105,6 +115,7 @@ pub struct BrokerRuntime {
     network: Option<Arc<Mutex<Box<dyn NetworkWireService>>>>,
     logical: Option<Arc<Mutex<Box<dyn LogicalWireService>>>>,
     logical_bindings: Arc<HashSet<String>>,
+    network_audit: Arc<Mutex<VecDeque<BrokerAuditEvent>>>,
     poisoned: Arc<AtomicBool>,
 }
 
@@ -116,6 +127,7 @@ impl BrokerRuntime {
             network: None,
             logical: None,
             logical_bindings: Arc::new(HashSet::new()),
+            network_audit: Arc::new(Mutex::new(VecDeque::new())),
             poisoned: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -195,7 +207,24 @@ impl BrokerRuntime {
             self.poisoned.store(true, Ordering::Release);
             return network_rejection(None, BrokerWireStatus::HostError, "runtime_poisoned");
         };
-        service.dispatch(identity, payload)
+        match service.dispatch(identity, payload) {
+            Ok((response, audit)) => {
+                let Ok(mut events) = self.network_audit.lock() else {
+                    self.poisoned.store(true, Ordering::Release);
+                    return network_rejection(
+                        None,
+                        BrokerWireStatus::HostError,
+                        "runtime_poisoned",
+                    );
+                };
+                if events.len() == MAX_NETWORK_AUDIT_EVENTS {
+                    events.pop_front();
+                }
+                events.push_back(audit);
+                response
+            }
+            Err(()) => network_rejection(None, BrokerWireStatus::HostError, "host_error"),
+        }
     }
 
     /// Dispatch a logical request using the captured trusted identity.
@@ -252,7 +281,21 @@ impl BrokerRuntime {
             };
             logical.reset_for_fresh_vm()?;
         }
+        let Ok(mut audit) = self.network_audit.lock() else {
+            self.poisoned.store(true, Ordering::Release);
+            return Err(BrokerHostError::new("runtime_poisoned"));
+        };
+        audit.clear();
         Ok(())
+    }
+
+    /// Drain bounded host-only network audit events in invocation order.
+    pub fn drain_network_audit(&self) -> Result<Vec<BrokerAuditEvent>, BrokerHostError> {
+        let Ok(mut events) = self.network_audit.lock() else {
+            self.poisoned.store(true, Ordering::Release);
+            return Err(BrokerHostError::new("runtime_poisoned"));
+        };
+        Ok(events.drain(..).collect())
     }
 }
 
@@ -324,6 +367,7 @@ mod tests {
             max_sockets: 1,
             max_datagrams: 1,
             max_datagram_bytes: 8,
+            max_stream_bytes: 8,
             max_messages: 1,
             max_message_bytes: 8,
             max_bytes: 8,

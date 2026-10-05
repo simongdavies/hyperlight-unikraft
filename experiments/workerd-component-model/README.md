@@ -92,6 +92,28 @@ Exact package integrity values, output hashes, and measurements are in
 | Size | Transpiled JS plus core Wasm <= 1.25x the source component size or <= 64 KiB absolute overhead, whichever is larger. **Passed via 45,059-byte absolute overhead.** |
 | Security | No WASI shim is emitted for this import-free world; generated JS contains no filesystem, process, or network imports. **Passed for the focused fixture.** |
 
+## Hyperlight proof
+
+The experiment now has a concrete Hyperlight lane rather than only a direct
+workerd process probe:
+
+1. Apply `workerd-component-hyperlight.patch` to the pinned Workerd executor
+   source and build `//src/workerd/server:workerd-sandbox-executor`.
+2. Package that executor with `examples/workerd-executor/build-rootfs.sh`.
+3. Run `cargo run --release --example workerd-component-proof`.
+
+The host keeps protocol version 1 and adds one module type, `wasm`, whose
+`source` is canonical base64. Existing text module encodings and request/
+response envelopes are unchanged. The proof loads the checked-in transpiled
+JavaScript and core Wasm, initializes and snapshots Workerd inside Hyperlight,
+then runs health, arithmetic, policy rejection, deny-all network, oversized
+request, and 100-response determinism checks through fresh restored VMs.
+
+The canonical Hyperlight bundle SHA-256 is
+`13499a5b6c88e082da9f53908b655452dced3bb8bc0d181aeadf1aeb215f520b`.
+`cargo test --test workerd_component` checks that identity, canonical ordering,
+transport fit, and invalid-Wasm rejection without requiring a hypervisor.
+
 ## Integration shape
 
 Reuse the existing lifecycle rather than adding an executor lane:
@@ -107,10 +129,10 @@ Reuse the existing lifecycle rather than adding an executor lane:
 5. Carry the canonical bundle identity beside `snapshot.hls`; reject rather
    than silently load when any identity field differs.
 
-Required dependencies are a Workerd-capable Unikraft guest image, an initrd
-assembly hook for the transpiled bundle, a small guest entrypoint mapping the
-existing named-call protocol to workerd's local service, and verified snapshot
-identity metadata. Existing hostfs and network dispatch code are not required.
+Required dependencies are the Workerd-capable Unikraft guest image and the
+patched executor. The existing named-call protocol, snapshot identity, timeout,
+restore, and deny-by-default capability paths are reused; no broker, hostfs, or
+network module is added by this proof.
 
 ## Aggressive decision target
 

@@ -262,14 +262,18 @@ impl BrokerPolicy {
 
 fn is_host_local(host: &EndpointHost) -> bool {
     match host {
-        EndpointHost::Ip(IpAddr::V4(ip)) => {
-            ip.is_loopback() || ip.is_link_local() || ip.is_unspecified()
-        }
-        EndpointHost::Ip(IpAddr::V6(ip)) => {
+        EndpointHost::Ip(ip) => is_host_local_ip(*ip),
+        EndpointHost::Dns(name) => name.as_str() == "localhost",
+    }
+}
+
+pub(crate) fn is_host_local_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_loopback() || ip.is_link_local() || ip.is_unspecified(),
+        IpAddr::V6(ip) => {
             let first = ip.segments()[0];
             ip.is_loopback() || ip.is_unspecified() || (first & 0xffc0) == 0xfe80
         }
-        EndpointHost::Dns(name) => name.as_str() == "localhost",
     }
 }
 
@@ -466,11 +470,21 @@ pub enum BrokerOperation {
         endpoint: BrokerEndpoint,
         profile: TlsProfile,
     },
+    /// Send bytes on an open TCP or TLS stream.
+    StreamSend { stream_id: u64, payload: Vec<u8> },
+    /// Receive at most `max_bytes` from an open TCP or TLS stream.
+    StreamReceive { stream_id: u64, max_bytes: u32 },
+    /// Open a connected UDP socket for one policy-authorized peer.
+    UdpOpen { endpoint: BrokerEndpoint },
     /// Send one bounded UDP datagram.
     UdpSend {
         endpoint: BrokerEndpoint,
         payload: Vec<u8>,
     },
+    /// Send one datagram through a connected UDP socket.
+    UdpSocketSend { socket_id: u64, payload: Vec<u8> },
+    /// Receive one datagram from a connected UDP socket.
+    UdpReceive { socket_id: u64, max_bytes: u32 },
     /// Open a bounded WebSocket.
     WebSocketOpen {
         endpoint: BrokerEndpoint,
@@ -483,6 +497,8 @@ pub enum BrokerOperation {
         payload: Vec<u8>,
         binary: bool,
     },
+    /// Receive one complete bounded WebSocket message.
+    WebSocketReceive { socket_id: u64, max_bytes: u32 },
     /// Close a broker-owned handle.
     Close { handle_id: u64 },
 }
@@ -586,6 +602,8 @@ pub struct BrokerLimits {
     pub max_datagrams: u64,
     /// Decoded bytes in one UDP datagram.
     pub max_datagram_bytes: u64,
+    /// Bytes in one TCP or TLS send or receive operation.
+    pub max_stream_bytes: u64,
     /// WebSocket message count over the request lifetime.
     pub max_messages: u64,
     /// Decoded bytes in one complete WebSocket message.
@@ -611,6 +629,7 @@ impl BrokerLimits {
             || self.max_sockets == 0
             || self.max_datagrams == 0
             || self.max_datagram_bytes == 0
+            || self.max_stream_bytes == 0
             || self.max_messages == 0
             || self.max_message_bytes == 0
             || self.max_bytes == 0
@@ -634,6 +653,7 @@ pub enum BudgetEvent {
     OpenSocket,
     CloseSocket,
     Datagram { bytes: u64 },
+    Stream { bytes: u64 },
     Message { bytes: u64 },
     BeginOperation,
     EndOperation,
@@ -745,6 +765,12 @@ impl BrokerBudget {
                 self.charge_bytes(bytes)?;
                 self.datagrams += 1;
             }
+            BudgetEvent::Stream { bytes } => {
+                if bytes > self.limits.max_stream_bytes {
+                    return Err(BudgetExceeded::StreamBytes);
+                }
+                self.charge_bytes(bytes)?;
+            }
             BudgetEvent::Message { bytes } => {
                 if bytes > self.limits.max_message_bytes {
                     return Err(BudgetExceeded::MessageBytes);
@@ -843,6 +869,18 @@ impl BrokerBudget {
     pub(crate) fn release_socket(&mut self) {
         self.sockets = self.sockets.saturating_sub(1);
     }
+
+    pub(crate) fn max_stream_bytes(&self) -> u64 {
+        self.limits.max_stream_bytes
+    }
+
+    pub(crate) fn max_datagram_bytes(&self) -> u64 {
+        self.limits.max_datagram_bytes
+    }
+
+    pub(crate) fn max_message_bytes(&self) -> u64 {
+        self.limits.max_message_bytes
+    }
 }
 
 fn check_increment_u32(
@@ -896,6 +934,7 @@ pub enum BudgetExceeded {
     Sockets,
     Datagrams,
     DatagramBytes,
+    StreamBytes,
     Messages,
     MessageBytes,
     Bytes,
@@ -924,6 +963,7 @@ pub enum BrokerContractError {
     InvalidIdentity { field: &'static str },
     InvalidAlpn,
     InvalidWebSocketSubprotocol,
+    InvalidReceiveLimit,
     PayloadTooLarge { actual: u64, limit: u64 },
     UnboundedOrZeroLimit,
 }
@@ -953,6 +993,7 @@ mod tests {
             max_sockets: 1,
             max_datagrams: 1,
             max_datagram_bytes: 8,
+            max_stream_bytes: 8,
             max_messages: 1,
             max_message_bytes: 8,
             max_bytes: 8,
@@ -1053,10 +1094,12 @@ mod tests {
         assert_eq!(
             (
                 budget.charge(BudgetEvent::Datagram { bytes: 9 }, Duration::ZERO),
+                budget.charge(BudgetEvent::Stream { bytes: 9 }, Duration::ZERO),
                 budget.charge(BudgetEvent::Message { bytes: 9 }, Duration::ZERO),
             ),
             (
                 Err(BudgetExceeded::DatagramBytes),
+                Err(BudgetExceeded::StreamBytes),
                 Err(BudgetExceeded::MessageBytes),
             )
         );

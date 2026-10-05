@@ -2,11 +2,88 @@
 // Copyright 2026 The Hyperlight Authors.
 mod common;
 
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpListener;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
+use std::thread;
 use std::time::{Duration, Instant};
 
-use common::{hluk_with_stdin_scratch, require_rootfs, temp_dir};
+use common::{hluk_with_stdin_scratch, host_ip, require_rootfs, temp_dir};
 use hyperlight_unikraft::{Exec, Mount, NetworkPolicy, SandboxBuilder};
+
+const HTTP_FIXTURE_BODY: &str = "hyperlight-dotnet-http-fixture";
+
+struct HttpFixture {
+    url: String,
+    request: mpsc::Receiver<String>,
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl HttpFixture {
+    fn start() -> Self {
+        let ip = host_ip();
+        let listener = TcpListener::bind((ip.as_str(), 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (request_tx, request) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let thread = thread::spawn(move || {
+            while !stop_thread.load(Ordering::Acquire) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    thread::sleep(Duration::from_millis(2));
+                    continue;
+                };
+                stream.set_nonblocking(false).unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).unwrap();
+                    if header == "\r\n" {
+                        break;
+                    }
+                }
+                request_tx.send(request_line).unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    HTTP_FIXTURE_BODY.len(),
+                    HTTP_FIXTURE_BODY,
+                )
+                .unwrap();
+                break;
+            }
+        });
+        Self {
+            url: format!("http://{ip}:{port}/dotnet-jit"),
+            request,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn assert_request(&self) {
+        let request = self
+            .request
+            .recv_timeout(Duration::from_secs(2))
+            .expect("fixture did not receive the guest HTTP request");
+        assert_eq!(request, "GET /dotnet-jit HTTP/1.1\r\n");
+    }
+}
+
+impl Drop for HttpFixture {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
 
 #[test]
 fn dotnet_jit_inline_code() {
@@ -210,20 +287,23 @@ fn dotnet_jit_threading() {
 
 #[test]
 fn dotnet_jit_http_get() {
+    let fixture = HttpFixture::start();
     let rootfs = require_rootfs("dotnet-jit");
     let mut sandbox = SandboxBuilder::from_initrd(rootfs)
         .scratch_mb(768)
         .network(NetworkPolicy::AllowAll)
         .boot()
         .unwrap();
+    sandbox.set_env_vars(&[("HLUK_HTTP_GET_URL", &fixture.url)]);
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/dotnet-jit/HttpGet.cs");
     sandbox.run(Exec::File(script)).unwrap();
     let output = sandbox.drain_output();
 
     assert!(
-        output.contains("Status: 200"),
-        "expected HttpGet.cs to get Status: 200, got: {output:?}",
+        output.contains("Status: 200") && output.contains(HTTP_FIXTURE_BODY),
+        "expected HttpGet.cs to get the fixture status and body, got: {output:?}",
     );
+    fixture.assert_request();
 }
 
 /// A worker thread that waits.  The threads in `Threads.cs` finish in
@@ -323,12 +403,16 @@ fn dotnet_jit_out_of_memory_is_an_exception() {
         .unwrap();
     sandbox
         .run(concat!(
+            "static void ExhaustManagedHeap() {\n",
             "GC.Collect();\n",
             "Console.WriteLine($\"limit={GC.GetGCMemoryInfo().TotalAvailableMemoryBytes >> 20}\");\n",
             "var keep = new System.Collections.Generic.List<byte[]>();\n",
             "try { while (true) keep.Add(new byte[1 << 20]); }\n",
             "catch (OutOfMemoryException) { Console.WriteLine($\"oom after {keep.Count}\"); }\n",
-            "keep = null; GC.Collect();\n",
+            "}\n",
+            "ExhaustManagedHeap();\n",
+            "GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();\n",
+            "Console.WriteLine(\"oom recovered\");\n",
         ))
         .unwrap();
     let out = sandbox.drain_output();
@@ -345,6 +429,7 @@ fn dotnet_jit_out_of_memory_is_an_exception() {
         out.contains("oom after"),
         "no OutOfMemoryException: {out:?}"
     );
+    assert!(out.contains("oom recovered"), "GC did not recover: {out:?}");
     sandbox.run("Console.WriteLine(\"still here\");").unwrap();
     assert!(sandbox.drain_output().contains("still here"));
 }

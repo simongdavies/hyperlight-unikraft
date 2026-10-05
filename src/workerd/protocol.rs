@@ -13,7 +13,7 @@ pub const PROTOCOL_VERSION: u16 = 1;
 pub const MAX_BODY_BYTES: usize = 32 * 1024;
 pub const MAX_ENVELOPE_BYTES: usize = 60 * 1024;
 pub const MAX_BUNDLE_SOURCE_BYTES: usize = 48 * 1024;
-pub const MAX_MODULE_SOURCE_BYTES: usize = 32 * 1024;
+pub const MAX_MODULE_SOURCE_BYTES: usize = 48 * 1024;
 pub const MAX_MODULES: usize = 32;
 pub const MAX_COMPATIBILITY_FLAGS: usize = 32;
 pub const MAX_HEADERS: usize = 64;
@@ -85,6 +85,8 @@ pub enum ModuleType {
     EsModule,
     #[serde(rename = "commonJsModule")]
     CommonJsModule,
+    #[serde(rename = "wasm")]
+    Wasm,
     #[serde(rename = "text")]
     Text,
     #[serde(rename = "json")]
@@ -98,6 +100,26 @@ pub struct WorkerModule {
     #[serde(rename = "type")]
     pub module_type: ModuleType,
     pub source: String,
+}
+
+impl WorkerModule {
+    pub fn wasm(name: impl Into<String>, bytes: &[u8]) -> Self {
+        Self {
+            name: name.into(),
+            module_type: ModuleType::Wasm,
+            source: STANDARD.encode(bytes),
+        }
+    }
+
+    fn decoded_source_len(&self) -> Result<usize> {
+        if self.module_type != ModuleType::Wasm {
+            return Ok(self.source.len());
+        }
+        STANDARD
+            .decode(&self.source)
+            .map(|bytes| bytes.len())
+            .map_err(|_| invalid("invalid Wasm module base64"))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -277,10 +299,11 @@ impl WorkerBundle {
             if index > 1 && self.modules[index - 1].name >= module.name {
                 return Err(invalid("modules are not unique and canonically ordered"));
             }
-            if module.source.len() > MAX_MODULE_SOURCE_BYTES {
+            let module_source_bytes = module.decoded_source_len()?;
+            if module_source_bytes > MAX_MODULE_SOURCE_BYTES {
                 return Err(invalid("module source exceeds size limit"));
             }
-            source_bytes += module.source.len();
+            source_bytes += module_source_bytes;
         }
         if source_bytes > MAX_BUNDLE_SOURCE_BYTES {
             return Err(invalid("aggregate module source exceeds size limit"));

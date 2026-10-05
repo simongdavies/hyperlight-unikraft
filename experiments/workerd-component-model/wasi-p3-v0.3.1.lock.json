@@ -1,0 +1,144 @@
+{
+  "schemaVersion": 1,
+  "status": "runtime-boundary-implemented-generated-bindings-deferred",
+  "authoritativeContracts": {
+    "wasiP3Lock": {
+      "path": "wasi-contracts/wasi-p3-lock.json",
+      "sha256": "afc52d6cf56e16f86d06f15cb7da801802127c7fa424b468478b1cfc74bf119c"
+    },
+    "sharedPolicySha256": "d4f1316d59594640688a2d8a3875fea675dc51196f36e19024d275675e273447",
+    "exclusionsSha256": "e43209923e1574ac7bd11f3edb1be2348ec39592e9f47d432b1a839b0bad1754",
+    "proofContractSha256": "31338f5b571b2b4fa9e8631f2f248f470c6cca49876a63afc60c29561399247d",
+    "interfaceMatrixSha256": "65027e05ad5322583e89094265bec1aafdef09028c18c3ddcc996f1bb3d674b2",
+    "contractVerifierSha256": "2bca4b4af21aa76ae2193dcd37e334b563d06f9b3df0c8f9cc8cfc50162f56a5",
+    "contractVerifierResult": "contracts-ok",
+    "complianceReviewSha256": "276ddde19a8e0c99720409533460f3a73580999e218cc948a9f5890627edf763",
+    "complianceVerifierSha256": "2bca4b4af21aa76ae2193dcd37e334b563d06f9b3df0c8f9cc8cfc50162f56a5"
+  },
+  "spec": {
+    "release": "WASI v0.3.1",
+    "releaseDate": "2026-08-11",
+    "commit": "59e48bfe3fae9bf2480eb15abd8f55999eb3b395",
+    "source": "https://github.com/WebAssembly/WASI/releases/tag/v0.3.1",
+    "excludedRelease": {
+      "version": "v0.3.2",
+      "plannedDate": "2026-10-13"
+    }
+  },
+  "packages": {
+    "wasi:cli@0.3.1": {
+      "tree": "3480769968618b69223aa9a42bd4219449d9bdbb",
+      "files": {
+        "command.wit": "10a13c60d52d7d928909289a8c9ffa2f363f0a8e",
+        "environment.wit": "fb14eee671455901197fcbf196c1511341a13a6f",
+        "exit.wit": "c412d148b4bddb8b978d779e948656bb033fa8a1",
+        "imports.wit": "488604f47dd4c87e77dbe8fbf6c5acdb04a49b80",
+        "run.wit": "10b6e49f3aedd70e2f186dc01cb0121d93976a8d",
+        "stdio.wit": "56eebe4eab11267186e23ae279c29cdeeea1791b",
+        "terminal.wit": "c37184f4c72aa50a7fac8ca6d42ce0a89bdd998f"
+      }
+    },
+    "wasi:clocks@0.3.1": {
+      "tree": "f34feb6db536c3f340ac7c965e9748da2ac966c7",
+      "files": {
+        "monotonic-clock.wit": "537177a48bc480fbaaa176d0e02bf14fd3e0db81",
+        "system-clock.wit": "119c3e17075d70cc396cea63b8c66909fbd3342e",
+        "timezone.wit": "2a443659b976e5dc605628bc817fdcb67aab1360",
+        "types.wit": "027133e4372478b93292123916eacbadbbdde8da",
+        "world.wit": "e605c0eb52dab55fd53a1e0b8b89d96a9ab12510"
+      }
+    },
+    "wasi:filesystem@0.3.1": {
+      "tree": "37a4b4d3c5186cd7bd7728369e2c4d4d7e330ccd",
+      "files": {
+        "preopens.wit": "2c225f90a8384c5b662e163c711387a4dbfe4c59",
+        "types.wit": "69ac782870f74dc8f06cfac7cc4e805f5a9c2005",
+        "world.wit": "66cbb4d7235fc0cc8496cb14ab74a8fd8fc1f63a"
+      }
+    },
+    "wasi:http@0.3.1": {
+      "tree": "b2b4dd9cf9c5430999c96b0aa0a21b6e77ea61a8",
+      "files": {
+        "types.wit": "47a6d6214c2840cd1c4ac734245f65310728cd2c",
+        "worlds.wit": "d79414d2a14f9b1d5300f0cc35f10e1e12ce585e"
+      }
+    },
+    "wasi:random@0.3.1": {
+      "tree": "e7285ca003498c9bec89055dc6b7637a431b3cc8",
+      "files": {
+        "insecure-seed.wit": "5442acb983ae7bb6ccf6f9fa8b397155a6843b0d",
+        "insecure.wit": "2332118ed59b862df2d11300d0035611b1907490",
+        "random.wit": "f16e3ff711f7f668ec28fcc431538aa18a253240",
+        "world.wit": "25d7dfdbcbea44620c47eba3e176849dd41739ab"
+      }
+    },
+    "wasi:sockets@0.3.1": {
+      "tree": "879a99461e4bd3fec3f79b818d64d73be3772fac",
+      "files": {
+        "ip-name-lookup.wit": "2cc6cea9951a691049aac1add8c9ec38c62c2d17",
+        "types.wit": "5cc743a6d7fedfb2f6e2f6a4e8180ca9eeb06c15",
+        "world.wit": "d23a53f2667ccf92ee6f98f3561f41aa2dcec710"
+      }
+    }
+  },
+  "toolchain": {
+    "rust": "1.98.0",
+    "rustTarget": "wasm32-wasip3",
+    "wasmTools": {
+      "version": "1.252.0",
+      "commit": "d66d4364c441d8b0122628509be52bd53c352a6e"
+    },
+    "witBindgen": {
+      "version": "0.62.0",
+      "commit": "c604ee01c03f50d7301984a3c920a650752cd136"
+    },
+    "cargoComponent": {
+      "version": "0.21.1",
+      "tagObject": "4148213c7eebf7aca9827e6dab87a58c39854336",
+      "commit": "e0cc637009d008fe7713300459463ce92dfccd0c"
+    },
+    "jco": {
+      "version": "1.35.0",
+      "commit": "7dd72c9fe2d795b657b16efa8061dd3fca4912d0",
+      "npmSha1": "819be139fc8ad837447cdb9cbea0be1e12d926df",
+      "integrity": "sha512-O53cWIMm/M1SpwLxKRicvAMDnzWf4zWs6I6qFZIGbn3HUovDMCCe9blkGxxYuyocHjVf/cXgNmlMu/x7Tyi77A=="
+    },
+    "preview3Shim": {
+      "installableVersion": "0.7.0",
+      "npmSha1": "e46f6a6d4aea1070a2d7ceaf5fa1d16ab1ceba56",
+      "integrity": "sha512-5bBAE1nKSIT6ZyWoyLQwV1VjJciAdgLk7hbMeO3y5mLJhrkBL9egE48x5IfvU1ubMsQsKWFrP0jle7ow0b5I6w==",
+      "unavailableUpstreamTag": {
+        "version": "0.8.1",
+        "commit": "1c32e73f6b7cd572fd7a2967a96fa0ba6f063132",
+        "npmStatus": "404-not-published"
+      },
+      "productionUse": "disabled-by---no-wasi-shim"
+    },
+    "workerd": {
+      "version": "1.20260925.1",
+      "compatibilityDate": "2026-09-25"
+    },
+    "wasmtime": {
+      "version": "49.0.2",
+      "commit": "3c8a3e79aa3188a1a12b3aebbaa097abccceac92"
+    }
+  },
+  "lowering": {
+    "jcoArguments": [
+      "--instantiation",
+      "sync",
+      "--minify",
+      "--no-nodejs-compat",
+      "--no-wasi-shim",
+      "--no-namespaced-exports",
+      "--strict"
+    ],
+    "canonicalAsyncRequirement": "future<T>, stream<T>, and async func semantics must remain asynchronous after lowering",
+    "unknownImportPolicy": "hard-initialization-error"
+  },
+  "blockers": [
+    "authoritative WIT file contents are not checked into this lane, so generated bindings are not claimed",
+    "@bytecodealliance/preview3-shim@0.8.1 is an upstream tag but is not installable from npm",
+    "wasi:http service/middleware host-binding contract is not frozen"
+  ]
+}

@@ -27,10 +27,13 @@ pub fn require_rootfs(runtime: &str) -> PathBuf {
     match rootfs(runtime) {
         Some(p) => p,
         None => {
-            panic!(
-                "{}-rootfs.cpio not found — run `just build-rootfs {}`",
-                runtime, runtime,
-            );
+            if runtime == "agent-custom" {
+                panic!(
+                    "agent-custom-rootfs.cpio not found — run \
+                     `just build-rootfs agent-custom examples/agent/custom/Dockerfile`"
+                );
+            }
+            panic!("{runtime}-rootfs.cpio not found — run `just build-rootfs {runtime}`");
         }
     }
 }

@@ -1,0 +1,1 @@
+{"version":1,"request_id":"d1-batch","binding":"database","operation":{"kind":"d1_batch","statements":[{"sql":"CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT NOT NULL)","parameters":[]},{"sql":"INSERT INTO users(id, name) VALUES (?1, ?2)","parameters":[{"type":"integer","value":1},{"type":"text","value":"Ada"}]}]}}

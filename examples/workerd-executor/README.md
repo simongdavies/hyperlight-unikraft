@@ -207,11 +207,12 @@ are sorted by `name`, and `mode` is exactly `ro` or `rw`:
 The host parses trusted JSON, rejects unknown/duplicate/invalid values, sorts
 flags, places the main ES module first, sorts remaining modules by name, and
 serializes compact canonical JSON. Types are exactly `esModule`,
-`commonJsModule`, `text`, and `json`; the main module remains an ES module.
-There are at most 32 flags and 32 modules; each module is at most 32 KiB and
-aggregate decoded source is at most 48 KiB. Module names are safe relative
-import paths. The final escaped JSON and Hyperlight FlatBuffer remain within
-the unchanged 64 KiB transport (60 KiB JSON limit).
+`commonJsModule`, `wasm`, `text`, and `json`; the main module remains an ES
+module. Wasm `source` is canonical base64 and is decoded before Workerd module
+registration. There are at most 32 flags and 32 modules; each decoded module
+and aggregate decoded/text source are at most 48 KiB. Module names are safe
+relative import paths. The final escaped JSON and Hyperlight FlatBuffer remain
+within the unchanged 64 KiB transport (60 KiB JSON limit).
 
 This replaces the old callback-pointer and JSON `/dev/hcall` ABI, which the
 v0.14 kernel does not provide. `HostPrint` transports stdout in chunks; there

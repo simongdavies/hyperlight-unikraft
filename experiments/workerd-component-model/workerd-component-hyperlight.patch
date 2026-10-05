@@ -1,0 +1,83 @@
+diff --git a/src/workerd/server/sandbox-executor/sandbox-executor.c++ b/src/workerd/server/sandbox-executor/sandbox-executor.c++
+index 9d438d9d..801d480a 100644
+--- a/src/workerd/server/sandbox-executor/sandbox-executor.c++
++++ b/src/workerd/server/sandbox-executor/sandbox-executor.c++
+@@ -25,7 +25,7 @@ constexpr size_t MAX_COMPATIBILITY_FLAG_BYTES = 64;
+ constexpr size_t MAX_COMPATIBILITY_FLAGS_BYTES = 2 * 1024;
+ constexpr size_t MAX_MODULES = 32;
+ constexpr size_t MAX_MODULE_NAME_BYTES = 256;
+-constexpr size_t MAX_MODULE_SOURCE_BYTES = 32 * 1024;
++constexpr size_t MAX_MODULE_SOURCE_BYTES = 48 * 1024;
+ constexpr size_t MAX_MODULE_SOURCES_BYTES = 48 * 1024;
+ constexpr size_t MAX_HOST_CALL_CHUNK_BYTES = 60 * 1024;
+ constexpr uint64_t MAX_HOST_OPERATION_ID = 9'007'199'254'740'991;
+@@ -100,5 +100,6 @@ bool validModuleName(kj::StringPtr value) {
+ ModuleType parseModuleType(kj::StringPtr value) {
+   if (value == "esModule"_kj) return ModuleType::ES_MODULE;
++  if (value == "wasm"_kj) return ModuleType::WASM;
+   if (value == "text"_kj) return ModuleType::TEXT;
+   if (value == "json"_kj) return ModuleType::JSON;
+   KJ_FAIL_REQUIRE("unsupported module type");
+@@ -108,6 +109,8 @@ kj::StringPtr moduleTypeName(ModuleType type) {
+   switch (type) {
+     case ModuleType::ES_MODULE:
+       return "esModule"_kj;
++    case ModuleType::WASM:
++      return "wasm"_kj;
+     case ModuleType::TEXT:
+       return "text"_kj;
+     case ModuleType::JSON:
+@@ -336,8 +339,14 @@ WorkerBundle parseWorkerBundle(kj::ArrayPtr<const char> input) {
+     auto type = parseModuleType(moduleFields[1].getValue().getString());
+     auto source = kj::str(moduleFields[2].getValue().getString());
+     KJ_REQUIRE(validModuleName(name), "invalid module name");
+-    KJ_REQUIRE(source.size() <= MAX_MODULE_SOURCE_BYTES, "module source exceeds size limit");
+-    aggregateSourceBytes += source.size();
++    size_t sourceBytes = source.size();
++    if (type == ModuleType::WASM) {
++      auto decoded = kj::decodeBase64(source);
++      KJ_REQUIRE(!decoded.hadErrors, "invalid Wasm module base64");
++      sourceBytes = decoded.size();
++    }
++    KJ_REQUIRE(sourceBytes <= MAX_MODULE_SOURCE_BYTES, "module source exceeds size limit");
++    aggregateSourceBytes += sourceBytes;
+     KJ_REQUIRE(
+         aggregateSourceBytes <= MAX_MODULE_SOURCES_BYTES, "module sources exceed size limit");
+     if (i == 0) {
+diff --git a/src/workerd/server/sandbox-executor/sandbox-runtime.c++ b/src/workerd/server/sandbox-executor/sandbox-runtime.c++
+index c364b8e7..68f059ca 100644
+--- a/src/workerd/server/sandbox-executor/sandbox-runtime.c++
++++ b/src/workerd/server/sandbox-executor/sandbox-runtime.c++
+@@ -23,6 +23,7 @@
+ #include <capnp/compat/http-over-capnp.h>
+ #include <capnp/compat/json.h>
+ #include <kj/async-io.h>
++#include <kj/encoding.h>
+
+ namespace workerd::server::sandbox_executor {
+ namespace {
+@@ -498,6 +499,12 @@ server::config::Worker::Reader buildConfig(
+       case ModuleType::ES_MODULE:
+         output.setEsModule(input.source);
+         break;
++      case ModuleType::WASM: {
++        auto decoded = kj::decodeBase64(input.source);
++        KJ_REQUIRE(!decoded.hadErrors, "invalid Wasm module base64");
++        output.setWasm(decoded);
++        break;
++      }
+       case ModuleType::TEXT:
+         output.setText(input.source);
+         break;
+diff --git a/src/workerd/server/sandbox-executor/sandbox-runtime.h b/src/workerd/server/sandbox-executor/sandbox-runtime.h
+index 23781277..5c4eeaaf 100644
+--- a/src/workerd/server/sandbox-executor/sandbox-runtime.h
++++ b/src/workerd/server/sandbox-executor/sandbox-runtime.h
+@@ -32,6 +32,7 @@ struct Response {
+
+ enum class ModuleType {
+   ES_MODULE,
++  WASM,
+   TEXT,
+   JSON,
+ };

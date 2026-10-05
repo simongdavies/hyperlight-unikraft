@@ -23,9 +23,14 @@ pub enum BrokerAuditAction {
     Decode,
     TcpConnect,
     TlsConnect,
+    StreamSend,
+    StreamReceive,
+    UdpOpen,
     UdpSend,
+    UdpReceive,
     WebSocketOpen,
     WebSocketSend,
+    WebSocketReceive,
     Close,
 }
 
@@ -192,10 +197,11 @@ impl BrokerAdapterOutput {
 }
 
 /// Successful executor result. It contains no host socket or credential object.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BrokerExecution {
     Opened { handle_id: u64 },
     Transferred { bytes: u64 },
+    Received { payload: Vec<u8>, binary: bool },
     Closed,
 }
 
@@ -248,6 +254,7 @@ pub trait BrokerExecutor {
 enum HandleKind {
     Tcp,
     Tls,
+    Udp,
     WebSocket,
 }
 
@@ -457,7 +464,14 @@ impl<E: BrokerExecutor> BrokerAdapter<E> {
             BrokerOperation::TlsConnect { endpoint, .. } => {
                 self.policy.authorize(BrokerProtocol::Tls, endpoint)
             }
-            BrokerOperation::UdpSend { endpoint, .. } => {
+            BrokerOperation::StreamSend { .. }
+            | BrokerOperation::StreamReceive { .. }
+            | BrokerOperation::UdpSocketSend { .. }
+            | BrokerOperation::UdpReceive { .. }
+            | BrokerOperation::WebSocketSend { .. }
+            | BrokerOperation::WebSocketReceive { .. }
+            | BrokerOperation::Close { .. } => Ok(()),
+            BrokerOperation::UdpOpen { endpoint } | BrokerOperation::UdpSend { endpoint, .. } => {
                 self.policy.authorize(BrokerProtocol::Udp, endpoint)
             }
             BrokerOperation::WebSocketOpen {
@@ -470,7 +484,6 @@ impl<E: BrokerExecutor> BrokerAdapter<E> {
                 },
                 endpoint,
             ),
-            BrokerOperation::WebSocketSend { .. } | BrokerOperation::Close { .. } => Ok(()),
         }
     }
 
@@ -485,6 +498,63 @@ impl<E: BrokerExecutor> BrokerAdapter<E> {
             BrokerOperation::WebSocketOpen { .. } => {
                 self.open(operation, HandleKind::WebSocket, elapsed)
             }
+            BrokerOperation::StreamSend { stream_id, payload } => {
+                if !matches!(
+                    self.handles.get(stream_id),
+                    Some(HandleKind::Tcp | HandleKind::Tls)
+                ) {
+                    return Err(AdapterRejection::Invalid("invalid_stream_handle"));
+                }
+                self.budget
+                    .charge(
+                        BudgetEvent::Stream {
+                            bytes: payload.len() as u64,
+                        },
+                        elapsed,
+                    )
+                    .map_err(AdapterRejection::Quota)?;
+                self.transfer(operation, payload.len())
+            }
+            BrokerOperation::StreamReceive {
+                stream_id,
+                max_bytes,
+            } => {
+                if !matches!(
+                    self.handles.get(stream_id),
+                    Some(HandleKind::Tcp | HandleKind::Tls)
+                ) {
+                    return Err(AdapterRejection::Invalid("invalid_stream_handle"));
+                }
+                if *max_bytes == 0 || u64::from(*max_bytes) > self.budget.max_stream_bytes() {
+                    return Err(AdapterRejection::Invalid("invalid_receive_limit"));
+                }
+                let result = self
+                    .executor
+                    .execute(operation)
+                    .map_err(AdapterRejection::Host)?;
+                let BrokerExecution::Received { payload, binary } = result else {
+                    return Err(AdapterRejection::Host(BrokerHostError::new(
+                        "invalid_executor_result",
+                    )));
+                };
+                if payload.len() > *max_bytes as usize {
+                    return Err(AdapterRejection::Host(BrokerHostError::new(
+                        "invalid_executor_result",
+                    )));
+                }
+                self.budget
+                    .charge(
+                        BudgetEvent::Stream {
+                            bytes: payload.len() as u64,
+                        },
+                        elapsed,
+                    )
+                    .map_err(AdapterRejection::Quota)?;
+                Ok(BrokerExecution::Received { payload, binary })
+            }
+            BrokerOperation::UdpOpen { .. } => {
+                self.open_socket(operation, HandleKind::Udp, elapsed)
+            }
             BrokerOperation::UdpSend { payload, .. } => {
                 self.budget
                     .charge(
@@ -495,6 +565,54 @@ impl<E: BrokerExecutor> BrokerAdapter<E> {
                     )
                     .map_err(AdapterRejection::Quota)?;
                 self.transfer(operation, payload.len())
+            }
+            BrokerOperation::UdpSocketSend { socket_id, payload } => {
+                if self.handles.get(socket_id) != Some(&HandleKind::Udp) {
+                    return Err(AdapterRejection::Invalid("invalid_udp_handle"));
+                }
+                self.budget
+                    .charge(
+                        BudgetEvent::Datagram {
+                            bytes: payload.len() as u64,
+                        },
+                        elapsed,
+                    )
+                    .map_err(AdapterRejection::Quota)?;
+                self.transfer(operation, payload.len())
+            }
+            BrokerOperation::UdpReceive {
+                socket_id,
+                max_bytes,
+            } => {
+                if self.handles.get(socket_id) != Some(&HandleKind::Udp) {
+                    return Err(AdapterRejection::Invalid("invalid_udp_handle"));
+                }
+                if *max_bytes == 0 || u64::from(*max_bytes) > self.budget.max_datagram_bytes() {
+                    return Err(AdapterRejection::Invalid("invalid_receive_limit"));
+                }
+                let result = self
+                    .executor
+                    .execute(operation)
+                    .map_err(AdapterRejection::Host)?;
+                let BrokerExecution::Received { payload, binary } = result else {
+                    return Err(AdapterRejection::Host(BrokerHostError::new(
+                        "invalid_executor_result",
+                    )));
+                };
+                if payload.len() > *max_bytes as usize {
+                    return Err(AdapterRejection::Host(BrokerHostError::new(
+                        "invalid_executor_result",
+                    )));
+                }
+                self.budget
+                    .charge(
+                        BudgetEvent::Datagram {
+                            bytes: payload.len() as u64,
+                        },
+                        elapsed,
+                    )
+                    .map_err(AdapterRejection::Quota)?;
+                Ok(BrokerExecution::Received { payload, binary })
             }
             BrokerOperation::WebSocketSend {
                 socket_id, payload, ..
@@ -512,6 +630,40 @@ impl<E: BrokerExecutor> BrokerAdapter<E> {
                     .map_err(AdapterRejection::Quota)?;
                 self.transfer(operation, payload.len())
             }
+            BrokerOperation::WebSocketReceive {
+                socket_id,
+                max_bytes,
+            } => {
+                if self.handles.get(socket_id) != Some(&HandleKind::WebSocket) {
+                    return Err(AdapterRejection::Invalid("invalid_websocket_handle"));
+                }
+                if *max_bytes == 0 || u64::from(*max_bytes) > self.budget.max_message_bytes() {
+                    return Err(AdapterRejection::Invalid("invalid_receive_limit"));
+                }
+                let result = self
+                    .executor
+                    .execute(operation)
+                    .map_err(AdapterRejection::Host)?;
+                let BrokerExecution::Received { payload, binary } = result else {
+                    return Err(AdapterRejection::Host(BrokerHostError::new(
+                        "invalid_executor_result",
+                    )));
+                };
+                if payload.len() > *max_bytes as usize {
+                    return Err(AdapterRejection::Host(BrokerHostError::new(
+                        "invalid_executor_result",
+                    )));
+                }
+                self.budget
+                    .charge(
+                        BudgetEvent::Message {
+                            bytes: payload.len() as u64,
+                        },
+                        elapsed,
+                    )
+                    .map_err(AdapterRejection::Quota)?;
+                Ok(BrokerExecution::Received { payload, binary })
+            }
             BrokerOperation::Close { handle_id } => {
                 if !self.handles.contains_key(handle_id) {
                     return Err(AdapterRejection::Invalid("invalid_handle"));
@@ -525,8 +677,12 @@ impl<E: BrokerExecutor> BrokerAdapter<E> {
                         "invalid_executor_result",
                     )));
                 }
-                self.handles.remove(handle_id);
-                self.budget.release_connection();
+                let Some(kind) = self.handles.remove(handle_id) else {
+                    return Err(AdapterRejection::Invalid("invalid_handle"));
+                };
+                if kind != HandleKind::Udp {
+                    self.budget.release_connection();
+                }
                 self.budget.release_socket();
                 Ok(result)
             }
@@ -591,6 +747,38 @@ impl<E: BrokerExecutor> BrokerAdapter<E> {
         }
     }
 
+    fn open_socket(
+        &mut self,
+        operation: &BrokerOperation,
+        kind: HandleKind,
+        elapsed: Duration,
+    ) -> Result<BrokerExecution, AdapterRejection> {
+        self.budget
+            .charge(BudgetEvent::OpenSocket, elapsed)
+            .map_err(AdapterRejection::Quota)?;
+        let result = match self.executor.execute(operation) {
+            Ok(result) => result,
+            Err(error) => {
+                self.budget.release_socket();
+                return Err(AdapterRejection::Host(error));
+            }
+        };
+        let BrokerExecution::Opened { handle_id } = result else {
+            self.budget.release_socket();
+            return Err(AdapterRejection::Host(BrokerHostError::new(
+                "invalid_executor_result",
+            )));
+        };
+        if self.handles.contains_key(&handle_id) {
+            self.poisoned = true;
+            return Err(AdapterRejection::Host(BrokerHostError::new(
+                "duplicate_handle",
+            )));
+        }
+        self.handles.insert(handle_id, kind);
+        Ok(result)
+    }
+
     fn rollback_open(&mut self, _elapsed: Duration) {
         self.budget.release_connection();
         self.budget.release_socket();
@@ -643,13 +831,21 @@ fn audit_context(operation: &BrokerOperation) -> (BrokerAuditAction, Option<Brok
         BrokerOperation::TlsConnect { endpoint, .. } => {
             (BrokerAuditAction::TlsConnect, Some(endpoint.clone()))
         }
+        BrokerOperation::StreamSend { .. } => (BrokerAuditAction::StreamSend, None),
+        BrokerOperation::StreamReceive { .. } => (BrokerAuditAction::StreamReceive, None),
+        BrokerOperation::UdpOpen { endpoint } => {
+            (BrokerAuditAction::UdpOpen, Some(endpoint.clone()))
+        }
         BrokerOperation::UdpSend { endpoint, .. } => {
             (BrokerAuditAction::UdpSend, Some(endpoint.clone()))
         }
+        BrokerOperation::UdpSocketSend { .. } => (BrokerAuditAction::UdpSend, None),
+        BrokerOperation::UdpReceive { .. } => (BrokerAuditAction::UdpReceive, None),
         BrokerOperation::WebSocketOpen { endpoint, .. } => {
             (BrokerAuditAction::WebSocketOpen, Some(endpoint.clone()))
         }
         BrokerOperation::WebSocketSend { .. } => (BrokerAuditAction::WebSocketSend, None),
+        BrokerOperation::WebSocketReceive { .. } => (BrokerAuditAction::WebSocketReceive, None),
         BrokerOperation::Close { .. } => (BrokerAuditAction::Close, None),
     }
 }
@@ -667,6 +863,7 @@ fn quota_code(exceeded: BudgetExceeded) -> &'static str {
         BudgetExceeded::Sockets => "socket_quota",
         BudgetExceeded::Datagrams => "datagram_quota",
         BudgetExceeded::DatagramBytes => "datagram_size_quota",
+        BudgetExceeded::StreamBytes => "stream_size_quota",
         BudgetExceeded::Messages => "message_quota",
         BudgetExceeded::MessageBytes => "message_size_quota",
         BudgetExceeded::Bytes => "byte_quota",
@@ -681,6 +878,9 @@ fn execution_result(result: BrokerExecution) -> BrokerWireResult {
     match result {
         BrokerExecution::Opened { handle_id } => BrokerWireResult::Opened { handle_id },
         BrokerExecution::Transferred { bytes } => BrokerWireResult::Transferred { bytes },
+        BrokerExecution::Received { payload, binary } => {
+            BrokerWireResult::Received { payload, binary }
+        }
         BrokerExecution::Closed => BrokerWireResult::Closed,
     }
 }
@@ -690,9 +890,14 @@ fn audit_action_token(action: BrokerAuditAction) -> &'static str {
         BrokerAuditAction::Decode => "decode",
         BrokerAuditAction::TcpConnect => "tcp.connect",
         BrokerAuditAction::TlsConnect => "tls.connect",
+        BrokerAuditAction::StreamSend => "stream.send",
+        BrokerAuditAction::StreamReceive => "stream.receive",
+        BrokerAuditAction::UdpOpen => "udp.open",
         BrokerAuditAction::UdpSend => "udp.send",
+        BrokerAuditAction::UdpReceive => "udp.receive",
         BrokerAuditAction::WebSocketOpen => "websocket.open",
         BrokerAuditAction::WebSocketSend => "websocket.send",
+        BrokerAuditAction::WebSocketReceive => "websocket.receive",
         BrokerAuditAction::Close => "handle.close",
     }
 }
@@ -749,6 +954,7 @@ mod tests {
             match operation {
                 BrokerOperation::TcpConnect { .. }
                 | BrokerOperation::TlsConnect { .. }
+                | BrokerOperation::UdpOpen { .. }
                 | BrokerOperation::WebSocketOpen { .. } => {
                     self.next_handle += 1;
                     Ok(BrokerExecution::Opened {
@@ -756,9 +962,27 @@ mod tests {
                     })
                 }
                 BrokerOperation::UdpSend { payload, .. }
+                | BrokerOperation::UdpSocketSend { payload, .. }
                 | BrokerOperation::WebSocketSend { payload, .. } => {
                     Ok(BrokerExecution::Transferred {
                         bytes: payload.len() as u64,
+                    })
+                }
+                BrokerOperation::StreamSend { payload, .. } => Ok(BrokerExecution::Transferred {
+                    bytes: payload.len() as u64,
+                }),
+                BrokerOperation::StreamReceive { max_bytes, .. } => Ok(BrokerExecution::Received {
+                    payload: vec![b'x'; *max_bytes as usize],
+                    binary: true,
+                }),
+                BrokerOperation::UdpReceive { max_bytes, .. } => Ok(BrokerExecution::Received {
+                    payload: vec![b'u'; *max_bytes as usize],
+                    binary: true,
+                }),
+                BrokerOperation::WebSocketReceive { max_bytes, .. } => {
+                    Ok(BrokerExecution::Received {
+                        payload: vec![b'w'; *max_bytes as usize],
+                        binary: false,
                     })
                 }
                 BrokerOperation::Close { .. } => Ok(BrokerExecution::Closed),
@@ -778,6 +1002,7 @@ mod tests {
             max_sockets: 2,
             max_datagrams: 1,
             max_datagram_bytes: 4,
+            max_stream_bytes: 4,
             max_messages: 1,
             max_message_bytes: 4,
             max_bytes: 8,
@@ -850,7 +1075,7 @@ mod tests {
             ),
             (
                 BrokerWireStatus::Ok,
-                BrokerWireResult::Opened { handle_id: 1 },
+                &BrokerWireResult::Opened { handle_id: 1 },
                 "snapshot-1",
                 BrokerAuditOutcome::Ok,
                 1,
@@ -909,7 +1134,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             decode_response(open.response()).unwrap().result(),
-            BrokerWireResult::Opened { handle_id: 1 }
+            &BrokerWireResult::Opened { handle_id: 1 }
         );
 
         let invalid = adapter
