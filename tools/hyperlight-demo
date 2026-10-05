@@ -3,6 +3,28 @@
 # Copyright 2026 The Hyperlight Authors.
 set -euo pipefail
 
+configure_user_home() {
+    local variable="$1"
+    local fallback="$2"
+    local value="${!variable:-$fallback}"
+    local probe
+
+    if ! mkdir -p "$value" 2>/dev/null ||
+        ! probe="$(mktemp "$value/.hyperlight-write-test.XXXXXX" 2>/dev/null)"; then
+        printf 'warning: %s=%s is not writable; using %s\n' \
+            "$variable" "$value" "$fallback" >&2
+        value="$fallback"
+        mkdir -p "$value"
+        probe="$(mktemp "$value/.hyperlight-write-test.XXXXXX")"
+    fi
+    rm -f -- "$probe"
+    printf -v "$variable" '%s' "$value"
+    export "$variable"
+}
+
+configure_user_home CARGO_HOME "$HOME/.cargo"
+configure_user_home RUSTUP_HOME "$HOME/.rustup"
+
 root="$(cd "$(dirname "$0")/.." && pwd)"
 output_dir="${HYPERLIGHT_DEMO_OUTPUT:-$root/demo-output}"
 demo_pid=""
@@ -17,7 +39,7 @@ if [[ -z "$go_bin" ]] && command -v go >/dev/null; then
     fi
 fi
 go_bin="${go_bin:-${GOPATH:-$HOME/go}/bin}"
-export PATH="$go_bin:$PATH"
+export PATH="$go_bin:$CARGO_HOME/bin:$PATH"
 
 demos=(
     isolation

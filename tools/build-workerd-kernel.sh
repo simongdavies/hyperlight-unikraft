@@ -22,7 +22,7 @@ git -C "$root/kernel/libs/libelf" archive HEAD |
 cp "$root/kernel/Dockerfile.build" "$build/kernel/Dockerfile.build"
 cp "$root/defconfig-workerd" "$build/defconfig-workerd"
 
-docker build -q -t hluk-kernel-builder \
+docker build --progress=plain -t hluk-kernel-builder \
     -f "$build/kernel/Dockerfile.build" "$build/kernel"
 docker run --rm \
     -v "$build/kernel:/kernel" \
