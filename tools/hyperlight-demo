@@ -8,6 +8,16 @@ output_dir="${HYPERLIGHT_DEMO_OUTPUT:-$root/demo-output}"
 demo_pid=""
 upstream_pid=""
 verbose=false
+go_bin="${GOBIN:-}"
+if [[ -z "$go_bin" ]] && command -v go >/dev/null; then
+    go_bin="$(go env GOBIN 2>/dev/null || true)"
+    if [[ -z "$go_bin" ]]; then
+        go_path="$(go env GOPATH 2>/dev/null || true)"
+        [[ -n "$go_path" ]] && go_bin="$go_path/bin"
+    fi
+fi
+go_bin="${go_bin:-${GOPATH:-$HOME/go}/bin}"
+export PATH="$go_bin:$PATH"
 
 demos=(
     isolation
@@ -329,7 +339,7 @@ require_runtime() {
             exit 2
         }
     done
-    for required in cargo curl hey jq npm python3; do
+    for required in cargo curl docker hey jq python3; do
         command -v "$required" >/dev/null || {
             echo "missing required command: $required" >&2
             exit 2
@@ -473,10 +483,12 @@ run_core_wasm() {
 }
 
 run_component() {
-    (
-        cd "$root/experiments/workerd-component-model"
-        npm test
-    )
+    docker run --rm \
+        --user "$(id -u):$(id -g)" \
+        --mount "type=bind,src=$root,dst=/repo" \
+        --workdir /repo/experiments/workerd-component-model \
+        workerd-hyperlight-builder \
+        node --test test/probe.test.mjs
     cargo +1.98.0 test --locked --test workerd_component -- --nocapture
     local worker="$root/experiments/workerd-component-model/worker.mjs"
     local generated="$root/experiments/workerd-component-model/generated/component.js"

@@ -4,7 +4,8 @@ FROM ubuntu:24.04
 
 RUN apt-get update -q && \
     apt-get install -y --no-install-recommends \
-        build-essential bison flex libncurses-dev python3 make && \
+        build-essential bison ca-certificates flex libncurses-dev make \
+        python3 wget && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /kernel
