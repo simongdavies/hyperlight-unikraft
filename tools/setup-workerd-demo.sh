@@ -4,7 +4,7 @@
 set -euo pipefail
 
 HYPERLIGHT_COMMIT=c0564669d7cc7cfd42f33d28e4a0f69261f3dca6
-WORKERD_COMMIT=621cb07e7d2cf0cb0f49872129d4408f6319acef
+WORKERD_COMMIT=9c698099ccbad54609901a2107aa12a55fe415db
 RUST_VERSION=1.98.0
 JUST_VERSION=1.58.0
 BAZELISK_VERSION=1.28.1
@@ -15,7 +15,6 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 cache_root="${XDG_CACHE_HOME:-$HOME/.cache}/hyperlight-workerd"
 workerd_dir="${WORKERD_DIR:-$cache_root/workerd}"
 install_deps=false
-export PATH="$HOME/go/bin:$HOME/.cargo/bin:$PATH"
 
 usage() {
     cat <<EOF
@@ -29,6 +28,8 @@ Options:
   -h, --help          Show this help
 
 Environment:
+  CARGO_HOME             Cargo home (must be user-writable; default: ~/.cargo)
+  RUSTUP_HOME            Rustup home (must be user-writable; default: ~/.rustup)
   CARGO_BUILD_JOBS       Cargo parallelism (default: 8)
   WORKERD_BAZEL_JOBS    Bazel parallelism (default: min(nproc, 20))
 
@@ -69,16 +70,81 @@ fail() {
     exit 1
 }
 
+configure_user_home() {
+    local variable="$1"
+    local fallback="$2"
+    local value="${!variable:-$fallback}"
+    local probe
+
+    if ! mkdir -p "$value" 2>/dev/null ||
+        ! probe="$(mktemp "$value/.hyperlight-write-test.XXXXXX" 2>/dev/null)"; then
+        if [[ "$value" == "$fallback" ]]; then
+            fail "$variable directory '$value' is not writable by the current user"
+        fi
+        printf 'warning: %s=%s is not writable; using %s\n' \
+            "$variable" "$value" "$fallback" >&2
+        value="$fallback"
+        mkdir -p "$value" ||
+            fail "could not create user-local $variable directory '$value'"
+        probe="$(mktemp "$value/.hyperlight-write-test.XXXXXX")" ||
+            fail "$variable directory '$value' is not writable by the current user"
+    fi
+    rm -f -- "$probe"
+    printf -v "$variable" '%s' "$value"
+    export "$variable"
+}
+
+installed_docker_ce_packages() {
+    local package
+
+    for package in containerd.io docker-ce docker-ce-cli \
+        docker-buildx-plugin docker-compose-plugin; do
+        if dpkg-query -W -f='${Status}' "$package" 2>/dev/null |
+            grep -q '^install ok installed$'; then
+            printf '%s\n' "$package"
+        fi
+    done
+}
+
 [[ "$(uname -s)" == Linux ]] || fail "this setup script requires Linux"
 [[ "$(uname -m)" == x86_64 ]] || fail "this setup script requires x86-64"
+((EUID != 0)) ||
+    fail "run this script as a normal user, not with sudo (it invokes sudo only for apt)"
+
+configure_user_home CARGO_HOME "$HOME/.cargo"
+configure_user_home RUSTUP_HOME "$HOME/.rustup"
+export PATH="$HOME/go/bin:$CARGO_HOME/bin:$PATH"
 
 if "$install_deps"; then
     command -v sudo >/dev/null || fail "sudo is required with --install-deps"
+    command -v apt-get >/dev/null ||
+        fail "apt-get is required with --install-deps"
+    command -v apt-cache >/dev/null ||
+        fail "apt-cache is required with --install-deps"
+    command -v dpkg-query >/dev/null ||
+        fail "dpkg-query is required with --install-deps"
+    mapfile -t docker_ce_packages < <(installed_docker_ce_packages)
+    if ((${#docker_ce_packages[@]})); then
+        printf 'error: Ubuntu docker.io/containerd conflicts with installed Docker CE packages: %s\n' \
+            "${docker_ce_packages[*]}" >&2
+        printf 'Remove them with the appropriate apt command, then rerun this script.\n' >&2
+        printf 'For example: sudo apt-get remove %s\n' \
+            "${docker_ce_packages[*]}" >&2
+        exit 1
+    fi
     step "Installing host packages"
     sudo apt-get update
-    sudo apt-get install -y \
-        binutils build-essential ca-certificates cpio curl docker.io file \
-        git golang-go jq nodejs npm patch pkg-config python3 rsync unzip
+    host_packages=(
+        binutils build-essential ca-certificates containerd cpio curl \
+        docker.io file git golang-go jq nodejs npm patch pkg-config python3 \
+        rsync unzip
+    )
+    if apt-cache show docker-buildx >/dev/null 2>&1; then
+        host_packages+=(docker-buildx)
+    else
+        printf 'warning: Ubuntu package docker-buildx is unavailable; continuing without it\n' >&2
+    fi
+    sudo apt-get install -y "${host_packages[@]}"
 fi
 
 for command in cargo curl docker file git go node npm patch python3 \
@@ -177,13 +243,24 @@ docker build \
     --file "$builder_file" \
     "$workerd_dir/.devcontainer"
 
-mkdir -p "$cache_root/bazel" "$root/build-elfloader/workerd-executor"
+builder_image_id="$(
+    docker image inspect --format '{{.Id}}' workerd-hyperlight-builder
+)"
+builder_cache_key="${builder_image_id#sha256:}"
+[[ "$builder_cache_key" =~ ^[0-9a-f]{64}$ ]] ||
+    fail "could not determine the Workerd builder image ID"
+builder_cache_root="$cache_root/bazel/builders/$builder_cache_key"
+mkdir -p \
+    "$builder_cache_root" \
+    "$cache_root/bazel/repository-cache" \
+    "$root/build-elfloader/workerd-executor"
 jobs="${WORKERD_BAZEL_JOBS:-$(nproc)}"
 ((jobs > 20)) && jobs=20
 docker run --rm \
     --env "WORKERD_BAZEL_JOBS=$jobs" \
     --mount "type=bind,src=$workerd_dir,dst=/workspace" \
-    --mount "type=bind,src=$cache_root/bazel,dst=/root/.cache/bazel" \
+    --mount "type=bind,src=$builder_cache_root,dst=/root/.cache/bazel/builder" \
+    --mount "type=bind,src=$cache_root/bazel/repository-cache,dst=/root/.cache/bazel/repository-cache" \
     --mount "type=bind,src=$root/build-elfloader/workerd-executor,dst=/output" \
     --workdir /workspace \
     workerd-hyperlight-builder \
@@ -191,14 +268,31 @@ docker run --rm \
         set -euo pipefail
         export CC=/usr/lib/llvm-22/bin/clang
         export CXX=/usr/lib/llvm-22/bin/clang++
+        clang_major="$("$CXX" --version |
+            sed -n "s/.*clang version \([0-9][0-9]*\).*/\1/p" |
+            head -n 1)"
+        [[ "$clang_major" == 22 ]] ||
+            { echo "error: expected Clang 22, found ${clang_major:-unknown}" >&2; exit 1; }
+        dpkg-query -W -f="\${binary:Package} \${Version}\n" \
+            libc++-22-dev libc++abi-22-dev libunwind-22-dev
+        printf "%s\n" \
+            "#include <string>" \
+            "#include <unordered_map>" \
+            "int main() {" \
+            "  std::unordered_map<std::string, int> values{{\"ok\", 1}};" \
+            "  return values[\"ok\"] == 1 ? 0 : 1;" \
+            "}" >/tmp/libcxx-check.cc
+        "$CXX" -std=c++20 -stdlib=libc++ -fuse-ld=lld \
+            /tmp/libcxx-check.cc -o /tmp/libcxx-check
+        /tmp/libcxx-check
         executor=bazel-bin/src/workerd/server/workerd-sandbox-executor
-        bazel --output_base=/root/.cache/bazel/output \
+        bazel --output_base=/root/.cache/bazel/builder/output \
             build //src/workerd/server:workerd-sandbox-executor \
             --config=opt \
             --strip=always \
             --//:io_backend=cxx \
             --jobs="$WORKERD_BAZEL_JOBS" \
-            --disk_cache=/root/.cache/bazel/action-cache \
+            --disk_cache=/root/.cache/bazel/builder/action-cache \
             --repository_cache=/root/.cache/bazel/repository-cache \
             --repo_env=CC="$CC" \
             --repo_env=CXX="$CXX"

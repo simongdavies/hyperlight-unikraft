@@ -104,10 +104,14 @@ workerd process probe:
 
 The host keeps protocol version 1 and adds one module type, `wasm`, whose
 `source` is canonical base64. Existing text module encodings and request/
-response envelopes are unchanged. The proof loads the checked-in transpiled
-JavaScript and core Wasm, initializes and snapshots Workerd inside Hyperlight,
-then runs health, arithmetic, policy rejection, deny-all network, oversized
-request, and 100-response determinism checks through fresh restored VMs.
+response envelopes are unchanged. The Workerd fork raises the per-text-module
+limit from 32 KiB to 48 KiB while retaining the 48 KiB aggregate limit. The
+45,194-byte generated adapter, 1,787-byte worker, and 61-byte core Wasm module
+total 47,042 bytes. The proof loads that transpiled JavaScript and core Wasm,
+initializes and snapshots Workerd inside Hyperlight, then runs health,
+arithmetic, policy rejection, deny-all network, oversized request, and
+100-response determinism checks through fresh restored VMs. Native Component
+Model loading remains unsupported.
 
 The canonical Hyperlight bundle SHA-256 is
 `13499a5b6c88e082da9f53908b655452dced3bb8bc0d181aeadf1aeb215f520b`.

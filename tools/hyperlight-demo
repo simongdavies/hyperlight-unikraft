@@ -97,7 +97,7 @@ description() {
         storage) echo "Use packaged files and named mounts while denied paths stay denied." ;;
         node) echo "Load included Node-style modules and allowed files; attempts to start processes, threads, or native add-ons remain unavailable." ;;
         core-wasm) echo "Compile and invoke packaged core Wasm inside disposable Workers." ;;
-        component) echo "Build the included Component example and show why it cannot run in this Workerd fork." ;;
+        component) echo "Build and run the WebAssembly Component example in Workerd on Hyperlight." ;;
         wasi-p2) echo "Exercise portable HTTP, streams, clock, and random-number support." ;;
         wasi-p3) echo "Exercise ordering, backpressure, deadlines, cancellation, and cleanup." ;;
         tcp-tls) echo "Workerd can open outbound TCP connections. TLS adds encryption to that connection. The host opens the connection for the temporary VM and allows only configured hostnames, IP addresses, ports, and encryption settings." ;;
@@ -123,7 +123,7 @@ action() {
         storage) echo "Read and write declared paths, then probe traversal and quota boundaries." ;;
         node) echo "Load both common JavaScript module formats and use the supported file API." ;;
         core-wasm) echo "Invoke the packaged Wasm export across disposable request VMs." ;;
-        component) echo "Build the example, compare its files, and check its generated module size." ;;
+        component) echo "Run the included WebAssembly Component example." ;;
         wasi-p2) echo "Run portable HTTP, stream, clock, random, cleanup, and denial checks." ;;
         wasi-p3) echo "Run async ordering, backpressure, deadline, cancellation, and cleanup checks." ;;
         tcp-tls) echo "Connect to a host-listed TCP and TLS destination, then try one that is not listed." ;;
@@ -149,7 +149,7 @@ takeaway() {
         storage) echo "Filesystem access remains named, bounded, and least-privileged." ;;
         node) echo "Node-style code can use included APIs and files but cannot control the host operating system." ;;
         core-wasm) echo "Core Wasm composes with the same disposable VM lifecycle." ;;
-        component) echo "The example builds; full execution is blocked by Workerd's module-size limit." ;;
+        component) echo "The WebAssembly Component example builds and runs in Workerd on Hyperlight." ;;
         wasi-p2|wasi-p3) echo "Portable interfaces remain narrow, bounded, and recoverable." ;;
         tcp-tls|udp|websocket|fetch) echo "Network access is denied by default; the host opens only listed destinations." ;;
         web-apis) echo "Common Web APIs remain useful across strict isolation boundaries." ;;
@@ -196,8 +196,7 @@ result_lines() {
             echo "RESULT: The packaged Wasm export returned the expected value in disposable VMs."
             ;;
         component)
-            echo "RESULT: The included Component example rebuilt into the expected files."
-            echo "LIMIT: Its 45,194-byte JavaScript module exceeds Workerd's 32 KiB limit."
+            echo "RESULT: The WebAssembly Component example built and ran in Workerd on Hyperlight."
             ;;
         wasi-p2)
             echo "RESULT: Typed HTTP, streams, clock, random, and resource release behaved correctly."
@@ -479,12 +478,17 @@ run_component() {
         npm test
     )
     cargo +1.98.0 test --locked --test workerd_component -- --nocapture
+    local worker="$root/experiments/workerd-component-model/worker.mjs"
     local generated="$root/experiments/workerd-component-model/generated/component.js"
-    local bytes
-    bytes="$(wc -c <"$generated")"
-    printf 'Generated Component JavaScript: %s bytes\n' "$bytes"
-    printf 'Workerd fork per-module limit: 32768 bytes\n'
-    printf 'The fixture files match; guest execution needs a separate Workerd change.\n'
+    local core_wasm="$root/experiments/workerd-component-model/generated/component.core.wasm"
+    local generated_bytes worker_bytes wasm_bytes aggregate_bytes
+    generated_bytes="$(wc -c <"$generated")"
+    worker_bytes="$(wc -c <"$worker")"
+    wasm_bytes="$(wc -c <"$core_wasm")"
+    aggregate_bytes=$((generated_bytes + worker_bytes + wasm_bytes))
+    ((generated_bytes <= 48 * 1024))
+    ((aggregate_bytes <= 48 * 1024))
+    cargo +1.98.0 run --release --locked --example workerd-component-proof
 }
 
 run_wasi_p2() {

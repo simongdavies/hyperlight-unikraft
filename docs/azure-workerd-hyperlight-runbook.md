@@ -14,8 +14,50 @@ cd hyperlight-unikraft
 test -c /dev/kvm && test -r /dev/kvm && test -w /dev/kvm
 ```
 
-Your user must be able to use `/dev/kvm` and Docker. The setup script installs
-the remaining build tools on Ubuntu or Debian.
+Your user must be able to use `/dev/kvm` and Docker. Run the setup script as
+that user, not with `sudo`; it invokes `sudo` only for apt. The script keeps
+Rustup and Cargo in writable user directories (normally `~/.rustup` and
+`~/.cargo`) and installs Ubuntu's `docker.io` and `containerd` packages.
+
+If Docker CE packages such as `containerd.io`, `docker-ce`, or
+`docker-ce-cli` are already installed, remove them before using
+`--install-deps`; they conflict with Ubuntu's `containerd` package:
+
+```bash
+sudo apt-get remove containerd.io docker-ce docker-ce-cli
+```
+
+The setup script detects this conflict before apt changes anything and reports
+the installed packages to remove.
+
+Docker may warn that its legacy builder is deprecated. That warning is
+harmless for this setup run. On Ubuntu releases that provide the distro
+package, the setup script installs it automatically; it can also be installed
+directly:
+
+```bash
+sudo apt-get install -y docker-buildx
+```
+
+Do not install Docker CE's `docker-buildx-plugin`; keep the Docker packages
+on Ubuntu's `docker.io`/`containerd` path.
+
+If a previous run fails while linking a builder tool with an undefined libc++
+symbol such as `std::__1::__hash_memory`, remove only the stale Bazel output
+and action caches, then rerun:
+
+```bash
+rm -rf \
+  "$HOME/.cache/hyperlight-workerd/bazel/output" \
+  "$HOME/.cache/hyperlight-workerd/bazel/action-cache"
+tools/setup-workerd-demo.sh --install-deps
+```
+
+The setup script namespaces new Bazel output and action caches by the exact
+builder image ID so objects built with an earlier Clang/libc++ image cannot be
+reused. Downloaded Bazel repositories remain shared across builder images.
+Before starting the expensive Workerd build, it also verifies Clang 22 and
+links a small libc++ program inside the builder.
 
 ## 2. Build
 
@@ -75,7 +117,7 @@ you want to stream it during a run.
 | `storage` | Packaged files and host folders | Packaged files and host-allowed folders work; all other host paths, read-only writes, and excess use are denied |
 | `node` | Node-style modules and files | Included modules and allowed files work; processes, worker threads, native add-ons, and other host files remain unavailable |
 | `core-wasm` | Core WebAssembly | The packaged Wasm export runs in disposable request VMs |
-| `component` | Component example | The example builds, but cannot run because its 45,194-byte JavaScript module exceeds Workerd's 32 KiB limit |
+| `component` | WebAssembly Component example | The example builds and runs in Workerd on Hyperlight |
 | `wasi-p2` | WASI Preview 2 | Portable HTTP, streams, clock, random, cleanup, and allowed-access checks pass |
 | `wasi-p3` | WASI Preview 3 | Ordering, backpressure, deadlines, cancellation, and cleanup pass |
 | `tcp-tls` | TCP and encrypted TCP connections | Network access is denied by default; destinations allowed by the host connect and everything else is blocked before a connection opens |
@@ -115,7 +157,7 @@ and cryptography.
 | Files | Packaged files, fresh temporary files, supported device files, and specific host folders granted to the Worker | Every other host path is inaccessible; temporary files are discarded with the VM |
 | Saved application data | KV, Cache, D1, and Durable Objects backed by host-kept data | Access is limited to configured services and allowed operations |
 | Request isolation | A fresh VM and fresh mutable module state for each request or event | VM-local state does not persist after the VM is destroyed |
-| Code and WebAssembly | Bundled JavaScript modules and core Wasm | `eval()`, `new Function()`, native add-ons, arbitrary host extensions, and the oversized Component fixture are unavailable |
+| Code and WebAssembly | Bundled JavaScript modules, core Wasm, and the WebAssembly Component example | `eval()`, `new Function()`, native add-ons, arbitrary host extensions, and native Component Model loading are unavailable |
 
 ### Node compatibility
 
@@ -153,7 +195,7 @@ external interfaces they use.
 | TCP and TLS | Workerd can open outbound TCP connections. TLS adds encryption to that connection. | Worker code sends the requested destination and encryption requirements to the host. The host checks them before DNS lookup or connection setup, opens an allowed socket, and relays bytes for the VM. A denied request fails before a connection opens, and the Worker never receives general host socket access. |
 | WebSockets | Workerd can create and use WebSocket connections. | Worker code requests an endpoint through the host interface. The host checks the endpoint, opens an allowed connection, relays messages, and enforces message-size and lifetime limits. Denied endpoints never connect. |
 | UDP | UDP support depends on which Workerd API is being used. | Worker code sends the destination and message to the host. The host checks the address, port, and message size before sending it and returns allowed replies to the VM. Other destinations and oversized messages are denied; the Worker never receives a general UDP socket. |
-| WASI and Components | Supports core Wasm and Worker APIs | Implements selected WASI Preview 2 and Preview 3 host interfaces. The build converts the included Component example into core Wasm and JavaScript adapter files, but that example cannot currently run because the generated JavaScript exceeds Workerd's module-size limit. |
+| WASI and Components | Supports core Wasm and Worker APIs | Implements selected WASI Preview 2 and Preview 3 host interfaces and runs the included WebAssembly Component example. |
 | Measurements | Provides its own runtime diagnostics | Shows how many VMs are ready, running, waiting, or being cleaned up, plus time spent in each step |
 
 ### Scheduled jobs and external queues
@@ -174,13 +216,10 @@ queue request, calls the host boundary, and maps the returned completion or
 retry decision back to the source service. Azure Functions and the connected
 service remain separate from this project.
 
-## Component example builds but does not run
+## WebAssembly Component example
 
-The conversion step succeeds and produces core Wasm plus a JavaScript adapter.
-Workerd must load that adapter as a module before the Component can run. The
-adapter is 45,194 bytes, but Workerd currently allows 32 KiB per module, so it
-is rejected before execution. Running the example requires either a smaller
-generated adapter or a change to Workerd's module-size limit.
+The WebAssembly Component example builds and runs in Workerd on Hyperlight.
+This demo does not add native Component Model loading.
 
 ## Compare creating VMs with using ready VMs
 
