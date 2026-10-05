@@ -165,6 +165,7 @@ git -C "$root" diff --quiet "$HYPERLIGHT_COMMIT" -- \
     ':(exclude)docs/**' \
     ':(exclude)README.md' \
     ':(exclude)examples/workerd-executor/README.md' \
+    ':(exclude)experiments/workerd-component-model/README.md' \
     ':(exclude)tools/setup-workerd-demo.sh' \
     ':(exclude)tools/hyperlight-demo' ||
     fail "runtime files differ from Hyperlight commit $HYPERLIGHT_COMMIT"
