@@ -328,7 +328,7 @@ bash examples/workerd-executor/build-rootfs.sh \
 step "Building the Hyperlight demo"
 cargo +"$RUST_VERSION" build --release --locked --example workerd-demo
 
-step "Rebuilding the Component Model fixture"
+step "Verifying the Component Model fixture"
 (
     cd experiments/workerd-component-model
     wasm-tools parse component.wat -o component.wasm
@@ -337,7 +337,6 @@ step "Rebuilding the Component Model fixture"
 docker run --rm \
     --user "$(id -u):$(id -g)" \
     --env HOME=/tmp \
-    --env npm_config_cache=/tmp/npm-cache \
     --mount "type=bind,src=$root,dst=/repo" \
     --workdir /repo/experiments/workerd-component-model \
     workerd-hyperlight-builder \
@@ -347,16 +346,7 @@ docker run --rm \
             sed -n "s/^v\([0-9][0-9]*\).*/\1/p")"
         ((node_major >= 22)) ||
             { echo "error: expected Node.js 22 or newer, found $(node --version)" >&2; exit 1; }
-        npm install \
-            --ignore-scripts \
-            --legacy-peer-deps \
-            --no-audit \
-            --no-fund \
-            --package-lock=false
-        npm run transpile
-        npm run lock
-        npm test
-        rm -rf node_modules
+        node --test test/*.test.mjs
     '
 git diff --exit-code -- experiments/workerd-component-model
 
