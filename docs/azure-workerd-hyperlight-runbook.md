@@ -47,7 +47,9 @@ release container. It creates a matching libc++ 22 shared runtime from the
 packaged static archive for Bazel host tools, then verifies the
 `std::__1::__hash_memory` link before starting the expensive Workerd build.
 Builder-specific Bazel output and action caches are namespaced by the exact
-builder image ID; downloaded repositories remain shared.
+builder image ID; downloaded repositories remain shared. A packaged executor
+that passes its self-test is stamped with the Workerd commit and builder image
+ID, so rerunning setup skips Bazel while those inputs remain unchanged.
 
 ## 2. Build
 

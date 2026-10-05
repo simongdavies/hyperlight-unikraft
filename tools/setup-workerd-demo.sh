@@ -250,7 +250,7 @@ RUN set -eux; \
 ENV PATH="/usr/lib/llvm-$LLVM_VERSION/bin:\${PATH}"
 EOF
 
-step "Building the Workerd executor"
+step "Preparing the Workerd executor builder"
 docker build \
     --tag workerd-hyperlight-builder \
     --file "$builder_file" \
@@ -263,60 +263,81 @@ builder_cache_key="${builder_image_id#sha256:}"
 [[ "$builder_cache_key" =~ ^[0-9a-f]{64}$ ]] ||
     fail "could not determine the Workerd builder image ID"
 builder_cache_root="$cache_root/bazel/builders/$builder_cache_key"
+executor_dir="$root/build-elfloader/workerd-executor"
+executor_path="$executor_dir/workerd-sandbox-executor"
+executor_stamp="$executor_dir/build.stamp"
+expected_executor_stamp="$(
+    printf 'workerd=%s\nbuilder=%s\n' "$WORKERD_COMMIT" "$builder_image_id"
+)"
 mkdir -p \
     "$builder_cache_root" \
     "$cache_root/bazel/repository-cache" \
-    "$root/build-elfloader/workerd-executor"
-jobs="${WORKERD_BAZEL_JOBS:-$(nproc)}"
-docker run --rm \
-    --env "WORKERD_BAZEL_JOBS=$jobs" \
-    --mount "type=bind,src=$workerd_dir,dst=/workspace" \
-    --mount "type=bind,src=$builder_cache_root,dst=/root/.cache/bazel/builder" \
-    --mount "type=bind,src=$cache_root/bazel/repository-cache,dst=/root/.cache/bazel/repository-cache" \
-    --mount "type=bind,src=$root/build-elfloader/workerd-executor,dst=/output" \
-    --workdir /workspace \
-    workerd-hyperlight-builder \
-    bash -c '
-        set -euo pipefail
-        export CC=/usr/lib/llvm-22/bin/clang
-        export CXX=/usr/lib/llvm-22/bin/clang++
-        clang_major="$("$CXX" --version |
-            sed -n "s/.*clang version \([0-9][0-9]*\).*/\1/p" |
-            head -n 1)"
-        [[ "$clang_major" == 22 ]] ||
-            { echo "error: expected Clang 22, found ${clang_major:-unknown}" >&2; exit 1; }
-        dpkg-query -W -f="\${binary:Package} \${Version}\n" \
-            libc++-22-dev libc++abi-22-dev libunwind-22-dev
-        printf "%s\n" \
-            "#include <string>" \
-            "#include <unordered_map>" \
-            "int main() {" \
-            "  std::unordered_map<std::string, int> values{{\"ok\", 1}};" \
-            "  return values[\"ok\"] == 1 ? 0 : 1;" \
-            "}" >/tmp/libcxx-check.cc
-        "$CXX" -std=c++20 -stdlib=libc++ -fuse-ld=lld \
-            -L/opt/libcxx22 -Wl,-rpath,/opt/libcxx22 \
-            /tmp/libcxx-check.cc -o /tmp/libcxx-check
-        LD_LIBRARY_PATH=/opt/libcxx22 /tmp/libcxx-check
-        executor=bazel-bin/src/workerd/server/workerd-sandbox-executor
-        bazel --output_base=/root/.cache/bazel/builder/output \
-            build //src/workerd/server:workerd-sandbox-executor \
-            --config=opt \
-            --strip=always \
-            --//:io_backend=cxx \
-            --jobs="$WORKERD_BAZEL_JOBS" \
-            --disk_cache=/root/.cache/bazel/builder/action-cache \
-            --repository_cache=/root/.cache/bazel/repository-cache \
-            --repo_env=CC="$CC" \
-            --repo_env=CXX="$CXX" \
-            --host_linkopt=-L/opt/libcxx22 \
-            --host_linkopt=-Wl,-rpath,/opt/libcxx22 \
-            --action_env=LD_LIBRARY_PATH=/opt/libcxx22 \
-            --host_action_env=LD_LIBRARY_PATH=/opt/libcxx22
-        "$executor" --self-test
-        llvm-strip "$executor"
-        install -m 0755 "$executor" /output/workerd-sandbox-executor
-    '
+    "$executor_dir"
+if [[ -x "$executor_path" ]] && [[ ! -e "$executor_stamp" ]]; then
+    step "Validating the existing Workerd executor"
+    "$executor_path" --self-test
+    printf '%s\n' "$expected_executor_stamp" >"$executor_stamp.tmp"
+    mv "$executor_stamp.tmp" "$executor_stamp"
+fi
+if [[ -x "$executor_path" ]] &&
+    [[ -f "$executor_stamp" ]] &&
+    [[ "$(cat "$executor_stamp")" == "$expected_executor_stamp" ]]; then
+    step "Reusing the validated Workerd executor"
+else
+    step "Building the Workerd executor"
+    jobs="${WORKERD_BAZEL_JOBS:-$(nproc)}"
+    docker run --rm \
+        --env "WORKERD_BAZEL_JOBS=$jobs" \
+        --mount "type=bind,src=$workerd_dir,dst=/workspace" \
+        --mount "type=bind,src=$builder_cache_root,dst=/root/.cache/bazel/builder" \
+        --mount "type=bind,src=$cache_root/bazel/repository-cache,dst=/root/.cache/bazel/repository-cache" \
+        --mount "type=bind,src=$executor_dir,dst=/output" \
+        --workdir /workspace \
+        workerd-hyperlight-builder \
+        bash -c '
+            set -euo pipefail
+            export CC=/usr/lib/llvm-22/bin/clang
+            export CXX=/usr/lib/llvm-22/bin/clang++
+            clang_major="$("$CXX" --version |
+                sed -n "s/.*clang version \([0-9][0-9]*\).*/\1/p" |
+                head -n 1)"
+            [[ "$clang_major" == 22 ]] ||
+                { echo "error: expected Clang 22, found ${clang_major:-unknown}" >&2; exit 1; }
+            dpkg-query -W -f="\${binary:Package} \${Version}\n" \
+                libc++-22-dev libc++abi-22-dev libunwind-22-dev
+            printf "%s\n" \
+                "#include <string>" \
+                "#include <unordered_map>" \
+                "int main() {" \
+                "  std::unordered_map<std::string, int> values{{\"ok\", 1}};" \
+                "  return values[\"ok\"] == 1 ? 0 : 1;" \
+                "}" >/tmp/libcxx-check.cc
+            "$CXX" -std=c++20 -stdlib=libc++ -fuse-ld=lld \
+                -L/opt/libcxx22 -Wl,-rpath,/opt/libcxx22 \
+                /tmp/libcxx-check.cc -o /tmp/libcxx-check
+            LD_LIBRARY_PATH=/opt/libcxx22 /tmp/libcxx-check
+            executor=bazel-bin/src/workerd/server/workerd-sandbox-executor
+            bazel --output_base=/root/.cache/bazel/builder/output \
+                build //src/workerd/server:workerd-sandbox-executor \
+                --config=opt \
+                --strip=always \
+                --//:io_backend=cxx \
+                --jobs="$WORKERD_BAZEL_JOBS" \
+                --disk_cache=/root/.cache/bazel/builder/action-cache \
+                --repository_cache=/root/.cache/bazel/repository-cache \
+                --repo_env=CC="$CC" \
+                --repo_env=CXX="$CXX" \
+                --host_linkopt=-L/opt/libcxx22 \
+                --host_linkopt=-Wl,-rpath,/opt/libcxx22 \
+                --action_env=LD_LIBRARY_PATH=/opt/libcxx22 \
+                --host_action_env=LD_LIBRARY_PATH=/opt/libcxx22
+            "$executor" --self-test
+            llvm-strip "$executor"
+            install -m 0755 "$executor" /output/workerd-sandbox-executor
+        '
+    printf '%s\n' "$expected_executor_stamp" >"$executor_stamp.tmp"
+    mv "$executor_stamp.tmp" "$executor_stamp"
+fi
 
 step "Building the Workerd guest kernel and root filesystem"
 cd "$root"
