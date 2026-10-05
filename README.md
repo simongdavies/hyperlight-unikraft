@@ -48,7 +48,7 @@ Guest scripts under `examples/` run with `hluk run` (or `just run <runtime> <scr
 - **HTTP servers** — `examples/http-server/{flask,express,kestrel}/` also show how to build a custom guest image on top of hluk's base runtime rootfs images (Python, Node, .NET AOT); see e.g., [`examples/http-server/flask/Dockerfile`](examples/http-server/flask/Dockerfile).
 - **Concurrency** — `examples/python/threading_demo.py` and `examples/python/subprocess_demo.py` exercise guest threads and subprocesses.
 - **Agents** — `examples/agent-framework/` runs a Microsoft Agent Framework agent with fully offline llama.cpp inference (`local.py`) or a remote model call (`remote.py`).
-- **Workerd on Hyperlight** — [`docs/workerd-hyperlight-runbook.md`](docs/workerd-hyperlight-runbook.md) is a standalone Linux/KVM clone-and-run walkthrough for building the signed public Workerd and Hyperlight sources and serving a Worker in fresh micro-VMs.
+- **Workerd on Hyperlight** — [`docs/azure-workerd-hyperlight-runbook.md`](docs/azure-workerd-hyperlight-runbook.md) is a standalone Linux/KVM clone-and-run walkthrough with guided, individually runnable feature and performance demos.
 
 Larger, self-contained demos live under `demos/`, each with its own `Justfile` and `README.md` (Linux):
 

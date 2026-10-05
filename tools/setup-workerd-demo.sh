@@ -100,7 +100,8 @@ git -C "$root" diff --quiet "$HYPERLIGHT_COMMIT" -- \
     ':(exclude)docs/**' \
     ':(exclude)README.md' \
     ':(exclude)examples/workerd-executor/README.md' \
-    ':(exclude)tools/setup-workerd-demo.sh' ||
+    ':(exclude)tools/setup-workerd-demo.sh' \
+    ':(exclude)tools/hyperlight-demo' ||
     fail "runtime files differ from signed Hyperlight commit $HYPERLIGHT_COMMIT"
 git -C "$root" submodule update --init --recursive
 
@@ -262,5 +263,5 @@ Packaged executor:
   $root/build-elfloader/workerd-executor/executor
 
 Next:
-  docs/workerd-hyperlight-runbook.md
+  docs/azure-workerd-hyperlight-runbook.md
 EOF

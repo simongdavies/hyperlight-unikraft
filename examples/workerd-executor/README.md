@@ -10,8 +10,8 @@ general-purpose kernel contains those drivers, but the wrapper registers no
 storage or network policy.
 
 For a standalone Linux/KVM walkthrough that builds the signed public sources,
-packages the executor, and starts the HTTP bridge, see
-[`docs/workerd-hyperlight-runbook.md`](../../docs/workerd-hyperlight-runbook.md).
+packages the executor, and runs the guided feature demos, see
+[`docs/azure-workerd-hyperlight-runbook.md`](../../docs/azure-workerd-hyperlight-runbook.md).
 Pinned package tarballs and deterministic assertions for the representative
 Node compatibility workloads are recorded in
 [`workerd-node-workload-pins.json`](workerd-node-workload-pins.json) and

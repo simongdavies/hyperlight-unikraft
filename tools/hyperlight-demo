@@ -1,0 +1,818 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 The Hyperlight Authors.
+set -euo pipefail
+
+root="$(cd "$(dirname "$0")/.." && pwd)"
+output_dir="${HYPERLIGHT_DEMO_OUTPUT:-$root/demo-output}"
+demo_pid=""
+upstream_pid=""
+verbose=false
+
+demos=(
+    isolation
+    policy
+    ingress
+    kv
+    cache
+    d1
+    durable-objects
+    storage
+    node
+    core-wasm
+    component
+    wasi-p2
+    wasi-p3
+    tcp-tls
+    udp
+    websocket
+    web-apis
+    fetch
+    benchmark-on-demand
+    benchmark-prewarmed
+)
+
+usage() {
+    cat <<'EOF'
+Run the guided Workerd-on-Hyperlight feature demos.
+
+Usage:
+  tools/hyperlight-demo [--output-dir DIR] [--verbose] [--all]
+  tools/hyperlight-demo [--output-dir DIR] [--verbose] --demo NAME
+  tools/hyperlight-demo --list
+  tools/hyperlight-demo --preview
+  tools/hyperlight-demo --describe NAME
+  tools/hyperlight-demo --help
+
+With no selection, the runner presents each demo interactively. Logs and
+ordinary demo output are written below demo-output/ by default.
+
+Options:
+  --all             Run every demo without presenter pauses
+  --demo NAME       Run one named demo
+  --list            Show the formatted feature menu
+  --preview         Render the complete presenter narration without running
+  --describe NAME   Render one demo's narration without running
+  --output-dir DIR  Override the output directory
+  --verbose         Stream raw command output as well as saving it
+  -h, --help        Show this help
+EOF
+}
+
+title() {
+    case "$1" in
+        isolation) echo "Disposable isolation and timeout recovery" ;;
+        policy) echo "Who is running, permissions, and usage limits" ;;
+        ingress) echo "Scheduled events and message batches" ;;
+        kv) echo "KV persistence" ;;
+        cache) echo "Cache persistence" ;;
+        d1) echo "D1 / SQL transactions" ;;
+        durable-objects) echo "Durable Objects keep separate state" ;;
+        storage) echo "Virtual filesystems and named storage" ;;
+        node) echo "Node-style modules and file access" ;;
+        core-wasm) echo "Core WebAssembly" ;;
+        component) echo "Component Model fixture" ;;
+        wasi-p2) echo "WASI Preview 2 portability" ;;
+        wasi-p3) echo "WASI Preview 3 async streaming" ;;
+        tcp-tls) echo "Controlled TCP and TLS connections" ;;
+        udp) echo "Controlled UDP messages" ;;
+        websocket) echo "Controlled WebSocket connections" ;;
+        web-apis) echo "WinterTC and common Web APIs" ;;
+        fetch) echo "Constrained outbound fetch" ;;
+        benchmark-on-demand) echo "On-demand latency and throughput" ;;
+        benchmark-prewarmed) echo "Prewarmed latency and throughput" ;;
+        *) return 1 ;;
+    esac
+}
+
+description() {
+    case "$1" in
+        isolation) echo "Force a timeout, then prove the next request succeeds in a fresh VM." ;;
+        policy) echo "The host knows which Worker is running and applies that Worker's permissions and usage limits. The Worker cannot change those rules itself." ;;
+        ingress) echo "A host can pass a scheduled event or message batch into a temporary VM and receive completion, acknowledge, or retry decisions. No scheduler or external queue service is connected." ;;
+        kv) echo "Store a key and value outside the temporary VM, then read it after the VM is replaced." ;;
+        cache) echo "Cache a response outside the temporary VM, then read it after the VM is replaced." ;;
+        d1) echo "Commit a group of SQL changes together and keep them after the VM is replaced." ;;
+        durable-objects) echo "Keep each Durable Object's data separate and available after VM replacement." ;;
+        storage) echo "Use packaged files and named mounts while denied paths stay denied." ;;
+        node) echo "Use supported Node-style modules and files without opening the whole host machine." ;;
+        core-wasm) echo "Compile and invoke packaged core Wasm inside disposable Workers." ;;
+        component) echo "Verify that the public Component example builds into the same files every time." ;;
+        wasi-p2) echo "Exercise portable HTTP, streams, clock, and random-number support." ;;
+        wasi-p3) echo "Exercise ordering, backpressure, deadlines, cancellation, and cleanup." ;;
+        tcp-tls) echo "Workerd can open outbound TCP connections. TLS adds encryption to that connection. The host opens the connection for the temporary VM and allows only configured hostnames, IP addresses, ports, and encryption settings." ;;
+        udp) echo "UDP support depends on which Workerd API is being used. The host can send and receive UDP messages for the temporary VM only for configured addresses and ports and within configured size limits." ;;
+        websocket) echo "Workerd can create and use WebSocket connections. The host allows only configured WebSocket endpoints and limits message size and connection lifetime." ;;
+        web-apis) echo "Exercise timers, streams, handlers, MessagePort, and fresh state." ;;
+        fetch) echo "Reach one declared loopback service while other destinations stay denied." ;;
+        benchmark-on-demand) echo "Measure the cold on-demand pool with a 32-request concurrent wave." ;;
+        benchmark-prewarmed) echo "Measure the matched adaptive warm pool and inspect replenishment." ;;
+        *) return 1 ;;
+    esac
+}
+
+action() {
+    case "$1" in
+        isolation) echo "Send a normal request, force a timeout, then send a recovery request." ;;
+        policy) echo "Run permission, usage-limit, denial, activity-log, and reset checks." ;;
+        ingress) echo "Pass a scheduled event and a named message batch into a temporary VM." ;;
+        kv) echo "Write and read a deterministic KV entry before and after VM reset." ;;
+        cache) echo "Populate a deterministic cache entry, replace the VM, and read it again." ;;
+        d1) echo "Execute a transactional SQL batch, replace the VM, and verify committed rows." ;;
+        durable-objects) echo "Write two objects' data, replace the VM, and verify the data stays separate." ;;
+        storage) echo "Read and write declared paths, then probe traversal and quota boundaries." ;;
+        node) echo "Load both common JavaScript module formats and use the supported file API." ;;
+        core-wasm) echo "Invoke the packaged Wasm export across disposable request VMs." ;;
+        component) echo "Rebuild the pinned example, compare its files, and report the module-size limit." ;;
+        wasi-p2) echo "Run portable HTTP, stream, clock, random, cleanup, and denial checks." ;;
+        wasi-p3) echo "Run async ordering, backpressure, deadline, cancellation, and cleanup checks." ;;
+        tcp-tls) echo "Open allowed TCP and encrypted TLS connections, then try an unlisted destination." ;;
+        udp) echo "Exchange UDP messages with an allowed address and port, then exceed the size limit." ;;
+        websocket) echo "Open an allowed WebSocket, exchange messages, then exceed the message limit." ;;
+        web-apis) echo "Call the timer, stream, handler, MessagePort, and fresh-state routes." ;;
+        fetch) echo "Fetch one declared loopback endpoint and probe blocked network targets." ;;
+        benchmark-on-demand) echo "Send 320 requests at concurrency 32 to the cold on-demand pool." ;;
+        benchmark-prewarmed) echo "Send the same wave to the adaptive warm pool and inspect refill state." ;;
+        *) return 1 ;;
+    esac
+}
+
+takeaway() {
+    case "$1" in
+        isolation) echo "A failed request VM is disposable and does not poison recovery." ;;
+        policy) echo "The Worker cannot change its own permissions or usage limits." ;;
+        ingress) echo "The result comes back out of the VM; another program must connect a real service." ;;
+        kv) echo "Configuration and application state can outlive disposable request VMs." ;;
+        cache) echo "Cached responses can be reused without coupling them to one request VM." ;;
+        d1) echo "Relational updates remain atomic even though request VMs are disposable." ;;
+        durable-objects) echo "Each Durable Object keeps its own data across temporary VMs." ;;
+        storage) echo "Filesystem access remains named, bounded, and least-privileged." ;;
+        node) echo "Node compatibility remains inside the constrained Worker boundary." ;;
+        core-wasm) echo "Core Wasm composes with the same disposable VM lifecycle." ;;
+        component) echo "The public Component fixture is reproducible; the signed runtime limit is explicit." ;;
+        wasi-p2|wasi-p3) echo "Portable interfaces remain narrow, bounded, and recoverable." ;;
+        tcp-tls|udp|websocket|fetch) echo "Useful networking works without opening every destination." ;;
+        web-apis) echo "Common Web APIs remain useful across strict isolation boundaries." ;;
+        benchmark-on-demand|benchmark-prewarmed) echo "Matched local measurements expose pool behavior without a pass/fail target." ;;
+        *) return 1 ;;
+    esac
+}
+
+result_lines() {
+    case "$1" in
+        isolation)
+            echo "RESULT: The forced timeout returned HTTP 504."
+            echo "RESULT: The following request succeeded with clean VM state."
+            ;;
+        policy)
+            echo "RESULT: The host applied the correct Worker's permissions and reset its usage counters."
+            echo "EXPECTED DENIAL: Changed Worker details, unknown actions, and excess use were rejected."
+            ;;
+        ingress)
+            echo "RESULT: Scheduled-event completion and message acknowledge/retry decisions returned clearly."
+            echo "LIMIT: No scheduler or external queue service is connected by this demo."
+            ;;
+        kv)
+            echo "RESULT: The KV value round-tripped and remained available after VM replacement."
+            ;;
+        cache)
+            echo "RESULT: The cached response survived a fresh VM reset."
+            ;;
+        d1)
+            echo "RESULT: The D1 / SQL batch committed transactionally and rows persisted after reset."
+            ;;
+        durable-objects)
+            echo "RESULT: Durable Object data survived VM replacement and stayed separate."
+            ;;
+        storage)
+            echo "RESULT: Packaged files, temporary files, devices, and named mounts behaved as declared."
+            echo "EXPECTED DENIAL: Other paths, folder escapes, read-only writes, and excess use were rejected."
+            ;;
+        node)
+            echo "RESULT: Both common JavaScript module formats and the supported file API worked."
+            echo "EXPECTED DENIAL: Unlisted packages, new processes, threads, and native add-ons stayed unavailable."
+            ;;
+        core-wasm)
+            echo "RESULT: The packaged Wasm export returned the expected value in disposable VMs."
+            ;;
+        component)
+            echo "RESULT: The public Component example rebuilt into the expected files."
+            echo "LIMIT: The generated module exceeds the signed runtime's 32 KiB per-module boundary."
+            ;;
+        wasi-p2)
+            echo "RESULT: Typed HTTP, streams, clock, random, and resource release behaved correctly."
+            echo "EXPECTED DENIAL: Extra command-line, file, listener, and raw-socket access stayed unavailable."
+            ;;
+        wasi-p3)
+            echo "RESULT: Ordering, backpressure, deadlines, cancellation, and cleanup all completed."
+            ;;
+        tcp-tls)
+            echo "RESULT: The host opened allowed TCP and encrypted TLS connections for the VM."
+            echo "EXPECTED DENIAL: An unlisted address or port failed before a connection was opened."
+            ;;
+        udp)
+            echo "RESULT: UDP messages were exchanged with the configured address and port."
+            echo "EXPECTED DENIAL: Unlisted destinations and oversized messages were rejected."
+            ;;
+        websocket)
+            echo "RESULT: The configured WebSocket exchanged messages and reset cleanly."
+            echo "EXPECTED DENIAL: Oversized messages and unlisted endpoints were rejected."
+            ;;
+        web-apis)
+            echo "RESULT: Timers, streams, handlers, MessagePort, and fresh-state routes completed."
+            ;;
+        fetch)
+            echo "RESULT: The declared loopback endpoint returned the expected response."
+            echo "EXPECTED DENIAL: Other hosts, ports, schemes, private ranges, and redirect following were blocked."
+            ;;
+        benchmark-on-demand)
+            echo "RESULT: All 320 cold on-demand responses returned HTTP 200."
+            echo "RESULT: Pool status returned to zero active, queued, teardown, and completion pressure."
+            ;;
+        benchmark-prewarmed)
+            echo "RESULT: All 320 matched prewarmed responses returned HTTP 200."
+            echo "RESULT: Pool status exposed ready depth, watermarks, refill state, and pressure."
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+render_demo() {
+    local demo="$1"
+    printf '\n============================================================\n'
+    printf '%s\n' "$(title "$demo")"
+    print_wrapped "Demonstrates: " "$(description "$demo")"
+    print_wrapped "Why it matters: " "$(takeaway "$demo")"
+    print_wrapped "Action: " "$(action "$demo")"
+}
+
+print_wrapped() {
+    local prefix="$1"
+    local text="$2"
+    local first=true
+    while IFS= read -r line; do
+        if "$first"; then
+            printf '%s%s\n' "$prefix" "$line"
+            first=false
+        else
+            printf '%*s%s\n' "${#prefix}" "" "$line"
+        fi
+    done < <(printf '%s\n' "$text" | fold -s -w "$((96 - ${#prefix}))")
+}
+
+print_result_lines() {
+    local line
+    while IFS= read -r line; do
+        print_wrapped "  " "$line"
+    done < <(result_lines "$1")
+}
+
+render_preview() {
+    local demo="$1"
+    render_demo "$demo"
+    printf 'On success the presenter shows:\n'
+    print_result_lines "$demo"
+}
+
+print_scope_context() {
+    cat <<'EOF'
+Scope: this is a guided view of tested Workerd-on-Hyperlight features, not a
+claim of complete WinterTC, Web Platform, or Node.js compatibility. The Web
+APIs listed as working run directly. Features that need files, saved data, or
+networking go through host checks. The Worker cannot open anything else.
+Prior selected Node compatibility runs passed 409/409 and 518/518 cases.
+EOF
+}
+
+list_demos() {
+    local demo number=1
+    printf 'Workerd on Hyperlight feature menu\n\n'
+    print_scope_context
+    printf '\n'
+    for demo in "${demos[@]}"; do
+        printf '%2d. %-28s --demo %s\n' "$number" "$(title "$demo")" "$demo"
+        print_wrapped "    " "$(description "$demo")"
+        number=$((number + 1))
+    done
+}
+
+stop_processes() {
+    if [[ -n "$demo_pid" ]]; then
+        kill -TERM "$demo_pid" 2>/dev/null || true
+        wait "$demo_pid" 2>/dev/null || true
+        demo_pid=""
+    fi
+    if [[ -n "$upstream_pid" ]]; then
+        kill -TERM "$upstream_pid" 2>/dev/null || true
+        wait "$upstream_pid" 2>/dev/null || true
+        upstream_pid=""
+    fi
+}
+trap stop_processes EXIT INT TERM
+
+stop_demo() {
+    if [[ -n "$demo_pid" ]]; then
+        kill -TERM "$demo_pid" 2>/dev/null || true
+        wait "$demo_pid" 2>/dev/null || true
+        demo_pid=""
+    fi
+}
+
+require_runtime() {
+    local required
+    for required in \
+        target/release/examples/workerd-demo \
+        build-elfloader/workerd-executor/executor \
+        examples/workerd-bundles/acceptance.json
+    do
+        [[ -e "$root/$required" ]] || {
+            echo "missing $required; run tools/setup-workerd-demo.sh first" >&2
+            exit 2
+        }
+    done
+    for required in cargo curl hey jq npm python3; do
+        command -v "$required" >/dev/null || {
+            echo "missing required command: $required" >&2
+            exit 2
+        }
+    done
+}
+
+wait_for_server() {
+    local server_log="$1"
+    local attempt
+    for attempt in $(seq 1 600); do
+        if curl --silent --fail \
+            http://127.0.0.1:8787/__hyperlight/pool-status >/dev/null; then
+            return 0
+        fi
+        if ! kill -0 "$demo_pid" 2>/dev/null; then
+            tail -n 30 "$server_log" >&2
+            return 1
+        fi
+        sleep 1
+    done
+    echo "workerd-demo did not become ready; see $server_log" >&2
+    return 1
+}
+
+start_server() {
+    local server_log="$1"
+    shift
+    stop_demo
+    "$root/target/release/examples/workerd-demo" \
+        --executor "$root/build-elfloader/workerd-executor/executor" \
+        --rootfs "$root/build-elfloader/workerd-executor/rootfs.img" \
+        --bind 127.0.0.1:8787 \
+        "$@" >"$server_log" 2>&1 &
+    demo_pid=$!
+    wait_for_server "$server_log"
+}
+
+run_exact_test() {
+    cargo +1.98.0 test --locked --lib "$1" -- --exact --nocapture
+}
+
+run_isolation() {
+    local dir="$output_dir/isolation"
+    mkdir -p "$dir"
+    start_server "$dir/server.log" \
+        --bundle "$root/examples/workerd-bundles/acceptance.json" \
+        --scratch-mb 384 \
+        --request-timeout-ms 500 \
+        --restore-mode on-demand \
+        --max-concurrent-sandboxes 1 \
+        --queue-capacity 1
+    curl --fail-with-body --silent --show-error \
+        http://127.0.0.1:8787/before |
+        jq -e '.path == "/before" and .method == "GET"' >/dev/null
+    local status
+    status="$(curl --silent --show-error --output "$dir/timeout.json" \
+        --write-out '%{http_code}' http://127.0.0.1:8787/busy)"
+    [[ "$status" == 504 ]]
+    curl --fail-with-body --silent --show-error \
+        http://127.0.0.1:8787/after |
+        jq -e '.path == "/after" and .method == "GET"' >/dev/null
+    stop_processes
+    echo "HTTP 504 was isolated; the following fresh-VM request succeeded."
+}
+
+run_policy() {
+    run_exact_test data::kv::tests::runtime_identity_and_binding_checks_precede_dispatch
+    run_exact_test data::kv::tests::operation_and_storage_quotas_fail_closed
+    run_exact_test data::kv::tests::fresh_vm_reset_clears_request_budget_and_audit_buffer_only
+}
+
+run_ingress() {
+    "$root/build-elfloader/workerd-executor/executor" --self-test
+}
+
+run_kv() {
+    run_exact_test \
+        data::kv::tests::deterministic_fixture_put_round_trips_and_persists_across_vm_reset
+}
+
+run_cache() {
+    run_exact_test data::cache::tests::deterministic_fixture_survives_fresh_vm_reset
+}
+
+run_d1() {
+    run_exact_test \
+        data::d1::tests::deterministic_batch_is_transactional_and_persists_across_reset
+}
+
+run_durable_objects() {
+    run_exact_test \
+        data::durable::tests::trusted_context_partitions_persistent_state_across_fresh_vm_reset
+}
+
+run_storage() {
+    local dir="$output_dir/storage"
+    local ro="$dir/readonly"
+    local rw="$dir/scratch"
+    mkdir -p "$ro" "$rw"
+    printf 'fixture-read-ok\n' >"$ro/message.txt"
+    start_server "$dir/server.log" \
+        --bundle "$root/examples/workerd-bundles/workerd-vfs-evidence.json" \
+        --scratch-mb 384 \
+        --restore-mode on-demand \
+        --storage-ro readonly="$ro" \
+        --storage-rw scratch="$rw" \
+        --storage-max-operations scratch=16 \
+        --storage-max-read-bytes scratch=1048576 \
+        --storage-max-write-bytes scratch=16
+    "$root/tools/run-workerd-vfs-demo.sh" \
+        --output-dir "$dir/vfs" all
+    "$root/tools/run-workerd-storage-policy-demo.sh" \
+        --output-dir "$dir/named-storage" all
+    stop_processes
+}
+
+run_node() {
+    "$root/build-elfloader/workerd-executor/executor" --self-test
+}
+
+run_wintertc() {
+    local name="$1"
+    shift
+    local dir="$output_dir/$name"
+    mkdir -p "$dir"
+    start_server "$dir/server.log" \
+        --bundle "$root/examples/workerd-bundles/workerd-wintertc-demo.json" \
+        --scratch-mb 384 \
+        --request-timeout-ms 30000 \
+        --restore-mode on-demand \
+        --max-concurrent-sandboxes 4 \
+        --queue-capacity 32
+    "$root/tools/run-wintertc-demo.sh" \
+        --output-dir "$dir/checks" "$@"
+    stop_processes
+}
+
+run_core_wasm() {
+    run_wintertc core-wasm core-wasm
+}
+
+run_component() {
+    (
+        cd "$root/experiments/workerd-component-model"
+        npm test
+    )
+    cargo +1.98.0 test --locked --test workerd_component -- --nocapture
+    local generated="$root/experiments/workerd-component-model/generated/component.js"
+    local bytes
+    bytes="$(wc -c <"$generated")"
+    printf 'Generated Component JavaScript: %s bytes\n' "$bytes"
+    printf 'Signed Workerd per-module limit: 32768 bytes\n'
+    printf 'The public fixture identities pass; guest execution needs a separately reviewed Workerd change.\n'
+}
+
+run_wasi_p2() {
+    cargo +1.98.0 test --locked --lib wasi_preview2::proof::tests -- --nocapture
+}
+
+run_wasi_p3() {
+    cargo +1.98.0 test --locked --test wasi_p3 -- --nocapture
+}
+
+run_tcp_tls() {
+    cargo +1.98.0 test --locked --test broker_tcp_tls -- --nocapture
+}
+
+run_udp() {
+    cargo +1.98.0 test --locked --test broker_udp -- --nocapture
+}
+
+run_websocket() {
+    cargo +1.98.0 test --locked --test broker_websocket -- --nocapture
+}
+
+run_web_apis() {
+    run_wintertc web-apis \
+        core timers global-handlers byob byte-stream-tee state messageport
+}
+
+run_fetch() {
+    local dir="$output_dir/fetch"
+    mkdir -p "$dir"
+    python3 - <<'PY' >"$dir/upstream.log" 2>&1 &
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+BODY = b"allowed-upstream\n"
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/redirect":
+            self.send_response(302)
+            self.send_header("location", "/ok")
+            self.send_header("content-length", "0")
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("content-length", str(len(BODY)))
+        self.end_headers()
+        self.wfile.write(BODY)
+    def log_message(self, *_):
+        pass
+ThreadingHTTPServer(("127.0.0.1", 18080), Handler).serve_forever()
+PY
+    upstream_pid=$!
+    local attempt
+    for attempt in $(seq 1 100); do
+        curl --silent --fail http://127.0.0.1:18080/ok >/dev/null && break
+        kill -0 "$upstream_pid" 2>/dev/null || return 1
+        sleep 0.1
+    done
+    curl --silent --fail http://127.0.0.1:18080/ok >/dev/null
+    start_server "$dir/server.log" \
+        --bundle "$root/examples/workerd-bundles/fetch-policy-demo.json" \
+        --scratch-mb 384 \
+        --restore-mode on-demand \
+        --fetch-loopback-port 18080
+    "$root/tools/run-workerd-fetch-policy-demo.sh" \
+        --output-dir "$dir/checks" \
+        --upstream-port 18080 \
+        all
+    stop_processes
+}
+
+wait_for_pool_quiescence() {
+    local mode="$1"
+    local status_file="$2"
+    local attempt
+    for attempt in $(seq 1 600); do
+        curl --fail-with-body --silent --show-error \
+            http://127.0.0.1:8787/__hyperlight/pool-status >"$status_file"
+        if jq -e --arg mode "$mode" '
+            .admitted == 0 and
+            .active == 0 and
+            .queued == 0 and
+            .execution_slots_in_use == 0 and
+            .restore_slots_in_use == 0 and
+            .recycle_queue_depth == 0 and
+            .teardown_in_flight == 0 and
+            .completion_queue_depth == 0 and
+            .completion_in_flight == 0 and
+            (
+                $mode == "on-demand" or
+                (
+                    .prewarmed_replenishing == 0 and
+                    .restore_permits_outstanding == 0 and
+                    .refill_active == false and
+                    .prewarmed_ready == .prewarmed_inventory
+                )
+            )
+        ' "$status_file" >/dev/null; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    echo "pool did not become quiescent; see $status_file" >&2
+    return 1
+}
+
+run_benchmark() {
+    local mode="$1"
+    local dir="$output_dir/benchmark-$mode"
+    local args=(
+        --bundle "$root/examples/workerd-bundles/workerd-pool-benchmark.json"
+        --scratch-mb 384
+        --request-timeout-ms 30000
+        --restore-mode "$mode"
+        --max-concurrent-sandboxes 32
+        --queue-capacity 256
+        --profile-log-every 64
+    )
+    if [[ "$mode" == prewarmed ]]; then
+        args+=(
+            --prewarmed-sandboxes 48
+            --max-concurrent-restores 1
+            --warm-floor 1
+            --ready-low-watermark 16
+            --ready-high-watermark 32
+            --max-replenish-batch 2
+        )
+    fi
+    mkdir -p "$dir"
+    start_server "$dir/server.log" "${args[@]}"
+    hey -n 320 -c 32 http://127.0.0.1:8787/sync | tee "$dir/hey.txt"
+    grep -Eq '\[200\][[:space:]]+320 responses' "$dir/hey.txt"
+    wait_for_pool_quiescence "$mode" "$dir/pool-status.json"
+    jq '{
+            restore_mode,
+            admitted,
+            active,
+            queued,
+            ready,
+            warm_floor,
+            ready_low_watermark,
+            ready_high_watermark,
+            execution_slots_in_use,
+            restore_slots_in_use,
+            recycle_queue_depth,
+            teardown_in_flight,
+            completion_queue_depth,
+            completion_in_flight,
+            replenishment_paused,
+            replenishment_pause_reason,
+            refill_active,
+            prewarmed_inventory,
+            prewarmed_ready,
+            prewarmed_replenishing
+        }' "$dir/pool-status.json"
+    stop_processes
+    printf 'Compare demo-output/benchmark-on-demand/hey.txt and '
+    printf 'demo-output/benchmark-prewarmed/hey.txt on this same host.\n'
+}
+
+run_demo_command() {
+    case "$1" in
+        isolation) run_isolation ;;
+        policy) run_policy ;;
+        ingress) run_ingress ;;
+        kv) run_kv ;;
+        cache) run_cache ;;
+        d1) run_d1 ;;
+        durable-objects) run_durable_objects ;;
+        storage) run_storage ;;
+        node) run_node ;;
+        core-wasm) run_core_wasm ;;
+        component) run_component ;;
+        wasi-p2) run_wasi_p2 ;;
+        wasi-p3) run_wasi_p3 ;;
+        tcp-tls) run_tcp_tls ;;
+        udp) run_udp ;;
+        websocket) run_websocket ;;
+        web-apis) run_web_apis ;;
+        fetch) run_fetch ;;
+        benchmark-on-demand) run_benchmark on-demand ;;
+        benchmark-prewarmed) run_benchmark prewarmed ;;
+        *) return 2 ;;
+    esac
+}
+
+run_one() {
+    local demo="$1"
+    local log="$output_dir/$demo.log"
+    mkdir -p "$output_dir"
+    render_demo "$demo"
+    printf 'Running... raw output is being saved to %s\n' "$log"
+    local status=0
+    if "$verbose"; then
+        (
+            trap stop_processes EXIT INT TERM
+            set -e
+            run_demo_command "$demo"
+        ) > >(tee "$log") 2>&1 || status=$?
+    else
+        (
+            trap stop_processes EXIT INT TERM
+            set -e
+            run_demo_command "$demo"
+        ) >"$log" 2>&1 || status=$?
+    fi
+    if ((status == 0)); then
+        printf '\nPASS: %s\n' "$(title "$demo")"
+        print_result_lines "$demo"
+        print_wrapped "TAKEAWAY: " "$(takeaway "$demo")"
+        printf 'LOG: %s\n' "$log"
+        return 0
+    fi
+    stop_processes
+    printf '\nFAIL: %s\n' "$(title "$demo")" >&2
+    printf 'LOG: %s\n' "$log" >&2
+    printf 'LAST OUTPUT:\n' >&2
+    tail -n 8 "$log" | sed 's/^/  /' >&2
+    return 1
+}
+
+mode=interactive
+selected=""
+while (($#)); do
+    case "$1" in
+        --all)
+            mode=all
+            shift
+            ;;
+        --demo)
+            (($# >= 2)) || {
+                echo "--demo requires a name" >&2
+                usage >&2
+                exit 2
+            }
+            mode=one
+            selected="$2"
+            shift 2
+            ;;
+        --list)
+            list_demos
+            exit 0
+            ;;
+        --preview)
+            mode=preview
+            shift
+            ;;
+        --describe)
+            (($# >= 2)) || {
+                echo "--describe requires a name" >&2
+                usage >&2
+                exit 2
+            }
+            mode=describe
+            selected="$2"
+            shift 2
+            ;;
+        --output-dir)
+            (($# >= 2)) || {
+                echo "--output-dir requires a value" >&2
+                usage >&2
+                exit 2
+            }
+            output_dir="$2"
+            shift 2
+            ;;
+        --verbose)
+            verbose=true
+            shift
+            ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "unknown option: $1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
+
+if [[ "$mode" == one || "$mode" == describe ]] &&
+    [[ ! " ${demos[*]} " =~ " $selected " ]]; then
+    echo "unknown demo: $selected" >&2
+    echo "run tools/hyperlight-demo --list to see valid names" >&2
+    exit 2
+fi
+if [[ "$mode" == preview ]]; then
+    print_scope_context
+    for demo in "${demos[@]}"; do
+        render_preview "$demo"
+    done
+    printf '\nPreview complete. The runbook contains the detailed compatibility boundaries.\n'
+    exit 0
+fi
+if [[ "$mode" == describe ]]; then
+    render_preview "$selected"
+    exit 0
+fi
+if [[ "$mode" == interactive ]] && [[ ! -t 0 ]]; then
+    echo "interactive mode requires a terminal; use --all or --demo NAME" >&2
+    exit 2
+fi
+
+require_runtime
+cd "$root"
+
+if [[ "$mode" == one ]]; then
+    run_one "$selected"
+    exit
+fi
+
+for demo in "${demos[@]}"; do
+    if [[ "$mode" == interactive ]]; then
+        printf '\nNext: %s\n%s\n' "$(title "$demo")" "$(description "$demo")"
+        read -r -p "Enter=run, s=skip, q=quit: " choice
+        case "$choice" in
+            q) exit 0 ;;
+            s) continue ;;
+        esac
+    fi
+    run_one "$demo"
+    if [[ "$mode" == interactive ]]; then
+        read -r -p "Enter=continue, r=repeat, q=quit: " choice
+        case "$choice" in
+            q) exit 0 ;;
+            r) run_one "$demo" ;;
+        esac
+    fi
+done
+
+printf '\nAll selected demos passed. Output: %s\n' "$output_dir"
