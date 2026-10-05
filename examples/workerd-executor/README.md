@@ -9,10 +9,9 @@ general-purpose kernel contains those drivers, but the wrapper registers no
 `fs_*` or `net_*` host functions unless the Rust host supplies an explicit
 storage or network policy.
 
-For a complete clean-VM Azure KVM walkthrough, including executor packaging,
-WinterTC capability routes, isolation/timeout checks, `hey` load, adaptive
-prewarm diagnostics, profiling, and cost cleanup, see
-[`docs/azure-workerd-hyperlight-runbook.md`](../../docs/azure-workerd-hyperlight-runbook.md).
+For a standalone Linux/KVM walkthrough that builds the signed public sources,
+packages the executor, and starts the HTTP bridge, see
+[`docs/workerd-hyperlight-runbook.md`](../../docs/workerd-hyperlight-runbook.md).
 Pinned package tarballs and deterministic assertions for the representative
 Node compatibility workloads are recorded in
 [`workerd-node-workload-pins.json`](workerd-node-workload-pins.json) and
@@ -501,7 +500,7 @@ restoring mapped snapshot state/page tables, and resuming it. Keeping that
 boundary preserves kill/recovery semantics and prevents request-to-request VM
 state reuse. Native Linux KVM measurements may differ from WHP.
 
-## Native Linux / Azure KVM reproduction
+## Native Linux/KVM reproduction
 
 Use a repository and Cargo target directory on the VM's native ext4 disk, not
 an SMB mount, `/mnt/c`, or another Windows-backed filesystem:
@@ -530,7 +529,7 @@ sha256sum kernel/workerd_hyperlight-x86_64 \
   build-elfloader/workerd-executor/rootfs.img
 ```
 
-Run the optimized executor's 344 MiB real-V8 acceptance probe. Use 768 MiB only
+Run the optimized executor's 344 MiB real-V8 probe. Use 768 MiB only
 as a diagnostic fallback when a 344 MiB failure is specifically attributable
 to memory, not for functional adapter or bundle failures:
 
@@ -543,9 +542,8 @@ cargo run --release --locked --example workerd-memory-probe -- 344 \
   | tee build-elfloader/workerd-memory-344-kvm.json
 ```
 
-Do not descend to a lower allocator candidate until the complete 344 MiB
-evidence matrix is green. Stop at the first failing candidate and retain every
-machine-readable result.
+Do not descend to a lower allocator candidate until all 344 MiB checks pass.
+Stop at the first failing candidate and inspect its machine-readable result.
 
 Run the reproducible real-V8 bundle probes through initialization, snapshot,
 fresh restore, and fetch:
@@ -568,7 +566,7 @@ runner. `api-smoke-matrix.json` records the selected pure Web APIs,
 capability-backed APIs intentionally unavailable in this sandbox, untested
 surfaces, the Hyperlight/executor ownership boundary, and the expected SHA-256
 digest vector. The timer host channel is covered by the native executor fixture;
-the Workerd KJ adapter and real-V8 timer qualification are separate. No
+the Workerd KJ adapter and real-V8 timer validation are separate. No
 additional Hyperlight kernel or host capability is currently identified for
 safe WebAssembly enablement, MessageChannel, File or BYOB streams: those remain
 executor embedder-policy/API verification tasks, followed by this same real-VM
@@ -607,5 +605,5 @@ unbounded VMs or an unbounded host queue.
 if artifacts/hypervisor access are missing; it does not silently self-skip.
 Use `cargo test --lib workerd` for the hardware-independent tests.
 Cross-Clippy is cfg/type validation only. This prototype claims neither W^X,
-stock-workerd support, production hardening, nor platform runtime qualification
-without an actual run on that platform.
+stock-workerd support, production hardening, nor platform support without an
+actual run on that platform.
