@@ -95,9 +95,9 @@ description() {
         d1) echo "Commit a group of SQL changes together and keep them after the VM is replaced." ;;
         durable-objects) echo "Keep each Durable Object's data separate and available after VM replacement." ;;
         storage) echo "Use packaged files and named mounts while denied paths stay denied." ;;
-        node) echo "Use supported Node-style modules and files without opening the whole host machine." ;;
+        node) echo "Load included Node-style modules and allowed files; attempts to start processes, threads, or native add-ons remain unavailable." ;;
         core-wasm) echo "Compile and invoke packaged core Wasm inside disposable Workers." ;;
-        component) echo "Verify that the public Component example builds into the same files every time." ;;
+        component) echo "Build the included Component example and show why it cannot run in this Workerd fork." ;;
         wasi-p2) echo "Exercise portable HTTP, streams, clock, and random-number support." ;;
         wasi-p3) echo "Exercise ordering, backpressure, deadlines, cancellation, and cleanup." ;;
         tcp-tls) echo "Workerd can open outbound TCP connections. TLS adds encryption to that connection. The host opens the connection for the temporary VM and allows only configured hostnames, IP addresses, ports, and encryption settings." ;;
@@ -105,8 +105,8 @@ description() {
         websocket) echo "Workerd can create and use WebSocket connections. The host allows only configured WebSocket endpoints and limits message size and connection lifetime." ;;
         web-apis) echo "Exercise timers, streams, handlers, MessagePort, and fresh state." ;;
         fetch) echo "Reach one declared loopback service while other destinations stay denied." ;;
-        benchmark-on-demand) echo "Measure the cold on-demand pool with a 32-request concurrent wave." ;;
-        benchmark-prewarmed) echo "Measure the matched adaptive warm pool and inspect replenishment." ;;
+        benchmark-on-demand) echo "Measure requests when VMs are created or restored as they are needed." ;;
+        benchmark-prewarmed) echo "Measure the same requests when ready VMs are available and replacements are prepared." ;;
         *) return 1 ;;
     esac
 }
@@ -123,16 +123,16 @@ action() {
         storage) echo "Read and write declared paths, then probe traversal and quota boundaries." ;;
         node) echo "Load both common JavaScript module formats and use the supported file API." ;;
         core-wasm) echo "Invoke the packaged Wasm export across disposable request VMs." ;;
-        component) echo "Rebuild the pinned example, compare its files, and report the module-size limit." ;;
+        component) echo "Build the example, compare its files, and check its generated module size." ;;
         wasi-p2) echo "Run portable HTTP, stream, clock, random, cleanup, and denial checks." ;;
         wasi-p3) echo "Run async ordering, backpressure, deadline, cancellation, and cleanup checks." ;;
-        tcp-tls) echo "Open allowed TCP and encrypted TLS connections, then try an unlisted destination." ;;
+        tcp-tls) echo "Connect to a host-listed TCP and TLS destination, then try one that is not listed." ;;
         udp) echo "Exchange UDP messages with an allowed address and port, then exceed the size limit." ;;
         websocket) echo "Open an allowed WebSocket, exchange messages, then exceed the message limit." ;;
         web-apis) echo "Call the timer, stream, handler, MessagePort, and fresh-state routes." ;;
         fetch) echo "Fetch one declared loopback endpoint and probe blocked network targets." ;;
-        benchmark-on-demand) echo "Send 320 requests at concurrency 32 to the cold on-demand pool." ;;
-        benchmark-prewarmed) echo "Send the same wave to the adaptive warm pool and inspect refill state." ;;
+        benchmark-on-demand) echo "Send 320 requests, with up to 32 running at once, while VMs are created as needed." ;;
+        benchmark-prewarmed) echo "Send the same requests using ready VMs and watch replacements being prepared." ;;
         *) return 1 ;;
     esac
 }
@@ -147,13 +147,13 @@ takeaway() {
         d1) echo "Relational updates remain atomic even though request VMs are disposable." ;;
         durable-objects) echo "Each Durable Object keeps its own data across temporary VMs." ;;
         storage) echo "Filesystem access remains named, bounded, and least-privileged." ;;
-        node) echo "Node compatibility remains inside the constrained Worker boundary." ;;
+        node) echo "Node-style code can use included APIs and files but cannot control the host operating system." ;;
         core-wasm) echo "Core Wasm composes with the same disposable VM lifecycle." ;;
-        component) echo "The public Component fixture is reproducible; the signed runtime limit is explicit." ;;
+        component) echo "The example builds; full execution is blocked by Workerd's module-size limit." ;;
         wasi-p2|wasi-p3) echo "Portable interfaces remain narrow, bounded, and recoverable." ;;
-        tcp-tls|udp|websocket|fetch) echo "Useful networking works without opening every destination." ;;
+        tcp-tls|udp|websocket|fetch) echo "Network access is denied by default; the host opens only listed destinations." ;;
         web-apis) echo "Common Web APIs remain useful across strict isolation boundaries." ;;
-        benchmark-on-demand|benchmark-prewarmed) echo "Matched local measurements expose pool behavior without a pass/fail target." ;;
+        benchmark-on-demand|benchmark-prewarmed) echo "The same local request run shows the difference between creating VMs when needed and keeping VMs ready." ;;
         *) return 1 ;;
     esac
 }
@@ -196,8 +196,8 @@ result_lines() {
             echo "RESULT: The packaged Wasm export returned the expected value in disposable VMs."
             ;;
         component)
-            echo "RESULT: The public Component example rebuilt into the expected files."
-            echo "LIMIT: The generated module exceeds the signed runtime's 32 KiB per-module boundary."
+            echo "RESULT: The included Component example rebuilt into the expected files."
+            echo "LIMIT: Its 45,194-byte JavaScript module exceeds Workerd's 32 KiB limit."
             ;;
         wasi-p2)
             echo "RESULT: Typed HTTP, streams, clock, random, and resource release behaved correctly."
@@ -226,12 +226,12 @@ result_lines() {
             echo "EXPECTED DENIAL: Other hosts, ports, schemes, private ranges, and redirect following were blocked."
             ;;
         benchmark-on-demand)
-            echo "RESULT: All 320 cold on-demand responses returned HTTP 200."
-            echo "RESULT: Pool status returned to zero active, queued, teardown, and completion pressure."
+            echo "RESULT: All 320 requests succeeded."
+            echo "RESULT: After the final response, no requests were running or waiting and cleanup was complete."
             ;;
         benchmark-prewarmed)
-            echo "RESULT: All 320 matched prewarmed responses returned HTTP 200."
-            echo "RESULT: Pool status exposed ready depth, watermarks, refill state, and pressure."
+            echo "RESULT: All 320 requests succeeded."
+            echo "RESULT: The demo showed how many ready VMs remained and whether replacements were being prepared."
             ;;
         *) return 1 ;;
     esac
@@ -483,8 +483,8 @@ run_component() {
     local bytes
     bytes="$(wc -c <"$generated")"
     printf 'Generated Component JavaScript: %s bytes\n' "$bytes"
-    printf 'Signed Workerd per-module limit: 32768 bytes\n'
-    printf 'The public fixture identities pass; guest execution needs a separately reviewed Workerd change.\n'
+    printf 'Workerd fork per-module limit: 32768 bytes\n'
+    printf 'The fixture files match; guest execution needs a separate Workerd change.\n'
 }
 
 run_wasi_p2() {

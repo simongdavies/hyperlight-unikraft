@@ -10,7 +10,6 @@ JUST_VERSION=1.58.0
 BAZELISK_VERSION=1.28.1
 BAZELISK_SHA256=22e7d3a188699982f661cf4687137ee52d1f24fec1ec893d91a6c4d791a75de8
 LLVM_VERSION=22
-SIGNING_FINGERPRINT=B23C39FC43F625F276EC54713A82F8BAFEA39557
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cache_root="${XDG_CACHE_HOME:-$HOME/.cache}/hyperlight-workerd"
@@ -20,7 +19,7 @@ export PATH="$HOME/go/bin:$HOME/.cargo/bin:$PATH"
 
 usage() {
     cat <<EOF
-Build the signed Workerd executor and package it for Hyperlight.
+Build the Workerd fork used by this demo and package it for Hyperlight.
 
 Usage: tools/setup-workerd-demo.sh [OPTIONS]
 
@@ -33,9 +32,9 @@ Environment:
   CARGO_BUILD_JOBS       Cargo parallelism (default: 8)
   WORKERD_BAZEL_JOBS    Bazel parallelism (default: min(nproc, 20))
 
-The script must run on x86-64 Linux with Docker and KVM available. It verifies
-the signed public commits, builds Workerd from source, packages the executor,
-and builds the release workerd-demo binary.
+The script must run on x86-64 Linux with Docker and KVM available. It checks
+out the exact Hyperlight and Workerd fork revisions used by this demo, builds
+Workerd from source, packages the executor, and builds workerd-demo.
 EOF
 }
 
@@ -79,10 +78,10 @@ if "$install_deps"; then
     sudo apt-get update
     sudo apt-get install -y \
         binutils build-essential ca-certificates cpio curl docker.io file \
-        git gnupg golang-go jq nodejs npm patch pkg-config python3 rsync unzip
+        git golang-go jq nodejs npm patch pkg-config python3 rsync unzip
 fi
 
-for command in cargo curl docker file git go gpg node npm patch python3 \
+for command in cargo curl docker file git go node npm patch python3 \
     readelf rustup sha256sum; do
     command -v "$command" >/dev/null ||
         fail "missing '$command' (rerun with --install-deps where applicable)"
@@ -92,9 +91,9 @@ done
 docker info >/dev/null 2>&1 ||
     fail "Docker is not usable by the current user"
 
-step "Verifying the Hyperlight runtime source"
+step "Checking the Hyperlight fork revision"
 git -C "$root" merge-base --is-ancestor "$HYPERLIGHT_COMMIT" HEAD ||
-    fail "the checkout is not based on signed Hyperlight commit $HYPERLIGHT_COMMIT"
+    fail "the checkout is not based on Hyperlight commit $HYPERLIGHT_COMMIT"
 git -C "$root" diff --quiet "$HYPERLIGHT_COMMIT" -- \
     . \
     ':(exclude)docs/**' \
@@ -102,26 +101,16 @@ git -C "$root" diff --quiet "$HYPERLIGHT_COMMIT" -- \
     ':(exclude)examples/workerd-executor/README.md' \
     ':(exclude)tools/setup-workerd-demo.sh' \
     ':(exclude)tools/hyperlight-demo' ||
-    fail "runtime files differ from signed Hyperlight commit $HYPERLIGHT_COMMIT"
+    fail "runtime files differ from Hyperlight commit $HYPERLIGHT_COMMIT"
 git -C "$root" submodule update --init --recursive
 
-verify_home="$(mktemp -d)"
 builder_file="$(mktemp)"
 cleanup() {
-    rm -rf -- "$verify_home"
     rm -f -- "$builder_file"
 }
 trap cleanup EXIT
-chmod 0700 "$verify_home"
-curl --fail --show-error --silent --location \
-    https://github.com/simongdavies.gpg |
-    GNUPGHOME="$verify_home" gpg --batch --import
-GNUPGHOME="$verify_home" gpg --batch --with-colons --fingerprint |
-    grep -Fq "fpr:::::::::$SIGNING_FINGERPRINT:" ||
-    fail "the downloaded signing key has an unexpected fingerprint"
-GNUPGHOME="$verify_home" git -C "$root" verify-commit "$HYPERLIGHT_COMMIT"
 
-step "Checking out signed Workerd source"
+step "Checking out the Workerd fork revision"
 if [[ ! -d "$workerd_dir/.git" ]]; then
     git clone \
         --branch simongdavies-workerd-ingress-bindings \
@@ -137,9 +126,8 @@ git -C "$workerd_dir" submodule update --init --recursive
     fail "Workerd checkout did not resolve to $WORKERD_COMMIT"
 [[ -z "$(git -C "$workerd_dir" status --porcelain)" ]] ||
     fail "Workerd checkout is not clean"
-GNUPGHOME="$verify_home" git -C "$workerd_dir" verify-commit "$WORKERD_COMMIT"
 
-step "Installing the pinned Rust toolchain and just"
+step "Installing the required Rust toolchain and just"
 rustup toolchain install "$RUST_VERSION" --profile minimal
 if ! command -v just >/dev/null; then
     cargo +"$RUST_VERSION" install just --version "$JUST_VERSION" --locked
@@ -229,7 +217,7 @@ bash examples/workerd-executor/build-rootfs.sh \
 step "Building the Hyperlight demo"
 cargo +"$RUST_VERSION" build --release --locked --example workerd-demo
 
-step "Rebuilding the pinned Component Model fixture"
+step "Rebuilding the Component Model fixture"
 (
     cd experiments/workerd-component-model
     npm install \

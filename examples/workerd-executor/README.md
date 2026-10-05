@@ -9,8 +9,8 @@ general-purpose kernel contains those drivers, but the wrapper registers no
 `fs_*` or `net_*` host functions unless the Rust host supplies an explicit
 storage or network policy.
 
-For a standalone Linux/KVM walkthrough that builds the signed public sources,
-packages the executor, and runs the guided feature demos, see
+For a standalone Linux/KVM walkthrough that builds the Workerd and Hyperlight
+forks used by this integration, packages the executor, and runs the guided demos, see
 [`docs/azure-workerd-hyperlight-runbook.md`](../../docs/azure-workerd-hyperlight-runbook.md).
 Pinned package tarballs and deterministic assertions for the representative
 Node compatibility workloads are recorded in

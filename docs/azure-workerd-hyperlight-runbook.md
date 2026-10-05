@@ -1,9 +1,8 @@
 # Run Workerd on Hyperlight
 
 This walkthrough starts from an existing x86-64 Linux machine with KVM. It
-builds the signed public Workerd and Hyperlight sources, then presents every
-Workerd-on-Hyperlight feature as an interactive, individually runnable demo.
-The historical URL is retained for existing links; no cloud tooling is needed.
+builds the Workerd and Hyperlight forks containing this integration, then
+presents every feature as an interactive, individually runnable demo.
 
 ## 1. Clone and check KVM
 
@@ -15,28 +14,17 @@ cd hyperlight-unikraft
 test -c /dev/kvm && test -r /dev/kvm && test -w /dev/kvm
 ```
 
-You also need Docker, Git, curl, GPG, Rustup, Node.js, npm, Go, Python, and
-common C/C++ build tools. The setup script can install the Ubuntu/Debian host
-packages, but it does not configure KVM or Docker permissions.
+Your user must be able to use `/dev/kvm` and Docker. The setup script installs
+the remaining build tools on Ubuntu or Debian.
 
-## 2. Build the signed pair
+## 2. Build
 
 ```bash
 tools/setup-workerd-demo.sh --install-deps
 ```
 
-Omit `--install-deps` when dependencies are already installed. The script:
-
-- verifies signed Hyperlight commit
-  `c0564669d7cc7cfd42f33d28e4a0f69261f3dca6`;
-- checks out and verifies signed Workerd commit
-  `621cb07e7d2cf0cb0f49872129d4408f6319acef`;
-- initializes submodules and builds the Workerd executor;
-- packages the executor with `examples/workerd-executor/build-rootfs.sh`;
-- builds `workerd-demo` and the reproducible Component fixture.
-
-Run `tools/setup-workerd-demo.sh --help` for checkout and concurrency options.
-Successful setup ends with `Setup complete` and the built binary paths.
+This checks out the matching Workerd fork, builds both projects, and prepares
+the demos. Omit `--install-deps` when the build tools are already installed.
 
 ## 3. Choose a demo
 
@@ -84,19 +72,19 @@ you want to stream it during a run.
 | `cache` | Cache API | Cached state survives a fresh VM reset |
 | `d1` | D1 / SQL | A transactional batch commits atomically and persists across reset |
 | `durable-objects` | Durable Objects | Each object's data stays separate and survives VM replacement |
-| `storage` | Packaged files and named folders | Listed folders work; folder escapes, read-only writes, and excess use are denied |
-| `node` | Node-style modules and files | Supported modules work without opening the whole host machine |
+| `storage` | Packaged files and host folders | Packaged files and host-allowed folders work; all other host paths, read-only writes, and excess use are denied |
+| `node` | Node-style modules and files | Included modules and allowed files work; processes, worker threads, native add-ons, and other host files remain unavailable |
 | `core-wasm` | Core WebAssembly | The packaged Wasm export runs in disposable request VMs |
-| `component` | Public Component fixture | Lowering and identities verify; the signed runtime size limit is reported |
+| `component` | Component example | The example builds, but cannot run because its 45,194-byte JavaScript module exceeds Workerd's 32 KiB limit |
 | `wasi-p2` | WASI Preview 2 | Portable HTTP, streams, clock, random, cleanup, and allowed-access checks pass |
 | `wasi-p3` | WASI Preview 3 | Ordering, backpressure, deadlines, cancellation, and cleanup pass |
-| `tcp-tls` | TCP/TLS broker | Declared destinations work and undeclared destinations fail before I/O |
+| `tcp-tls` | TCP and encrypted TCP connections | Network access is denied by default; destinations allowed by the host connect and everything else is blocked before a connection opens |
 | `udp` | Controlled UDP messages | Bounded messages work only for host-approved destinations |
 | `websocket` | Controlled WebSocket connections | Configured endpoint, message-size, lifetime, reset, and denial checks pass |
 | `web-apis` | WinterTC and Web APIs | Timers, streams, handlers, MessagePort, and state reset pass |
 | `fetch` | Constrained outbound fetch | One declared loopback service works; other routes and redirects stay bounded |
-| `benchmark-on-demand` | Cold pool latency/throughput | 320 HTTP 200 responses at concurrency 32 plus quiescent pool status |
-| `benchmark-prewarmed` | Adaptive warm-pool latency/throughput | Matched load succeeds and reports ready/refill/pressure state |
+| `benchmark-on-demand` | Create VMs as requests arrive | Sends 320 requests, with up to 32 running at once, and confirms every request succeeds and cleanup finishes |
+| `benchmark-prewarmed` | Reuse a pool of ready VMs | Sends the same requests and shows how many ready VMs remain and whether replacements are being prepared |
 
 The presenter reuses the repository's existing VFS, named-storage, WinterTC,
 and fetch scripts and their checked-in Worker bundles. Use their `--list`
@@ -105,69 +93,68 @@ options when presenting the lower-level route checks.
 ## Compatibility at a glance
 
 Workerd runs JavaScript applications built for the Workers platform.
-Hyperlight runs each request inside a small temporary virtual machine. This
-project connects them; it does not replace Workerd's features, but controls
-what crosses the VM boundary.
+Hyperlight runs the untrusted Worker code for each request inside a small
+temporary virtual machine. The host provides the external interfaces used by
+Workerd features and applies the configured rules there. For example, network
+connections can reach only destinations allowed by the host, and file APIs can
+see only packaged files and the specific host folders allowed for that Worker.
 
-These tables describe the signed self-hosted Workerd package and the ways this
-project connects it to temporary VMs. They distinguish what the demos prove
-from complete compatibility that is not claimed.
+These tables show which Workerd features are available, what restrictions
+apply, and which compatibility gaps remain.
 
-### WinterTC and Web APIs
+### Worker API capabilities
 
 WinterTC is a shared checklist of browser-style JavaScript APIs that are useful
 outside a browser, such as requests, responses, URLs, streams, timers, files,
 and cryptography.
 
-| Status | Surface | What the demo proves or what remains |
+| Capability group | Supported | Missing or restricted |
 |---|---|---|
-| Working | URL and request APIs, FormData, Blob/File, text codecs, crypto digest/random, timers, streams/transforms/compression, MessagePort, byte streams with caller-provided buffers, core Wasm, and fresh-state reset | `web-apis` and `core-wasm` run the listed APIs in temporary VMs. These APIs are working, not unsupported. |
-| Working with host checks | Outbound fetch, TCP/TLS, UDP, WebSocket, named folders, and saved data | The matching demos prove that only listed destinations, folders, and operations are available. |
-| Different storage lifetime | KV, Cache, D1, and Durable Objects | Data is kept by the host so it survives replacement of the temporary VM. VM-local counters and request state reset. |
-| Remaining gap | Complete WinterTC and browser-style API coverage | The listed APIs are demonstrated, but complete compatibility with every WinterTC or browser API check has not been established. |
-| Unavailable by design | Unrestricted dynamic code and direct host access | `eval()`/`new Function()`, arbitrary host paths, raw sockets/listeners, and arbitrary host extensions are not provided. |
+| Core web APIs | URL and request/response APIs, FormData, Blob/File, text codecs, digest, secure random values, timers, readable/writable/transform/compression streams, MessagePort, and byte streams with caller-provided buffers | Support status is not yet documented for WinterTC APIs outside this list |
+| Network clients | Outbound fetch, TCP/TLS, UDP, and WebSocket through host-provided interfaces | Denied by default; only allowed destinations and operations work; direct host sockets and listeners are unavailable |
+| Files | Packaged files, fresh temporary files, supported device files, and specific host folders granted to the Worker | Every other host path is inaccessible; temporary files are discarded with the VM |
+| Saved application data | KV, Cache, D1, and Durable Objects backed by host-kept data | Access is limited to configured services and allowed operations |
+| Request isolation | A fresh VM and fresh mutable module state for each request or event | VM-local state does not persist after the VM is destroyed |
+| Code and WebAssembly | Bundled JavaScript modules and core Wasm | `eval()`, `new Function()`, native add-ons, arbitrary host extensions, and the oversized Component fixture are unavailable |
 
 ### Node compatibility
 
-The pinned Workerd fork supports many Node-style JavaScript APIs, but it is not
+The Workerd fork supports many Node-style JavaScript APIs, but it is not
 a complete Node.js runtime. Prior selected runs passed the configured suite
 **409/409** and the broader selected suite **518/518**. Those results
-demonstrate the selected subset, not complete Node.js compatibility.
+cover the selected subset; they do not establish complete Node.js
+compatibility.
 
 | Surface | Supported behavior and boundary |
 |---|---|
 | JavaScript modules and common APIs | Both ES modules and CommonJS (the two common JavaScript module formats), plus text, JSON, core Wasm, and selected Buffer/path/URL/stream/crypto-style APIs work. |
-| Files | `node:fs` uses packaged files, fresh temporary files, supported device files, and explicitly named folders. It cannot search the host filesystem. |
+| Files | `node:fs` can read packaged files and use fresh temporary files. The host may also grant the Worker access to specific folders. Every other host path is inaccessible. |
 | `process` information | Applications see stable placeholder values such as `pid=1`, not the real host process. |
-| Networking | HTTP and explicitly enabled TCP/TLS/UDP/WebSocket paths can reach listed destinations. Importing a module does not open the network. |
+| Networking | The host controls every external connection, and access is denied by default. It may allow a Worker to use outbound fetch, TCP/TLS, UDP, or WebSocket only for approved destinations and operations. Loading a module grants no network access. |
 | Loading code | Applications can load modules included in their bundle. They cannot install packages at runtime, search host folders, or use `eval()`/`new Function()`. |
 | Child processes | `node:child_process` can be imported, but process-creation methods report `ERR_METHOD_NOT_IMPLEMENTED`. |
-| Worker threads | Operational worker threads are unavailable (`isMainThread=true`, `threadId=0`, `parentPort=null`); MessageChannel/MessagePort remain supported separately. |
+| Worker threads | Code cannot create additional JavaScript worker threads. `node:worker_threads` reports that code is running on the main thread. MessageChannel and MessagePort can pass messages, but they do not create another thread. |
 | Native add-ons | `.node` loading and `process.dlopen()` report `ERR_METHOD_NOT_IMPLEMENTED`; use JavaScript, built-ins, or packaged core Wasm. |
 
-### What this project adds around self-hosted Workerd
+### What the Hyperlight integration changes
 
-This is a comparison with vanilla self-hosted Workerd, not a comparison with
-managed products.
+Workerd already provides the features in the middle column. The integration
+runs untrusted Worker code in temporary VMs and applies host rules to the
+external interfaces they use.
 
 | Feature | What Workerd already does | What this project adds |
 |---|---|---|
 | Temporary VM for each request | Runs JavaScript requests and events in isolated runtimes | Runs each request or event in a small temporary VM and destroys it afterward; a timeout does not poison the next request |
 | Fast VM startup | Starts and manages its normal runtime processes | Saves a ready VM image, restores it on demand, or keeps an adaptive pool ready |
-| Who is running, permissions, and limits | Uses configuration, bindings, and runtime limits | The host identifies the Worker, applies its permissions and usage limits, resets counters, and records activity across VM replacement |
+| Worker permissions and limits | Uses configuration, bindings, and runtime limits | Before a VM starts, the host selects the Worker bundle and registers its allowed network, timer, and file services. Each external operation is sent to the host, which checks the policy, performs or denies the operation, and counts usage. A replacement VM gets fresh per-request counters, while Worker code cannot read or change the host policy. |
 | Scheduled events and message batches | Runs scheduled and queue handlers for supplied events | Passes a scheduled event or logical queue name plus message batch into the VM and returns completion, acknowledge, retry, batch-retry, or no-retry decisions |
 | KV, Cache, D1, and Durable Objects | Provides these APIs and configured local or remote data services | Connects them to host-kept data that survives destruction of the temporary VM |
-| Named folders | Provides bundle files, directory services, and virtual Node files | Adds named read-only/read/write host folders with path checks and per-VM operation/byte limits |
-| TCP and TLS | Workerd can open outbound TCP connections. TLS adds encryption to that connection. | The host opens the connection for the temporary VM. Only configured hostnames, IP addresses, ports, and encryption settings are allowed. |
-| WebSockets | Workerd can create and use WebSocket connections. | The host allows connections only to configured WebSocket endpoints and limits message size and connection lifetime. |
-| UDP | UDP support depends on which Workerd API is being used. | The host can send and receive UDP messages for the temporary VM, but only for configured addresses and ports and within configured size limits. General network access is not provided. |
-| WASI and Components | Supports core Wasm and Worker APIs | Adds WASI Preview 2/3 work and a pinned conversion from Components to core Wasm plus JavaScript |
-| Rust bridge | Is normally built and embedded through C++ paths | Packages the executor through a Rust guest bridge into the same temporary-VM lifecycle |
-| Measurements | Provides its own runtime diagnostics | Adds VM counts, waiting time, restore/refill, cleanup pressure, and phase timing |
-
-WASI lets WebAssembly programs use a selected set of common services.
-Components package portable WebAssembly interfaces; this project converts the
-pinned example into core Wasm and JavaScript that Workerd can load.
+| Host folders | Provides bundle files, directory services, and virtual Node files | Before launch, the host opens each allowed folder and exposes it at a fixed path inside the VM. Worker code can use paths only inside that folder. The host blocks path escapes and writes to read-only folders, counts operations and transferred bytes, and rejects further access when the configured limit is reached. |
+| TCP and TLS | Workerd can open outbound TCP connections. TLS adds encryption to that connection. | Worker code sends the requested destination and encryption requirements to the host. The host checks them before DNS lookup or connection setup, opens an allowed socket, and relays bytes for the VM. A denied request fails before a connection opens, and the Worker never receives general host socket access. |
+| WebSockets | Workerd can create and use WebSocket connections. | Worker code requests an endpoint through the host interface. The host checks the endpoint, opens an allowed connection, relays messages, and enforces message-size and lifetime limits. Denied endpoints never connect. |
+| UDP | UDP support depends on which Workerd API is being used. | Worker code sends the destination and message to the host. The host checks the address, port, and message size before sending it and returns allowed replies to the VM. Other destinations and oversized messages are denied; the Worker never receives a general UDP socket. |
+| WASI and Components | Supports core Wasm and Worker APIs | Implements selected WASI Preview 2 and Preview 3 host interfaces. The build converts the included Component example into core Wasm and JavaScript adapter files, but that example cannot currently run because the generated JavaScript exceeds Workerd's module-size limit. |
+| Measurements | Provides its own runtime diagnostics | Shows how many VMs are ready, running, waiting, or being cleaned up, plus time spent in each step |
 
 ### Scheduled jobs and external queues
 
@@ -178,34 +165,35 @@ returns acknowledge or retry decisions. A separate host adapter is still
 required to read from and write to a real queue service and apply those
 decisions.
 
-## Component fixture limitation
+One adapter option is a small Azure Function. A timer, queue, or Service Bus
+trigger can receive work; a
+[managed connector trigger](https://learn.microsoft.com/azure/azure-functions/functions-connectors-overview)
+can receive events from services such as Microsoft 365, Teams, or SharePoint.
+The function converts the incoming event into this project's scheduled or
+queue request, calls the host boundary, and maps the returned completion or
+retry decision back to the source service. Azure Functions and the connected
+service remain separate from this project.
 
-`component` rebuilds and verifies only the checked-in public example and runs
-the matching file and bundle checks. The signed Workerd executor
-limits an individual module to 32 KiB; the generated Component JavaScript is
-45,194 bytes. Full guest execution therefore needs a separately reviewed
-Workerd source change. This walkthrough does not patch or replace the signed
-source.
+## Component example builds but does not run
 
-## Matched latency and throughput
+The conversion step succeeds and produces core Wasm plus a JavaScript adapter.
+Workerd must load that adapter as a module before the Component can run. The
+adapter is 45,194 bytes, but Workerd currently allows 32 KiB per module, so it
+is rejected before execution. Running the example requires either a smaller
+generated adapter or a change to Workerd's module-size limit.
 
-The two benchmark demos use the same bundle, 384 MiB scratch, 30-second request
-timeout, active/client concurrency 32, queue 256, profile interval 64, and:
+## Compare creating VMs with using ready VMs
 
-```text
-hey -n 320 -c 32 http://127.0.0.1:8787/sync
-```
+Both demos send the same 320 requests, with up to 32 running at once.
+`benchmark-on-demand` creates or restores VMs as requests arrive.
+`benchmark-prewarmed` begins with ready VMs and prepares replacements as they
+are used.
 
-`benchmark-on-demand` uses cold restore. `benchmark-prewarmed` uses owners48,
-active32, restore1, warm floor1, ready low/high 16/32, and refill batch2.
-Compare `demo-output/benchmark-on-demand/hey.txt` with
-`demo-output/benchmark-prewarmed/hey.txt` on the same machine. These are local
-latency/throughput illustrations, not pass/fail targets.
-
-The presenter also saves pool status. On-demand is quiescent when admitted,
-active, queued, execution, teardown, and completion gauges are zero. Prewarmed
-is quiescent when those gauges are zero, all inventory is ready, no restore is
-active, and refill is inactive.
+The presenter reports response time and request rate, confirms that no work is
+left running or waiting, and shows whether replacement VMs are still being
+prepared. Run both demos on the same machine for a meaningful comparison. Raw
+results are saved under `demo-output/benchmark-on-demand/` and
+`demo-output/benchmark-prewarmed/`.
 
 ## Stop and clean up
 
@@ -221,7 +209,3 @@ rm -rf \
   target
 docker image rm workerd-hyperlight-builder
 ```
-
-If `/dev/kvm` or Docker is denied, correct the current user's group/session
-permissions and rerun the prerequisite check. If a build runs out of memory,
-lower `WORKERD_BAZEL_JOBS` and `CARGO_BUILD_JOBS`.
