@@ -215,8 +215,7 @@ ARG BAZELISK_SHA256=$BAZELISK_SHA256
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
-        ca-certificates curl dpkg-dev git gnupg lsb-release \
-        software-properties-common tcl wget; \
+        ca-certificates curl dpkg-dev git gnupg lsb-release tcl wget; \
     curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
         | gpg --dearmor -o /usr/share/keyrings/apt.llvm.org.gpg; \
     codename="\$(. /etc/os-release; printf '%s' "\$VERSION_CODENAME")"; \
