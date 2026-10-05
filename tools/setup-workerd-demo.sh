@@ -264,6 +264,7 @@ executor_stamp="$executor_dir/build.stamp"
 expected_executor_stamp="$(
     printf 'workerd=%s\nbuilder=%s\n' "$WORKERD_COMMIT" "$builder_image_id"
 )"
+stamped_workerd=""
 mkdir -p \
     "$builder_cache_root" \
     "$cache_root/bazel/repository-cache" \
@@ -278,9 +279,14 @@ if [[ -x "$executor_path" ]] && [[ ! -e "$executor_stamp" ]]; then
     printf '%s\n' "$expected_executor_stamp" >"$executor_stamp.tmp"
     mv "$executor_stamp.tmp" "$executor_stamp"
 fi
+if [[ -f "$executor_stamp" ]]; then
+    stamped_workerd="$(
+        sed -n 's/^workerd=//p' "$executor_stamp" |
+            head -n 1
+    )"
+fi
 if [[ -x "$executor_path" ]] &&
-    [[ -f "$executor_stamp" ]] &&
-    [[ "$(cat "$executor_stamp")" == "$expected_executor_stamp" ]]; then
+    [[ "$stamped_workerd" == "$WORKERD_COMMIT" ]]; then
     step "Reusing the validated Workerd executor"
 else
     step "Building the Workerd executor"
