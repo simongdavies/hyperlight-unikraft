@@ -136,7 +136,7 @@ if "$install_deps"; then
     sudo apt-get update
     host_packages=(
         binutils build-essential ca-certificates containerd cpio curl \
-        docker.io file git golang-go jq nodejs npm patch pkg-config python3 \
+        docker.io file git golang-go jq patch pkg-config python3 \
         rsync unzip
     )
     if apt-cache show docker-buildx >/dev/null 2>&1; then
@@ -147,7 +147,7 @@ if "$install_deps"; then
     sudo apt-get install -y "${host_packages[@]}"
 fi
 
-for command in cargo curl docker file git go node npm patch python3 \
+for command in cargo curl docker file git go patch python3 \
     readelf rustup sha256sum; do
     command -v "$command" >/dev/null ||
         fail "missing '$command' (rerun with --install-deps where applicable)"
@@ -332,17 +332,33 @@ cargo +"$RUST_VERSION" build --release --locked --example workerd-demo
 step "Rebuilding the Component Model fixture"
 (
     cd experiments/workerd-component-model
-    npm install \
-        --ignore-scripts \
-        --no-audit \
-        --no-fund \
-        --package-lock=false
-    npm run build:component
-    npm run transpile
-    npm run lock
-    npm test
-    rm -rf node_modules
+    wasm-tools parse component.wat -o component.wasm
+    wasm-tools validate --features component-model component.wasm
 )
+docker run --rm \
+    --user "$(id -u):$(id -g)" \
+    --env HOME=/tmp \
+    --env npm_config_cache=/tmp/npm-cache \
+    --mount "type=bind,src=$root,dst=/repo" \
+    --workdir /repo/experiments/workerd-component-model \
+    workerd-hyperlight-builder \
+    bash -c '
+        set -euo pipefail
+        node_major="$(node --version |
+            sed -n "s/^v\([0-9][0-9]*\).*/\1/p")"
+        ((node_major >= 22)) ||
+            { echo "error: expected Node.js 22 or newer, found $(node --version)" >&2; exit 1; }
+        npm install \
+            --ignore-scripts \
+            --legacy-peer-deps \
+            --no-audit \
+            --no-fund \
+            --package-lock=false
+        npm run transpile
+        npm run lock
+        npm test
+        rm -rf node_modules
+    '
 git diff --exit-code -- experiments/workerd-component-model
 
 step "Checking the packaged executor"
