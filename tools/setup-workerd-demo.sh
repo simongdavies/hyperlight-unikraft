@@ -31,7 +31,7 @@ Environment:
   CARGO_HOME             Cargo home (must be user-writable; default: ~/.cargo)
   RUSTUP_HOME            Rustup home (must be user-writable; default: ~/.rustup)
   CARGO_BUILD_JOBS       Cargo parallelism (default: 8)
-  WORKERD_BAZEL_JOBS    Bazel parallelism (default: min(nproc, 20))
+  WORKERD_BAZEL_JOBS    Bazel parallelism (default: nproc)
 
 The script must run on x86-64 Linux with Docker and KVM available. It checks
 out the exact Hyperlight and Workerd fork revisions used by this demo, builds
@@ -268,7 +268,6 @@ mkdir -p \
     "$cache_root/bazel/repository-cache" \
     "$root/build-elfloader/workerd-executor"
 jobs="${WORKERD_BAZEL_JOBS:-$(nproc)}"
-((jobs > 20)) && jobs=20
 docker run --rm \
     --env "WORKERD_BAZEL_JOBS=$jobs" \
     --mount "type=bind,src=$workerd_dir,dst=/workspace" \
