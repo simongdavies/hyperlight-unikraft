@@ -160,15 +160,9 @@ docker info >/dev/null 2>&1 ||
 step "Checking the Hyperlight fork revision"
 git -C "$root" merge-base --is-ancestor "$HYPERLIGHT_COMMIT" HEAD ||
     fail "the checkout is not based on Hyperlight commit $HYPERLIGHT_COMMIT"
-git -C "$root" diff --quiet "$HYPERLIGHT_COMMIT" -- \
-    . \
-    ':(exclude)docs/**' \
-    ':(exclude)README.md' \
-    ':(exclude)examples/workerd-executor/README.md' \
-    ':(exclude)experiments/workerd-component-model/README.md' \
-    ':(exclude)tools/setup-workerd-demo.sh' \
-    ':(exclude)tools/hyperlight-demo' ||
-    fail "runtime files differ from Hyperlight commit $HYPERLIGHT_COMMIT"
+git -C "$root" diff --quiet &&
+    git -C "$root" diff --cached --quiet ||
+    fail "the Hyperlight checkout has uncommitted tracked changes"
 git -C "$root" submodule update --init --recursive
 
 builder_file="$(mktemp)"
