@@ -578,6 +578,27 @@ mod tests {
     }
 
     #[test]
+    fn sql_operation_serializes_to_workerd_compatibility_token() {
+        let operation = D1Operation::Batch {
+            statements: vec![D1Statement {
+                sql: "SELECT 1".to_string(),
+                parameters: Vec::new(),
+            }],
+        };
+
+        assert_eq!(
+            serde_json::to_value(operation).unwrap(),
+            serde_json::json!({
+                "kind": "d1_batch",
+                "statements": [{
+                    "sql": "SELECT 1",
+                    "parameters": []
+                }]
+            })
+        );
+    }
+
+    #[test]
     fn deterministic_batch_is_transactional_and_persists_across_reset() {
         let runtime =
             runtime(D1Binding::in_memory("database", false, D1Limits::default()).unwrap());

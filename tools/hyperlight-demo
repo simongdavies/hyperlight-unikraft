@@ -740,20 +740,26 @@ ensure_capability_proof() {
         [[ ! -s "$output_dir/$database-before.tsv" ]]
     done
     local temporary="$proof.tmp"
-    cargo +1.98.0 run --release --locked --example workerd-capability-proof -- \
+    if ! cargo +1.98.0 run --release --locked --example workerd-capability-proof -- \
         "$root/build-elfloader/workerd-executor/rootfs.img" \
         "$root/build-elfloader/workerd-executor/executor" \
         344 \
         "$state_dir" \
         "$scope" \
-        >"$temporary"
+        >"$temporary"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
     if [[ "$scope" == sql ]]; then
-        jq -e '
+        if ! jq -e '
             .runtime == "workerd-on-hyperlight" and
             .sql.query_after_fresh_vm.results[0].rows == [[{"type":"integer","value":1},{"type":"text","value":"Ada"}]]
-        ' "$temporary" >/dev/null
+        ' "$temporary" >/dev/null; then
+            rm -f -- "$temporary"
+            return 1
+        fi
     else
-        jq -e '
+        if ! jq -e '
         .runtime == "workerd-on-hyperlight" and
         .scheduled.outcome == "ok" and
         .queue.explicit_acks == ["message-1"] and
@@ -767,7 +773,10 @@ ensure_capability_proof() {
         .cache.match_after_fresh_vm.cached_status == 200 and
         .sql.query_after_fresh_vm.results[0].rows == [[{"type":"integer","value":1},{"type":"text","value":"Ada"}]] and
         .durable_object.get_after_fresh_vm.value_base64 == "aHlwZXJsaWdodA=="
-        ' "$temporary" >/dev/null
+        ' "$temporary" >/dev/null; then
+            rm -f -- "$temporary"
+            return 1
+        fi
     fi
     mv "$temporary" "$proof"
     capability_proof_ran=true

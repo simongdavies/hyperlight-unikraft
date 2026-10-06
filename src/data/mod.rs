@@ -17,7 +17,10 @@ pub use d1::{
     D1Binding, D1Limits, D1Operation, D1Parameter, D1Request, D1Response, D1ResultSet, D1Service,
     D1Statement, D1Status, D1Value,
 };
-pub use d1::{D1Binding as SqlBinding, D1Limits as SqlLimits, D1Service as SqlService};
+pub use d1::{
+    D1Binding as SqlBinding, D1Limits as SqlLimits, D1Operation as SqlOperation,
+    D1Parameter as SqlParameter, D1Service as SqlService, D1Statement as SqlStatement,
+};
 pub use durable::{
     DurableDeliveryContext, DurableObjectBinding, DurableObjectError, DurableObjectLimits,
     DurableObjectOperation, DurableObjectRequest, DurableObjectResponse, DurableObjectService,

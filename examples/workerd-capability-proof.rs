@@ -12,7 +12,7 @@ use hyperlight_unikraft::broker_runtime::{
 use hyperlight_unikraft::data::{
     CacheBinding, CacheLimits, CacheService, DurableDeliveryContext, DurableObjectBinding,
     DurableObjectLimits, DurableObjectService, KvBinding, KvLimits, KvService, SqlBinding,
-    SqlLimits, SqlService,
+    SqlLimits, SqlOperation, SqlParameter, SqlService, SqlStatement,
 };
 use hyperlight_unikraft::workerd::{
     ExecutionProfile, FetchBroker, Header, ModuleType, PROTOCOL_VERSION, QueueMessage,
@@ -180,6 +180,10 @@ fn execute_profiled(
     ))
 }
 
+fn sql_batch_operation(statements: Vec<SqlStatement>) -> Result<Value, serde_json::Error> {
+    serde_json::to_value(SqlOperation::Batch { statements })
+}
+
 fn data_worker(
     rootfs: &PathBuf,
     executor: &PathBuf,
@@ -298,26 +302,26 @@ fn run_sql_proof(
         &version,
         "sql-batch",
         "database",
-        json!({
-            "kind":"sql_batch",
-            "statements":[
-                {"sql":"CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT NOT NULL)","parameters":[]},
-                {"sql":"INSERT INTO users(id, name) VALUES (?1, ?2)","parameters":[
-                    {"type":"integer","value":1},
-                    {"type":"text","value":"Ada"}
-                ]}
-            ]
-        }),
+        sql_batch_operation(vec![
+            SqlStatement {
+                sql: "CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT NOT NULL)".into(),
+                parameters: Vec::new(),
+            },
+            SqlStatement {
+                sql: "INSERT INTO users(id, name) VALUES (?1, ?2)".into(),
+                parameters: vec![SqlParameter::Integer(1), SqlParameter::Text("Ada".into())],
+            },
+        ])?,
     )?;
     let (query, query_profile) = execute_profiled(
         &worker,
         &version,
         "sql-query",
         "database",
-        json!({
-            "kind":"sql_batch",
-            "statements":[{"sql":"SELECT id, name FROM users ORDER BY id","parameters":[]}]
-        }),
+        sql_batch_operation(vec![SqlStatement {
+            sql: "SELECT id, name FROM users ORDER BY id".into(),
+            parameters: Vec::new(),
+        }])?,
     )?;
     println!(
         "{}",
@@ -530,26 +534,26 @@ export default {
         &data_version,
         "sql-batch",
         "database",
-        json!({
-            "kind":"sql_batch",
-            "statements":[
-                {"sql":"CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT NOT NULL)","parameters":[]},
-                {"sql":"INSERT INTO users(id, name) VALUES (?1, ?2)","parameters":[
-                    {"type":"integer","value":1},
-                    {"type":"text","value":"Ada"}
-                ]}
-            ]
-        }),
+        sql_batch_operation(vec![
+            SqlStatement {
+                sql: "CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT NOT NULL)".into(),
+                parameters: Vec::new(),
+            },
+            SqlStatement {
+                sql: "INSERT INTO users(id, name) VALUES (?1, ?2)".into(),
+                parameters: vec![SqlParameter::Integer(1), SqlParameter::Text("Ada".into())],
+            },
+        ])?,
     )?;
     let (sql_query, sql_query_profile) = execute_profiled(
         &data,
         &data_version,
         "sql-query",
         "database",
-        json!({
-            "kind":"sql_batch",
-            "statements":[{"sql":"SELECT id, name FROM users ORDER BY id","parameters":[]}]
-        }),
+        sql_batch_operation(vec![SqlStatement {
+            sql: "SELECT id, name FROM users ORDER BY id".into(),
+            parameters: Vec::new(),
+        }])?,
     )?;
     let (durable_put, durable_put_profile) = execute_profiled(
         &data,
