@@ -260,6 +260,29 @@ verify-workerd-kernel:
 verify-workerd-kernel:
     @Write-Error "verify-workerd-kernel needs Docker on Linux; run it inside WSL."; exit 1
 
+# One-time (per checkout) setup for the guided Workerd-on-Hyperlight feature
+# demos: builds the guest kernel/rootfs, the Workerd executor, and the
+# `workerd-demo` example and `hluk` binaries the demos drive.
+[unix]
+setup-workerd-demo:
+    bash "{{root_dir}}/tools/setup-workerd-demo.sh"
+
+[windows]
+setup-workerd-demo:
+    @Write-Error "setup-workerd-demo needs Docker on Linux; run it inside WSL."; exit 1
+
+# Run the guided Workerd-on-Hyperlight feature demos (tools/hyperlight-demo).
+# Run `just setup-workerd-demo` first. With no arguments this is interactive;
+# pass through flags such as --all, --demo NAME, or --list, e.g.
+# `just workerd-demos --demo resident`.
+[unix]
+workerd-demos *args:
+    bash "{{root_dir}}/tools/hyperlight-demo" {{args}}
+
+[windows]
+workerd-demos *args:
+    @Write-Error "workerd-demos needs Docker on Linux; run it inside WSL."; exit 1
+
 # Build the native test-fixture kernel from source, reproducibly, in the same
 # Docker toolchain as the elfloader kernel.  Sources live in the fixture dir;
 # the app is built at fixed container paths so the binary is deterministic.

@@ -364,6 +364,9 @@ bash examples/workerd-executor/build-rootfs.sh \
 step "Building the Hyperlight demo"
 cargo +"$RUST_VERSION" build --release --locked --example workerd-demo
 
+step "Building the hluk CLI (workerd-host demos)"
+cargo +"$RUST_VERSION" build --release --locked --bin hluk
+
 step "Verifying the Component Model fixture"
 (
     cd experiments/workerd-component-model

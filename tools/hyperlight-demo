@@ -66,12 +66,26 @@ root="$(normalize_path "$(cd "$(dirname "$0")/.." && pwd)")"
 output_dir="${HYPERLIGHT_DEMO_OUTPUT:-$root/demo-output}"
 demo_pid=""
 upstream_pid=""
+extra_pids=()
 verbose=false
 capability_proof_ran=false
 benchmark_requests="${HYPERLIGHT_BENCHMARK_REQUESTS:-$((physical_cores * 100))}"
 benchmark_concurrency="${HYPERLIGHT_BENCHMARK_CONCURRENCY:-$physical_cores}"
 benchmark_vms="${HYPERLIGHT_BENCHMARK_VMS:-$physical_cores}"
 benchmark_pool_vms="${HYPERLIGHT_BENCHMARK_POOL_VMS:-$((physical_cores + 1))}"
+# benchmark-resident/benchmark-multi-app/benchmark-orchestrator-contract:
+# number of independent/routed apps to spread load across. Reuses
+# physical_cores like the other benchmark_* defaults (uncapped by design:
+# document the resource implications rather than silently capping it).
+benchmark_apps="${HYPERLIGHT_BENCHMARK_APPS:-$physical_cores}"
+# Total requests for the three load benchmarks above. Distinct from
+# benchmark_requests (which stays the on-demand/prewarmed default): its
+# default depends on benchmark_apps, which --benchmark-apps may still
+# change later in arg parsing, so the real default is deferred and
+# computed once parsing finishes (see below the arg-parsing loop).
+benchmark_load_requests="${HYPERLIGHT_BENCHMARK_LOAD_REQUESTS:-}"
+benchmark_load_requests_explicit=false
+[[ -n "$benchmark_load_requests" ]] && benchmark_load_requests_explicit=true
 go_bin="${GOBIN:-}"
 if [[ -z "$go_bin" ]] && command -v go >/dev/null; then
     go_bin="$(go env GOBIN 2>/dev/null || true)"
@@ -102,8 +116,14 @@ demos=(
     websocket
     web-apis
     fetch
+    resident
+    multi-app
+    orchestrator-contract
     benchmark-on-demand
     benchmark-prewarmed
+    benchmark-resident
+    benchmark-multi-app
+    benchmark-orchestrator-contract
 )
 
 usage() {
@@ -137,6 +157,14 @@ Options:
   --benchmark-vms N Concurrent request VMs (default: physical cores)
   --benchmark-pool-vms N
                     Prewarmed inventory (default: physical cores + 1)
+  --benchmark-apps N
+                    Independent/routed apps for benchmark-resident,
+                    benchmark-multi-app, and benchmark-orchestrator-contract
+                    (default: physical cores)
+  --benchmark-load-requests N
+                    Total requests for those same three benchmarks,
+                    distributed evenly across --benchmark-apps apps
+                    (default: --benchmark-apps x 1000)
   --verbose         Stream raw command output as well as saving it
   -h, --help        Show this help
 EOF
@@ -162,8 +190,14 @@ title() {
         websocket) echo "Controlled WebSocket connections" ;;
         web-apis) echo "WinterTC and common Web APIs" ;;
         fetch) echo "Constrained outbound fetch" ;;
+        resident) echo "Reusable resident VM" ;;
+        multi-app) echo "Multi-app routing in one host process" ;;
+        orchestrator-contract) echo "Orchestrator-ready process contract" ;;
         benchmark-on-demand) echo "On-demand latency and throughput" ;;
         benchmark-prewarmed) echo "Prewarmed latency and throughput" ;;
+        benchmark-resident) echo "Resident-host throughput across independent apps" ;;
+        benchmark-multi-app) echo "Multi-app routing throughput and fairness" ;;
+        benchmark-orchestrator-contract) echo "Orchestrator contract under load and drain" ;;
         *) return 1 ;;
     esac
 }
@@ -188,8 +222,14 @@ description() {
         websocket) echo "Exercise the host broker that will carry WebSocket traffic and enforce endpoint, message-size, and lifetime limits; Workerd WebSocket-channel wiring remains separate." ;;
         web-apis) echo "Exercise timers, streams, handlers, MessagePort, and fresh state." ;;
         fetch) echo "Reach one declared loopback service while other destinations stay denied." ;;
+        resident) echo "A resident VM serves several requests without being torn down between them, then is explicitly retired once it crosses its configured request limit." ;;
+        multi-app) echo "One workerd-host process serves two independently configured apps, routed by hostname, from a single listening port." ;;
+        orchestrator-contract) echo "The workerd-host process exposes liveness, readiness, and status endpoints, and shuts down cleanly on SIGTERM." ;;
         benchmark-on-demand) echo "Measure requests when VMs are created or restored as they are needed." ;;
         benchmark-prewarmed) echo "Measure the same requests when ready VMs are available and replacements are prepared." ;;
+        benchmark-resident) echo "Drive real hey load across $benchmark_apps independently running resident workerd-host processes, each on its own loopback port, and capture per-app and aggregate throughput." ;;
+        benchmark-multi-app) echo "Drive real hey load across $benchmark_apps apps routed by hostname through one workerd-host process, and capture per-app fairness and routing/queue counters in demo output files." ;;
+        benchmark-orchestrator-contract) echo "Drive real hey load across $benchmark_apps apps, then send SIGTERM mid-flight and prove admitted requests drain while new traffic is not admitted." ;;
         *) return 1 ;;
     esac
 }
@@ -214,8 +254,14 @@ action() {
         websocket) echo "Open an allowed WebSocket, exchange messages, then exceed the message limit." ;;
         web-apis) echo "Call the timer, stream, handler, MessagePort, and fresh-state routes." ;;
         fetch) echo "Fetch one declared loopback endpoint and probe blocked network targets." ;;
+        resident) echo "Send several sequential requests against one resident VM, then exceed its max-requests-per-VM limit and show explicit retirement." ;;
+        multi-app) echo "Start one workerd-host process with two apps and request each by hostname." ;;
+        orchestrator-contract) echo "Drive /healthz, /readyz, and /status, then send SIGTERM and observe the drain and exit code." ;;
         benchmark-on-demand) echo "Send $benchmark_requests requests, with up to $benchmark_concurrency requests and $benchmark_vms VMs running at once, while VMs are created as needed." ;;
         benchmark-prewarmed) echo "Send $benchmark_requests requests, with up to $benchmark_concurrency requests and $benchmark_vms VMs running at once, using a ready inventory of $benchmark_pool_vms VMs." ;;
+        benchmark-resident) echo "Start $benchmark_apps independent resident apps on separate ports, then send $benchmark_load_requests total requests at $benchmark_concurrency aggregate concurrency, split evenly across apps." ;;
+        benchmark-multi-app) echo "Start one workerd-host process with $benchmark_apps routed apps, then send $benchmark_load_requests total requests at $benchmark_concurrency aggregate concurrency against each app's hostname." ;;
+        benchmark-orchestrator-contract) echo "Start one workerd-host process with $benchmark_apps apps, verify health/readiness/status under a reference load, then send the remaining in-flight share and SIGTERM together and measure the drain." ;;
         *) return 1 ;;
     esac
 }
@@ -236,7 +282,11 @@ takeaway() {
         wasi-p2|wasi-p3) echo "Portable interfaces remain narrow, bounded, and recoverable." ;;
         tcp-tls|udp|websocket|fetch) echo "Network access is denied by default; the host opens only listed destinations." ;;
         web-apis) echo "Common Web APIs remain useful across strict isolation boundaries." ;;
+        resident) echo "A resident VM keeps guest-visible state across requests until it is explicitly recycled." ;;
+        multi-app) echo "One host process can route many independently configured apps by hostname." ;;
+        orchestrator-contract) echo "An external orchestrator can rely on deterministic health, readiness, status, and shutdown behavior." ;;
         benchmark-on-demand|benchmark-prewarmed) echo "The same local request run shows the difference between creating VMs when needed and keeping VMs ready." ;;
+        benchmark-resident|benchmark-multi-app|benchmark-orchestrator-contract) echo "Real hey load, not just functional checks, backs the resident/multi-app/orchestrator-contract claims." ;;
         *) return 1 ;;
     esac
 }
@@ -310,6 +360,17 @@ result_lines() {
             echo "RESULT: The declared loopback endpoint returned the expected response."
             echo "EXPECTED DENIAL: Other hosts, ports, schemes, private ranges, and redirect following were blocked."
             ;;
+        resident)
+            echo "RESULT: Five sequential requests were served by the same resident VM without teardown."
+            echo "RESULT: The sixth request crossed max_requests_per_vm and triggered one explicit retirement."
+            ;;
+        multi-app)
+            echo "RESULT: Both apps answered correctly, routed purely by hostname, from one process and port."
+            ;;
+        orchestrator-contract)
+            echo "RESULT: /healthz, /readyz, and /status reported correctly while the process was running."
+            echo "RESULT: SIGTERM drained in-flight work and exited with code 0 (clean shutdown)."
+            ;;
         benchmark-on-demand)
             echo "RESULT: All $benchmark_requests requests succeeded."
             echo "RESULT: After the final response, no requests were running or waiting and cleanup was complete."
@@ -317,6 +378,18 @@ result_lines() {
         benchmark-prewarmed)
             echo "RESULT: All $benchmark_requests requests succeeded."
             echo "RESULT: The demo showed how many ready VMs remained and whether replacements were being prepared."
+            ;;
+        benchmark-resident)
+            echo "RESULT: All $benchmark_load_requests requests across $benchmark_apps independent resident apps succeeded."
+            echo "RESULT: Per-app and aggregate throughput/latency and resident status/retirement counters were captured."
+            ;;
+        benchmark-multi-app)
+            echo "RESULT: All $benchmark_load_requests requests across $benchmark_apps routed apps succeeded, one process and port."
+            echo "RESULT: Per-app and aggregate hey output, status, and routing kinds were captured."
+            ;;
+        benchmark-orchestrator-contract)
+            echo "RESULT: Health/readiness/status reported correctly while a reference load ran."
+            echo "RESULT: SIGTERM mid-flight drained admitted requests, rejected new traffic, and exited 0 within the drain timeout."
             ;;
         *) return 1 ;;
     esac
@@ -446,7 +519,7 @@ print_worker_code() {
     rm -f -- "$artifact" "$rendered"
     worker_code_heading
     case "$demo" in
-        isolation)
+        isolation|resident|multi-app|orchestrator-contract)
             write_bundle_worker_code \
                 "$root/examples/workerd-bundles/acceptance.json" "$artifact"
             ;;
@@ -482,9 +555,13 @@ print_worker_code() {
             write_bundle_worker_code \
                 "$root/examples/workerd-bundles/fetch-policy-demo.json" "$artifact"
             ;;
-        benchmark-on-demand|benchmark-prewarmed)
+        benchmark-on-demand|benchmark-prewarmed|benchmark-resident|benchmark-multi-app)
             write_bundle_worker_code \
                 "$root/examples/workerd-bundles/workerd-pool-benchmark.json" "$artifact"
+            ;;
+        benchmark-orchestrator-contract)
+            write_bundle_worker_code \
+                "$root/examples/workerd-bundles/workerd-drain-benchmark.json" "$artifact"
             ;;
         wasi-p2|wasi-p3)
             printf '  No JavaScript runs in Workerd for this WASI host-contract demo.\n\n'
@@ -666,6 +743,22 @@ print_demo_evidence() {
             evidence_row "Metadata/private" "denied"
             evidence_row "Redirect" "returned without following"
             ;;
+        resident)
+            evidence_row "Requests served" "$(jq -r '.[0].resident_requests_served' "$output_dir/resident/status.json")"
+            evidence_row "Retirements" "$(jq -r '.[0].retirements' "$output_dir/resident/status.json")"
+            evidence_row "max_requests_per_vm" "5"
+            ;;
+        multi-app)
+            evidence_row "app-a" "HTTP $(cut -f1 "$output_dir/multi-app/app-a.txt")"
+            evidence_row "app-b" "HTTP $(cut -f1 "$output_dir/multi-app/app-b.txt")"
+            evidence_row "Status" "$(jq -c '[.[] | {app_id, kind}]' "$output_dir/multi-app/status.json")"
+            ;;
+        orchestrator-contract)
+            evidence_row "healthz" "$(jq -r '.status' "$output_dir/orchestrator-contract/healthz.json")"
+            evidence_row "readyz" "$(jq -r '.status' "$output_dir/orchestrator-contract/readyz.json")"
+            evidence_row "status" "$(jq -c '.[0]' "$output_dir/orchestrator-contract/status.json")"
+            evidence_row "Exit code" "$(cat "$output_dir/orchestrator-contract/exit-code.txt") (0 = clean shutdown)"
+            ;;
         benchmark-on-demand|benchmark-prewarmed)
             local mode="${demo#benchmark-}"
             local benchmark_dir="$output_dir/benchmark-$mode"
@@ -686,6 +779,41 @@ print_demo_evidence() {
             sed 's/^/  /' "$benchmark_dir/lscpu.txt"
             printf '\n%bHEY OUTPUT%b\n\n' "$c_bold$c_green" "$c_reset"
             sed 's/^/  /' "$benchmark_dir/hey.txt"
+            ;;
+        benchmark-resident)
+            local dir="$output_dir/benchmark-resident"
+            evidence_row "Apps" "$benchmark_apps independent resident processes"
+            evidence_row "Total requests" "$benchmark_load_requests / aggregate concurrency $benchmark_concurrency"
+            evidence_row "Aggregate throughput" "$(jq -r '.aggregate.aggregate_requests_per_sec' "$dir/summary.json") req/s"
+            evidence_row "Weighted mean latency" "$(jq -r '.aggregate.weighted_mean_latency_ms' "$dir/summary.json") ms"
+            evidence_row "Per-app" "$(jq -c '[.apps[] | {app_id, requests, requests_per_sec}]' "$dir/summary.json")"
+            printf '\n%bLSCPU OUTPUT%b\n\n' "$c_bold$c_green" "$c_reset"
+            sed 's/^/  /' "$dir/lscpu.txt"
+            printf '\n%bSUMMARY JSON%b\n\n' "$c_bold$c_green" "$c_reset"
+            jq '.' "$dir/summary.json" | sed 's/^/  /'
+            ;;
+        benchmark-multi-app)
+            local dir="$output_dir/benchmark-multi-app"
+            evidence_row "Apps" "$benchmark_apps routed apps, one process and port"
+            evidence_row "Total requests" "$benchmark_load_requests / aggregate concurrency $benchmark_concurrency"
+            evidence_row "Aggregate throughput" "$(jq -r '.aggregate.aggregate_requests_per_sec' "$dir/summary.json") req/s"
+            evidence_row "Status" "$(jq -c '[.[] | {app_id, kind}]' "$dir/status.json")"
+            evidence_row "Per-app" "$(jq -c '[.apps[] | {app_id, requests, requests_per_sec}]' "$dir/summary.json")"
+            printf '\n%bLSCPU OUTPUT%b\n\n' "$c_bold$c_green" "$c_reset"
+            sed 's/^/  /' "$dir/lscpu.txt"
+            printf '\n%bSUMMARY JSON%b\n\n' "$c_bold$c_green" "$c_reset"
+            jq '.' "$dir/summary.json" | sed 's/^/  /'
+            ;;
+        benchmark-orchestrator-contract)
+            local dir="$output_dir/benchmark-orchestrator-contract"
+            evidence_row "Apps" "$benchmark_apps apps under load"
+            evidence_row "Pre-drain throughput" "$(jq -r '.pre_drain.aggregate.aggregate_requests_per_sec' "$dir/summary.json") req/s"
+            evidence_row "During-drain requests" "$(jq -r '.during_drain.aggregate.total_requests' "$dir/summary.json") completed after SIGTERM"
+            evidence_row "Post-signal probe" "$(jq -r '.post_signal_probe' "$dir/summary.json")"
+            evidence_row "Shutdown duration" "$(jq -r '.shutdown_duration_ms' "$dir/summary.json") ms"
+            evidence_row "Exit code" "$(jq -r '.exit_code' "$dir/summary.json") (0 = clean shutdown)"
+            printf '\n%bSUMMARY JSON%b\n\n' "$c_bold$c_green" "$c_reset"
+            jq '.' "$dir/summary.json" | sed 's/^/  /'
             ;;
         component)
             local component="$output_dir/component/proof.json"
@@ -804,6 +932,13 @@ stop_processes() {
         wait "$upstream_pid" 2>/dev/null || true
         upstream_pid=""
     fi
+    local pid
+    for pid in "${extra_pids[@]:-}"; do
+        [[ -n "$pid" ]] || continue
+        kill -TERM "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+    done
+    extra_pids=()
 }
 trap stop_processes EXIT INT TERM
 
@@ -819,6 +954,7 @@ require_runtime() {
     local required
     for required in \
         target/release/examples/workerd-demo \
+        target/release/hluk \
         build-elfloader/workerd-executor/executor \
         examples/workerd-bundles/acceptance.json
     do
@@ -868,6 +1004,408 @@ start_server() {
 
 run_exact_test() {
     cargo +1.98.0 test --locked --lib "$1" -- --exact --nocapture
+}
+
+# --- workerd-host (resident Workerd host) demo helpers -------------------
+#
+# These drive the `hluk workerd-host` binary (distinct from the single-app
+# `workerd-demo` example `start_server` above), so they get their own
+# config-writing, readiness-wait, and request helpers rather than reusing
+# the `workerd-demo`-specific ones.
+
+# write_host_config OUTPUT_PATH APPS_JSON
+#
+# Writes a `hyperlight_unikraft::workerd::HostConfig` JSON file at
+# OUTPUT_PATH, filling in this checkout's shared rootfs/executor and
+# wrapping the caller-provided apps array (already-built JSON, one element
+# per `AppConfig`).
+write_host_config() {
+    local output="$1"
+    local apps_json="$2"
+    jq -n \
+        --arg rootfs "$root/build-elfloader/workerd-executor/rootfs.img" \
+        --arg executor "$root/build-elfloader/workerd-executor/executor" \
+        --argjson apps "$apps_json" \
+        '{rootfs_path: $rootfs, executor_path: $executor, apps: $apps}' \
+        >"$output"
+}
+
+# app_config APP_ID HOSTNAME BUNDLE_PATH POOL_JSON [AFFINITY]
+#
+# Builds one `AppConfig` JSON object. POOL_JSON is an already-tagged
+# `AppPoolConfig` object, e.g. `{"kind":"resident","capacity":1,...}`.
+app_config() {
+    local app_id="$1" hostname="$2" bundle_path="$3" pool_json="$4"
+    local affinity="${5:-none}"
+    jq -n \
+        --arg app_id "$app_id" \
+        --arg hostname "$hostname" \
+        --arg bundle_path "$bundle_path" \
+        --argjson pool "$pool_json" \
+        --arg affinity "$affinity" \
+        '{
+            route: {app_id: $app_id, hostnames: [$hostname], path_prefix: null},
+            bundle_path: $bundle_path,
+            scratch_memory_mb: 384,
+            execute_timeout_secs: 30,
+            capability_policy: {},
+            pool: $pool,
+            connection_affinity: $affinity
+        }'
+}
+
+wait_for_workerd_host_ready() {
+    local server_log="$1"
+    local bind="$2"
+    local pid="${3:-$demo_pid}"
+    local attempt
+    for attempt in $(seq 1 600); do
+        if curl --silent --fail "http://$bind/__hyperlight/readyz" >/dev/null; then
+            return 0
+        fi
+        if ! kill -0 "$pid" 2>/dev/null; then
+            tail -n 30 "$server_log" >&2
+            return 1
+        fi
+        sleep 0.1
+    done
+    echo "workerd-host did not become ready; see $server_log" >&2
+    return 1
+}
+
+# start_workerd_host SERVER_LOG CONFIG_PATH [BIND] [EXTRA_ARGS...]
+start_workerd_host() {
+    local server_log="$1"
+    local config="$2"
+    local bind="${3:-127.0.0.1:8080}"
+    local shift_count=$#
+    ((shift_count > 3)) && shift_count=3
+    shift "$shift_count"
+    stop_demo
+    "$root/target/release/hluk" workerd-host \
+        --config "$config" \
+        --bind "$bind" \
+        "$@" \
+        >"$server_log" 2>&1 &
+    demo_pid=$!
+    wait_for_workerd_host_ready "$server_log" "$bind"
+}
+
+# start_workerd_host_extra SERVER_LOG CONFIG_PATH BIND [EXTRA_ARGS...]
+#
+# Like start_workerd_host, but for an ADDITIONAL concurrently-running
+# `hluk workerd-host` process (used by benchmark-resident's M independent,
+# simultaneously-up apps): does not call stop_demo or touch $demo_pid, and
+# tracks its PID in extra_pids so stop_processes cleans it up alongside the
+# primary process.
+start_workerd_host_extra() {
+    local server_log="$1" config="$2" bind="$3"
+    local shift_count=$#
+    ((shift_count > 3)) && shift_count=3
+    shift "$shift_count"
+    "$root/target/release/hluk" workerd-host \
+        --config "$config" \
+        --bind "$bind" \
+        "$@" \
+        >"$server_log" 2>&1 &
+    local pid=$!
+    extra_pids+=("$pid")
+    wait_for_workerd_host_ready "$server_log" "$bind" "$pid"
+}
+
+# allocate_evenly TOTAL PARTS ARRNAME
+#
+# Deterministically splits TOTAL into PARTS non-negative integers summing
+# to TOTAL: each part gets TOTAL/PARTS, and the remainder (TOTAL % PARTS)
+# is assigned one-each to the first parts, so results are stable and
+# reproducible regardless of divisibility. Writes the PARTS values into
+# the caller's array ARRNAME.
+allocate_evenly() {
+    local total="$1" parts="$2"
+    local -n out_arr="$3"
+    local base=$((total / parts))
+    local remainder=$((total % parts))
+    out_arr=()
+    local i share
+    for ((i = 0; i < parts; i++)); do
+        share="$base"
+        ((i < remainder)) && share=$((share + 1))
+        out_arr+=("$share")
+    done
+}
+
+# self_test: lightweight, offline (no demo processes, no network) coverage
+# for allocate_evenly's determinism/remainder handling. Run via the hidden
+# `--self-test` flag; exits non-zero on the first failed assertion.
+self_test() {
+    local failures=0
+
+    assert_alloc() {
+        local total="$1" parts="$2" expected="$3"
+        local -a got
+        allocate_evenly "$total" "$parts" got
+        local actual="${got[*]}"
+        if [[ "$actual" != "$expected" ]]; then
+            printf 'FAIL allocate_evenly %s %s: expected [%s] got [%s]\n' \
+                "$total" "$parts" "$expected" "$actual" >&2
+            failures=$((failures + 1))
+            return
+        fi
+        local sum=0 x
+        for x in "${got[@]}"; do sum=$((sum + x)); done
+        if ((sum != total)); then
+            printf 'FAIL allocate_evenly %s %s: parts sum to %s, not %s\n' \
+                "$total" "$parts" "$sum" "$total" >&2
+            failures=$((failures + 1))
+        fi
+    }
+
+    assert_alloc 100 4 "25 25 25 25"
+    assert_alloc 10 3 "4 3 3"
+    assert_alloc 1 1 "1"
+    assert_alloc 1 3 "1 0 0"
+    assert_alloc 7 7 "1 1 1 1 1 1 1"
+    assert_alloc 0 4 "0 0 0 0"
+
+    # Regression guard for run_one's fail-fast fix: bash disables errexit
+    # for a compound command (and everything nested inside it, including
+    # nested `set -e`) whenever that compound command is the left-hand
+    # side of `||`. `run_one` avoids that by toggling errexit off/on
+    # around a plain (non-conditional) subshell invocation instead of
+    # `(...) || status=$?`. Prove both the broken and the fixed pattern
+    # here, offline, so a future edit that reintroduces the `||` form is
+    # caught without needing a real demo process.
+    _self_test_fails() { local x=5; [[ "$x" == 0 ]]; echo "unreachable"; }
+
+    local broken_status=0
+    ( set -e; _self_test_fails >/dev/null 2>&1 ) || broken_status=$?
+    if ((broken_status == 0)); then
+        echo "self-test: confirmed the broken '(...) || status=\$?' pattern" \
+            "masks a failing assertion (status=0, as expected for this negative check)"
+    else
+        printf 'FAIL run_one regression guard: the broken pattern unexpectedly' >&2
+        printf ' reported status=%s; the pattern this guards against may have' "$broken_status" >&2
+        printf ' changed and this guard needs to be re-reasoned about\n' >&2
+        failures=$((failures + 1))
+    fi
+
+    set +e
+    ( set -e; _self_test_fails >/dev/null 2>&1 )
+    local fixed_status=$?
+    set -e
+    if ((fixed_status != 0)); then
+        echo "self-test: run_one's fail-fast pattern reports a nonzero status" \
+            "for a failing demo (status=$fixed_status)"
+    else
+        echo "FAIL run_one regression guard: the fail-fast pattern reported" \
+            "status=0 for a deliberately failing assertion" >&2
+        failures=$((failures + 1))
+    fi
+    unset -f _self_test_fails
+
+    if ((failures == 0)); then
+        echo "self-test: all allocate_evenly assertions passed"
+        return 0
+    fi
+    echo "self-test: $failures assertion(s) failed" >&2
+    return 1
+}
+
+# launch_hey_jobs REQS_ARR CONC_ARR URL_ARR HOST_ARR TIMEOUT_ARR OUTFILE_ARR STATUS_ARRNAME
+#
+# Runs one `hey` invocation per index across the given parallel arrays, at
+# most 16 concurrently (bounding heavy client processes in flight at any
+# instant regardless of how many apps/indices there are), recording each
+# job's exit status (0 = success) into STATUS_ARRNAME. A zero request
+# count is treated as a trivial success (no `hey` invocation, empty
+# output file): used by the orchestrator-contract benchmark's degenerate
+# small-N per-app phase split.
+launch_hey_jobs() {
+    # Namerefs use a `_lhj_` prefix so they can never alias a caller-side
+    # array of the same base name (bash namerefs otherwise self-reference
+    # and fail with "circular name reference" when the caller's array
+    # happens to share the parameter's name, e.g. `launch_hey_jobs reqs
+    # concs ...`).
+    local -n _lhj_reqs="$1" _lhj_concs="$2" _lhj_urls="$3" _lhj_hosts="$4"
+    local -n _lhj_timeouts="$5" _lhj_outfiles="$6"
+    local -n _lhj_statuses="$7"
+    local max_parallel=16
+    local n="${#_lhj_reqs[@]}"
+    _lhj_statuses=()
+    local i=0
+    while ((i < n)); do
+        local -a batch_pids=() batch_indexes=()
+        local batch_end=$((i + max_parallel))
+        ((batch_end <= n)) || batch_end="$n"
+        local j
+        for ((j = i; j < batch_end; j++)); do
+            if ((_lhj_reqs[j] <= 0)); then
+                _lhj_statuses[j]=0
+                : >"${_lhj_outfiles[j]}"
+                continue
+            fi
+            local -a host_args=()
+            [[ -n "${_lhj_hosts[j]}" ]] && host_args=(-host "${_lhj_hosts[j]}")
+            hey -n "${_lhj_reqs[j]}" -c "${_lhj_concs[j]}" -t "${_lhj_timeouts[j]}" \
+                "${host_args[@]}" "${_lhj_urls[j]}" >"${_lhj_outfiles[j]}" 2>&1 &
+            batch_pids+=("$!")
+            batch_indexes+=("$j")
+        done
+        local k
+        for ((k = 0; k < ${#batch_pids[@]}; k++)); do
+            local pid="${batch_pids[k]}" idx="${batch_indexes[k]}"
+            local status=0
+            wait "$pid" || status=$?
+            _lhj_statuses[idx]="$status"
+        done
+        i="$batch_end"
+    done
+}
+
+# build_app_summary APP_ID REQUESTS CONCURRENCY HEY_OUTPUT_FILE
+#
+# Parses one `hey` text report into a per-app JSON summary object, using
+# the requests/concurrency the caller already configured rather than
+# re-deriving them from the report. Missing fields (e.g. a skipped
+# zero-request job) default to 0.
+build_app_summary() {
+    local app_id="$1" requests="$2" concurrency="$3" hey_file="$4"
+    local rps avg_s
+    rps="$(grep -m1 'Requests/sec:' "$hey_file" | awk '{print $2}')"
+    avg_s="$(grep -m1 '  Average:' "$hey_file" | awk '{print $2}')"
+    jq -n \
+        --arg app_id "$app_id" \
+        --argjson requests "$requests" \
+        --argjson concurrency "$concurrency" \
+        --argjson rps "${rps:-0}" \
+        --argjson avg_s "${avg_s:-0}" \
+        '{
+            app_id: $app_id,
+            requests: $requests,
+            concurrency: $concurrency,
+            requests_per_sec: $rps,
+            average_latency_ms: ($avg_s * 1000)
+        }'
+}
+
+# write_benchmark_summary SCENARIO PER_APP_ARRAY_JSON OUTPUT_PATH
+#
+# Builds the common {scenario, apps, aggregate} shape shared by all three
+# new benchmarks' summary.json: aggregate throughput is the sum of each
+# app's independently-measured requests/sec (a standard approximation for
+# combined client-side load), and aggregate latency is the per-request
+# weighted mean across apps.
+write_benchmark_summary() {
+    local scenario="$1" per_app_json="$2" output="$3"
+    jq -n --arg scenario "$scenario" --argjson apps "$per_app_json" '
+        {
+            scenario: $scenario,
+            apps: $apps,
+            aggregate: {
+                total_requests: ($apps | map(.requests) | add),
+                aggregate_requests_per_sec: ($apps | map(.requests_per_sec) | add),
+                weighted_mean_latency_ms: (
+                    ($apps | map(.average_latency_ms * .requests) | add) /
+                    (($apps | map(.requests) | add) as $total |
+                        if $total > 0 then $total else 1 end)
+                )
+            }
+        }' >"$output"
+}
+
+# host_http_get BIND HOST_HEADER PATH -> prints "STATUS\tBODY"
+host_http_get() {
+    local bind="$1" host_header="$2" path="$3"
+    local body status
+    body="$(curl --silent --show-error --output - --write-out '\n%{http_code}' \
+        --header "Host: $host_header" "http://$bind$path")"
+    status="${body##*$'\n'}"
+    printf '%s\t%s\n' "$status" "${body%$'\n'*}"
+}
+
+run_resident() {
+    local dir="$output_dir/resident"
+    mkdir -p "$dir"
+    local pool
+    pool="$(jq -n '{kind:"resident", capacity:1, queue_capacity:4, max_requests_per_vm:5, max_lifetime_secs:null}')"
+    local apps
+    apps="$(jq -n --argjson app "$(app_config resident resident.test \
+        "$root/examples/workerd-bundles/acceptance.json" "$pool")" '[$app]')"
+    write_host_config "$dir/config.json" "$apps"
+    start_workerd_host "$dir/server.log" "$dir/config.json" 127.0.0.1:8180
+    local n
+    for n in $(seq 1 6); do
+        host_http_get 127.0.0.1:8180 resident.test "/resident/$n" \
+            >"$dir/request-$n.txt"
+        [[ "$(cut -f1 "$dir/request-$n.txt")" == 200 ]]
+    done
+    curl --fail-with-body --silent --show-error \
+        --header "Host: resident.test" \
+        http://127.0.0.1:8180/__hyperlight/status \
+        | tee "$dir/status.json" \
+        | jq -e '.[0].resident_requests_served == 6 and .[0].retirements == 1' \
+        >/dev/null
+    stop_processes
+    echo "Six requests hit one resident VM; the sixth crossed max_requests_per_vm and retired it."
+}
+
+run_multi_app() {
+    local dir="$output_dir/multi-app"
+    mkdir -p "$dir"
+    local resident_pool disposable_pool apps
+    resident_pool="$(jq -n '{kind:"resident", capacity:1, queue_capacity:4, max_requests_per_vm:null, max_lifetime_secs:null}')"
+    disposable_pool="$(jq -n '{kind:"disposable", max_concurrent_sandboxes:4, queue_capacity:16}')"
+    apps="$(jq -n \
+        --argjson a "$(app_config app-a a.test \
+            "$root/examples/workerd-bundles/acceptance.json" "$resident_pool")" \
+        --argjson b "$(app_config app-b b.test \
+            "$root/examples/workerd-bundles/acceptance.json" "$disposable_pool")" \
+        '[$a, $b]')"
+    write_host_config "$dir/config.json" "$apps"
+    start_workerd_host "$dir/server.log" "$dir/config.json" 127.0.0.1:8181
+    host_http_get 127.0.0.1:8181 a.test /hello >"$dir/app-a.txt"
+    host_http_get 127.0.0.1:8181 b.test /hello >"$dir/app-b.txt"
+    [[ "$(cut -f1 "$dir/app-a.txt")" == 200 ]]
+    [[ "$(cut -f1 "$dir/app-b.txt")" == 200 ]]
+    curl --fail-with-body --silent --show-error \
+        --header "Host: a.test" \
+        http://127.0.0.1:8181/__hyperlight/status \
+        | tee "$dir/status.json" \
+        | jq -e '
+            (map(select(.app_id == "app-a"))[0].kind == "resident") and
+            (map(select(.app_id == "app-b"))[0].kind == "disposable")
+        ' >/dev/null
+    stop_processes
+    echo "Both apps were served correctly and independently from one process and port."
+}
+
+run_orchestrator_contract() {
+    local dir="$output_dir/orchestrator-contract"
+    mkdir -p "$dir"
+    local pool apps
+    pool="$(jq -n '{kind:"disposable", max_concurrent_sandboxes:4, queue_capacity:16}')"
+    apps="$(jq -n --argjson app "$(app_config contract contract.test \
+        "$root/examples/workerd-bundles/acceptance.json" "$pool")" '[$app]')"
+    write_host_config "$dir/config.json" "$apps"
+    start_workerd_host "$dir/server.log" "$dir/config.json" 127.0.0.1:8182
+    curl --fail-with-body --silent --show-error \
+        http://127.0.0.1:8182/__hyperlight/healthz >"$dir/healthz.json"
+    jq -e '.status == "ok"' "$dir/healthz.json" >/dev/null
+    curl --fail-with-body --silent --show-error \
+        http://127.0.0.1:8182/__hyperlight/readyz >"$dir/readyz.json"
+    jq -e '.status == "ready"' "$dir/readyz.json" >/dev/null
+    curl --fail-with-body --silent --show-error \
+        --header "Host: contract.test" \
+        http://127.0.0.1:8182/__hyperlight/status >"$dir/status.json"
+    jq -e '.[0].app_id == "contract" and .[0].kind == "disposable"' \
+        "$dir/status.json" >/dev/null
+    kill -TERM "$demo_pid"
+    local exit_code=0
+    wait "$demo_pid" || exit_code=$?
+    demo_pid=""
+    echo "$exit_code" >"$dir/exit-code.txt"
+    [[ "$exit_code" == 0 ]]
+    echo "SIGTERM produced a clean drain and exit code $exit_code (0 = clean shutdown)."
 }
 
 run_isolation() {
@@ -1365,6 +1903,328 @@ run_benchmark() {
     printf 'demo-output/benchmark-prewarmed/hey.txt on this same host.\n'
 }
 
+run_benchmark_resident() {
+    local dir="$output_dir/benchmark-resident"
+    mkdir -p "$dir"
+    LC_ALL=C lscpu | grep -E '^(CPU\(s\)|Socket|Core|Thread)' >"$dir/lscpu.txt"
+
+    local -a req_alloc conc_alloc
+    allocate_evenly "$benchmark_load_requests" "$benchmark_apps" req_alloc
+    allocate_evenly "$benchmark_concurrency" "$benchmark_apps" conc_alloc
+
+    local -a reqs concs urls hosts timeouts outfiles statuses status_files
+    local i
+    for ((i = 0; i < benchmark_apps; i++)); do
+        local app_dir="$dir/app-$i"
+        mkdir -p "$app_dir"
+        local port=$((8320 + i))
+        local bind="127.0.0.1:$port"
+        local conc=$((conc_alloc[i] < req_alloc[i] ? conc_alloc[i] : req_alloc[i]))
+        ((conc > 0)) || conc=1
+        local queue_capacity=64
+        ((conc * 4 > queue_capacity)) && queue_capacity=$((conc * 4))
+        local pool
+        pool="$(jq -n --argjson capacity "$conc" --argjson qc "$queue_capacity" \
+            '{kind:"resident", capacity:$capacity, queue_capacity:$qc, max_requests_per_vm:null, max_lifetime_secs:null}')"
+        local apps_json
+        apps_json="$(jq -n --argjson app "$(app_config "bench-$i" bench.resident.test \
+            "$root/examples/workerd-bundles/workerd-pool-benchmark.json" "$pool")" '[$app]')"
+        write_host_config "$app_dir/config.json" "$apps_json"
+        if ((i == 0)); then
+            start_workerd_host "$app_dir/server.log" "$app_dir/config.json" "$bind"
+        else
+            start_workerd_host_extra "$app_dir/server.log" "$app_dir/config.json" "$bind"
+        fi
+        reqs[i]="${req_alloc[i]}"
+        concs[i]="$conc"
+        urls[i]="http://$bind/sync"
+        hosts[i]="bench.resident.test"
+        timeouts[i]=30
+        outfiles[i]="$app_dir/hey.txt"
+        status_files[i]="$app_dir/status.json"
+    done
+
+    launch_hey_jobs reqs concs urls hosts timeouts outfiles statuses
+
+    local app_summaries="[]"
+    for ((i = 0; i < benchmark_apps; i++)); do
+        [[ "${statuses[i]}" == 0 ]]
+        if ((reqs[i] > 0)); then
+            grep -Eq "\\[200\\][[:space:]]+${reqs[i]} responses" "${outfiles[i]}"
+        fi
+        local port=$((8320 + i))
+        curl --fail-with-body --silent --show-error \
+            "http://127.0.0.1:$port/__hyperlight/status" >"${status_files[i]}"
+        local one
+        one="$(build_app_summary "bench-$i" "${reqs[i]}" "${concs[i]}" "${outfiles[i]}")"
+        app_summaries="$(jq -c --argjson one "$one" '. + [$one]' <<<"$app_summaries")"
+    done
+
+    write_benchmark_summary "benchmark-resident" "$app_summaries" "$dir/summary.json"
+    jq -s '.' "$dir"/app-*/status.json >"$dir/status.json"
+    stop_processes
+    echo "All $benchmark_load_requests requests across $benchmark_apps independent resident apps succeeded; see $dir/summary.json"
+}
+
+run_benchmark_multi_app() {
+    local dir="$output_dir/benchmark-multi-app"
+    mkdir -p "$dir"
+    LC_ALL=C lscpu | grep -E '^(CPU\(s\)|Socket|Core|Thread)' >"$dir/lscpu.txt"
+    local bind=127.0.0.1:8330
+
+    local -a req_alloc conc_alloc
+    allocate_evenly "$benchmark_load_requests" "$benchmark_apps" req_alloc
+    allocate_evenly "$benchmark_concurrency" "$benchmark_apps" conc_alloc
+
+    local -a app_json_lines
+    local i
+    for ((i = 0; i < benchmark_apps; i++)); do
+        local pool
+        if ((i % 2 == 0)); then
+            pool="$(jq -n '{kind:"resident", capacity:4, queue_capacity:64, max_requests_per_vm:null, max_lifetime_secs:null}')"
+        else
+            pool="$(jq -n '{kind:"disposable", max_concurrent_sandboxes:4, queue_capacity:64}')"
+        fi
+        app_json_lines+=("$(app_config "app-$i" "app-$i.bench" \
+            "$root/examples/workerd-bundles/workerd-pool-benchmark.json" "$pool")")
+    done
+    local apps_json
+    apps_json="$(printf '%s\n' "${app_json_lines[@]}" | jq -s '.')"
+    write_host_config "$dir/config.json" "$apps_json"
+    start_workerd_host "$dir/server.log" "$dir/config.json" "$bind"
+
+    local -a reqs concs urls hosts timeouts outfiles statuses
+    for ((i = 0; i < benchmark_apps; i++)); do
+        local conc=$((conc_alloc[i] < req_alloc[i] ? conc_alloc[i] : req_alloc[i]))
+        ((conc > 0)) || conc=1
+        reqs[i]="${req_alloc[i]}"
+        concs[i]="$conc"
+        urls[i]="http://$bind/sync"
+        hosts[i]="app-$i.bench"
+        timeouts[i]=30
+        outfiles[i]="$dir/app-$i-hey.txt"
+    done
+    launch_hey_jobs reqs concs urls hosts timeouts outfiles statuses
+
+    local app_summaries="[]"
+    for ((i = 0; i < benchmark_apps; i++)); do
+        [[ "${statuses[i]}" == 0 ]]
+        if ((reqs[i] > 0)); then
+            grep -Eq "\\[200\\][[:space:]]+${reqs[i]} responses" "${outfiles[i]}"
+        fi
+        local one
+        one="$(build_app_summary "app-$i" "${reqs[i]}" "${concs[i]}" "${outfiles[i]}")"
+        app_summaries="$(jq -c --argjson one "$one" '. + [$one]' <<<"$app_summaries")"
+    done
+
+    curl --fail-with-body --silent --show-error \
+        --header "Host: app-0.bench" \
+        "http://$bind/__hyperlight/status" >"$dir/status.json"
+    jq -e --argjson expected "$benchmark_apps" 'length == $expected' "$dir/status.json" >/dev/null
+
+    write_benchmark_summary "benchmark-multi-app" "$app_summaries" "$dir/summary.json"
+    stop_processes
+    echo "All $benchmark_load_requests requests across $benchmark_apps routed apps succeeded, one process and port; see $dir/summary.json"
+}
+
+run_benchmark_orchestrator_contract() {
+    local dir="$output_dir/benchmark-orchestrator-contract"
+    mkdir -p "$dir"
+    local bind=127.0.0.1:8331
+
+    local -a total_alloc
+    allocate_evenly "$benchmark_load_requests" "$benchmark_apps" total_alloc
+
+    local -a app_json_lines
+    local i
+    for ((i = 0; i < benchmark_apps; i++)); do
+        local pool
+        pool="$(jq -n '{kind:"disposable", max_concurrent_sandboxes:4, queue_capacity:64}')"
+        app_json_lines+=("$(app_config "drain-$i" "drain-$i.bench" \
+            "$root/examples/workerd-bundles/workerd-drain-benchmark.json" "$pool")")
+    done
+    local apps_json
+    apps_json="$(printf '%s\n' "${app_json_lines[@]}" | jq -s '.')"
+    write_host_config "$dir/config.json" "$apps_json"
+    start_workerd_host "$dir/server.log" "$dir/config.json" "$bind" \
+        --drain-timeout-ms 5000
+
+    # Phase A/B split: ~75% of each app's allocation goes to the pre-drain
+    # /sync reference load; the remaining ~25% (floor 1, borrowed from
+    # Phase A when an app's total is very small) goes to /drain and is
+    # launched right before SIGTERM, proving in-flight admitted work still
+    # completes.
+    local -a phase_a_alloc phase_b_alloc
+    for ((i = 0; i < benchmark_apps; i++)); do
+        local total="${total_alloc[i]}"
+        local b=$((total / 4))
+        ((b >= 1)) || b=1
+        ((b <= total)) || b="$total"
+        phase_a_alloc[i]=$((total - b))
+        phase_b_alloc[i]="$b"
+    done
+
+    local -a conc_alloc
+    allocate_evenly "$benchmark_concurrency" "$benchmark_apps" conc_alloc
+
+    # Phase A: foreground, run to completion as the pre-drain reference.
+    local -a a_reqs a_concs a_urls a_hosts a_timeouts a_outfiles a_statuses
+    for ((i = 0; i < benchmark_apps; i++)); do
+        local conc=$((conc_alloc[i] < phase_a_alloc[i] ? conc_alloc[i] : phase_a_alloc[i]))
+        ((conc > 0)) || conc=1
+        a_reqs[i]="${phase_a_alloc[i]}"
+        a_concs[i]="$conc"
+        a_urls[i]="http://$bind/sync"
+        a_hosts[i]="drain-$i.bench"
+        a_timeouts[i]=30
+        a_outfiles[i]="$dir/app-$i-phase-a.txt"
+    done
+    launch_hey_jobs a_reqs a_concs a_urls a_hosts a_timeouts a_outfiles a_statuses
+
+    local pre_apps="[]"
+    for ((i = 0; i < benchmark_apps; i++)); do
+        [[ "${a_statuses[i]}" == 0 ]]
+        if ((a_reqs[i] > 0)); then
+            grep -Eq "\\[200\\][[:space:]]+${a_reqs[i]} responses" "${a_outfiles[i]}"
+        fi
+        local one
+        one="$(build_app_summary "drain-$i" "${a_reqs[i]}" "${a_concs[i]}" "${a_outfiles[i]}")"
+        pre_apps="$(jq -c --argjson one "$one" '. + [$one]' <<<"$pre_apps")"
+    done
+    write_benchmark_summary "pre-drain" "$pre_apps" "$dir/pre-drain-summary.json"
+
+    curl --fail-with-body --silent --show-error \
+        "http://$bind/__hyperlight/healthz" >"$dir/healthz.json"
+    jq -e '.status == "ok"' "$dir/healthz.json" >/dev/null
+    curl --fail-with-body --silent --show-error \
+        "http://$bind/__hyperlight/readyz" >"$dir/readyz-before.json"
+    jq -e '.status == "ready"' "$dir/readyz-before.json" >/dev/null
+    curl --fail-with-body --silent --show-error \
+        --header "Host: drain-0.bench" \
+        "http://$bind/__hyperlight/status" >"$dir/status.json"
+    jq -e --argjson expected "$benchmark_apps" 'length == $expected' "$dir/status.json" >/dev/null
+
+    # Phase B: launch the in-flight /drain batch in the background, give it
+    # a head start to actually connect and be accepted/dispatched before
+    # signaling: workerd-host's accept loop checks its shutdown flag before
+    # each `accept()`, so a connection that has not yet been accepted when
+    # the flag flips is never admitted and fails with a connection error
+    # instead of draining. `tests/workerd_host_contract.rs`'s equivalent
+    # test gets away with a fixed 30ms sleep because it dispatches the
+    # in-flight request from an in-process thread; here each app's head
+    # start is an external `hey` process, whose fork/exec and Go-runtime
+    # startup latency is not bounded by a fixed sleep (observed, under WSL2
+    # load, to occasionally exceed 30ms for one app while a later-launched
+    # app's process happens to start faster). So instead of sleeping a
+    # fixed duration, poll each app's real `/status` admitted-work counters
+    # (active+queued) and only signal once every app shows at least one
+    # in-flight request, bounded by a generous timeout; a timeout here
+    # means a real failure to admit, which the grep assertions below will
+    # then correctly surface as a demo FAIL rather than mask. M is bounded
+    # by --benchmark-apps and documented to stay small, so this
+    # intentionally does not route through the 16-way launch_hey_jobs
+    # batching.
+    local -a b_pids b_reqs b_concs b_outfiles
+    for ((i = 0; i < benchmark_apps; i++)); do
+        local conc=$((conc_alloc[i] < phase_b_alloc[i] ? conc_alloc[i] : phase_b_alloc[i]))
+        ((conc > 0)) || conc=1
+        b_reqs[i]="${phase_b_alloc[i]}"
+        b_concs[i]="$conc"
+        b_outfiles[i]="$dir/app-$i-phase-b.txt"
+        hey -n "${phase_b_alloc[i]}" -c "$conc" -t 30 \
+            -host "drain-$i.bench" "http://$bind/drain" \
+            >"${b_outfiles[i]}" 2>&1 &
+        b_pids[i]=$!
+    done
+
+    local admit_deadline=$((SECONDS + 10))
+    while true; do
+        local admitted_status all_admitted=1
+        admitted_status="$(curl --silent --show-error --max-time 1 \
+            --header "Host: drain-0.bench" "http://$bind/__hyperlight/status" 2>/dev/null || echo '[]')"
+        for ((i = 0; i < benchmark_apps; i++)); do
+            local in_flight
+            in_flight="$(jq -r --arg id "drain-$i" \
+                '[.[] | select(.app_id == $id) | (.active + .queued)] | add // 0' \
+                <<<"$admitted_status" 2>/dev/null || echo 0)"
+            ((in_flight >= 1)) || all_admitted=0
+        done
+        ((all_admitted == 1)) && break
+        ((SECONDS < admit_deadline)) || break
+        sleep 0.01
+    done
+
+    local shutdown_start
+    shutdown_start="$(date +%s%3N)"
+    kill -TERM "$demo_pid"
+
+    local post_signal_probe="no_response"
+    local probe_body probe_exit=0
+    probe_body="$(curl --silent --show-error --max-time 1 --output /dev/null \
+        --write-out '%{http_code}' "http://$bind/__hyperlight/readyz")" || probe_exit=$?
+    if ((probe_exit == 0)) && [[ "$probe_body" == 200 ]]; then
+        post_signal_probe="unexpected_200"
+    fi
+    [[ "$post_signal_probe" == no_response ]]
+
+    local -a b_statuses
+    for ((i = 0; i < benchmark_apps; i++)); do
+        local status=0
+        wait "${b_pids[i]}" || status=$?
+        b_statuses[i]="$status"
+    done
+
+    local during_apps="[]"
+    for ((i = 0; i < benchmark_apps; i++)); do
+        [[ "${b_statuses[i]}" == 0 ]]
+        if ((b_reqs[i] > 0)); then
+            grep -Eq "\\[200\\][[:space:]]+${b_reqs[i]} responses" "${b_outfiles[i]}"
+        fi
+        local one
+        one="$(build_app_summary "drain-$i" "${b_reqs[i]}" "${b_concs[i]}" "${b_outfiles[i]}")"
+        during_apps="$(jq -c --argjson one "$one" '. + [$one]' <<<"$during_apps")"
+    done
+    write_benchmark_summary "during-drain" "$during_apps" "$dir/during-drain-summary.json"
+
+    # Bounded poll for process exit (drain-timeout-ms 5000 + buffer), not a
+    # blind wait: new connections after SIGTERM get no response until the
+    # process actually exits, so this is the only reliable exit signal.
+    local deadline=$((SECONDS + 15))
+    while kill -0 "$demo_pid" 2>/dev/null; do
+        if ((SECONDS >= deadline)); then
+            echo "workerd-host did not exit within the drain timeout" >&2
+            return 1
+        fi
+        sleep 0.05
+    done
+    local exit_code=0
+    wait "$demo_pid" || exit_code=$?
+    local shutdown_end
+    shutdown_end="$(date +%s%3N)"
+    demo_pid=""
+
+    local shutdown_duration_ms=$((shutdown_end - shutdown_start))
+    jq -n \
+        --arg scenario "orchestrator-contract" \
+        --slurpfile pre_drain "$dir/pre-drain-summary.json" \
+        --slurpfile during_drain "$dir/during-drain-summary.json" \
+        --arg post_signal_probe "$post_signal_probe" \
+        --argjson shutdown_duration_ms "$shutdown_duration_ms" \
+        --argjson exit_code "$exit_code" \
+        '{
+            scenario: $scenario,
+            pre_drain: $pre_drain[0],
+            during_drain: $during_drain[0],
+            post_signal_probe: $post_signal_probe,
+            shutdown_duration_ms: $shutdown_duration_ms,
+            exit_code: $exit_code
+        }' >"$dir/summary.json"
+
+    [[ "$exit_code" == 0 ]]
+    echo "$exit_code" >"$dir/exit-code.txt"
+    echo "SIGTERM mid-flight drained admitted requests (post-signal probe: $post_signal_probe) and exited $exit_code within the drain timeout ($shutdown_duration_ms ms)."
+}
+
 run_demo_command() {
     case "$1" in
         isolation) run_isolation ;;
@@ -1385,8 +2245,14 @@ run_demo_command() {
         websocket) run_websocket ;;
         web-apis) run_web_apis ;;
         fetch) run_fetch ;;
+        resident) run_resident ;;
+        multi-app) run_multi_app ;;
+        orchestrator-contract) run_orchestrator_contract ;;
         benchmark-on-demand) run_benchmark on-demand ;;
         benchmark-prewarmed) run_benchmark prewarmed ;;
+        benchmark-resident) run_benchmark_resident ;;
+        benchmark-multi-app) run_benchmark_multi_app ;;
+        benchmark-orchestrator-contract) run_benchmark_orchestrator_contract ;;
         *) return 2 ;;
     esac
 }
@@ -1400,19 +2266,32 @@ run_one() {
     printf '\n%bRUNNING%b\n' "$c_yellow" "$c_reset"
     printf '  Raw log: %s\n\n' "$log"
     local status=0
+    # NOTE: deliberately not `(...) || status=$?`. Bash disables `errexit`
+    # for everything executed inside a compound command (and every nested
+    # function call within it, transitively) whenever that compound
+    # command is the left-hand side of `||`/`&&`/an `if` condition — even
+    # though the subshell re-enables `set -e` internally. That silently
+    # turned every demo's internal `[[ ]]`/`jq -e`/`grep -Eq` assertion
+    # into a no-op: a failing assertion would not abort the subshell, so
+    # the demo would still reach its last command and report PASS. Toggling
+    # `errexit` off/on around a *plain* (non-conditional) invocation avoids
+    # that exemption, so `$?` below reflects the first real failure.
+    set +e
     if "$verbose"; then
         (
             trap stop_processes EXIT INT TERM
             set -e
             run_demo_command "$demo"
-        ) > >(tee "$log") 2>&1 || status=$?
+        ) > >(tee "$log") 2>&1
     else
         (
             trap stop_processes EXIT INT TERM
             set -e
             run_demo_command "$demo"
-        ) >"$log" 2>&1 || status=$?
+        ) >"$log" 2>&1
     fi
+    status=$?
+    set -e
     if ((status == 0)); then
         printf '\n%bPASS%b  %s\n' "$c_green$c_bold" "$c_reset" "$(title "$demo")"
         print_demo_evidence "$demo"
@@ -1468,6 +2347,10 @@ while (($#)); do
             mode=clear
             shift
             ;;
+        --self-test)
+            mode=self-test
+            shift
+            ;;
         --output-dir)
             (($# >= 2)) || {
                 echo "--output-dir requires a value" >&2
@@ -1509,6 +2392,23 @@ while (($#)); do
             benchmark_pool_vms="$2"
             shift 2
             ;;
+        --benchmark-apps)
+            (($# >= 2)) || {
+                echo "--benchmark-apps requires a value" >&2
+                exit 2
+            }
+            benchmark_apps="$2"
+            shift 2
+            ;;
+        --benchmark-load-requests)
+            (($# >= 2)) || {
+                echo "--benchmark-load-requests requires a value" >&2
+                exit 2
+            }
+            benchmark_load_requests="$2"
+            benchmark_load_requests_explicit=true
+            shift 2
+            ;;
         --verbose)
             verbose=true
             shift
@@ -1525,11 +2425,17 @@ while (($#)); do
     esac
 done
 
+if [[ "$benchmark_load_requests_explicit" != true ]]; then
+    benchmark_load_requests=$((benchmark_apps * 1000))
+fi
+
 for benchmark_value in \
     benchmark_requests \
     benchmark_concurrency \
     benchmark_vms \
-    benchmark_pool_vms; do
+    benchmark_pool_vms \
+    benchmark_apps \
+    benchmark_load_requests; do
     if [[ ! "${!benchmark_value}" =~ ^[1-9][0-9]*$ ]]; then
         printf '%s must be a positive integer, got %q\n' \
             "$benchmark_value" "${!benchmark_value}" >&2
@@ -1543,6 +2449,38 @@ fi
 if ((benchmark_pool_vms < 2)); then
     echo "--benchmark-pool-vms must be at least 2" >&2
     exit 2
+fi
+
+# The --benchmark-apps (M) cross-checks below only apply to the three
+# M-based load benchmarks. benchmark_apps defaults to the physical-core
+# count independently of --benchmark-concurrency/--benchmark-requests
+# (which the pre-existing benchmark-on-demand/benchmark-prewarmed demos
+# use on their own), so gating this on the actually-selected demo(s) keeps
+# those two demos' existing flag combinations working unchanged.
+uses_benchmark_apps=false
+case "$mode" in
+    all) uses_benchmark_apps=true ;;
+    one)
+        case "$selected" in
+            benchmark-resident | benchmark-multi-app | benchmark-orchestrator-contract)
+                uses_benchmark_apps=true
+                ;;
+        esac
+        ;;
+esac
+if "$uses_benchmark_apps"; then
+    if ((benchmark_concurrency < benchmark_apps)); then
+        echo "--benchmark-concurrency must be at least --benchmark-apps" >&2
+        exit 2
+    fi
+    if ((benchmark_apps > benchmark_load_requests)); then
+        echo "--benchmark-apps cannot exceed --benchmark-load-requests" >&2
+        exit 2
+    fi
+    if ((benchmark_concurrency > benchmark_load_requests)); then
+        echo "--benchmark-concurrency cannot exceed --benchmark-load-requests" >&2
+        exit 2
+    fi
 fi
 
 if [[ "$mode" == one || "$mode" == describe ]] &&
@@ -1562,6 +2500,10 @@ fi
 if [[ "$mode" == clear ]]; then
     clear_output
     exit 0
+fi
+if [[ "$mode" == self-test ]]; then
+    self_test
+    exit $?
 fi
 if [[ "$mode" == describe ]]; then
     render_preview "$selected"

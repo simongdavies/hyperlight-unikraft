@@ -4,16 +4,16 @@
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use hyperlight_unikraft::workerd::{
-    FetchBroker, FetchBrokerConfig, FetchLimits, FetchPolicy, Header, MAX_BODY_BYTES,
-    MAX_HEADER_BYTES, PROTOCOL_VERSION, PrewarmPolicy, RequestEnvelope, StorageBinding,
-    StoragePolicy, TimerLimits, WorkerBundle, WorkerCapabilityPolicy, WorkerPoolRestoreMode,
-    WorkerRequestPool, WorkerVersionId, WorkerVersionSandbox,
+    ConnectionMode, FetchBroker, FetchBrokerConfig, FetchLimits, FetchPolicy, MAX_HEADER_BYTES,
+    PrewarmPolicy, StorageBinding, StoragePolicy, TimerLimits, WorkerBundle,
+    WorkerCapabilityPolicy, WorkerPoolRestoreMode, WorkerRequestPool, WorkerVersionId,
+    WorkerVersionSandbox, http_reason, read_http_request, write_http_error, write_http_response,
 };
 use hyperlight_unikraft::{AllowList, MountLimits, NetworkPolicy};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::OsString;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -875,16 +875,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("connection setup failed: {error}");
             continue;
         }
-        let request = match read_request(&mut stream, request_id) {
-            Ok(request) => request,
+        let parsed = match read_http_request(&mut stream, request_id, MAX_REQUEST_HEAD_BYTES) {
+            Ok(parsed) => parsed,
             Err(error) => {
-                if let Err(write_error) = write_error(&mut stream, 400, &error) {
+                if let Err(write_error) =
+                    write_http_error(&mut stream, 400, &error, ConnectionMode::Close)
+                {
                     eprintln!("bad request response failed: {write_error}");
                 }
                 continue;
             }
         };
-        if request_path(&request.url) == "/__hyperlight/pool-status" {
+        let request = parsed.envelope;
+        if parsed.path == "/__hyperlight/pool-status" {
             let status = pool.status();
             let body = serde_json::to_vec(&serde_json::json!({
                 "restore_mode": match options.restore_mode {
@@ -969,7 +972,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "profile_log_every": options.profile_log_every,
                 "profile_samples_logged": profile_samples.load(Ordering::Relaxed),
             }))?;
-            write_response(&mut stream, 200, "application/json", &body)?;
+            write_http_response(
+                &mut stream,
+                200,
+                "application/json",
+                &body,
+                ConnectionMode::Close,
+            )?;
             continue;
         }
         let request_sequence = profile_sequence.fetch_add(1, Ordering::Relaxed);
@@ -990,31 +999,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn request_path(url: &str) -> &str {
-    let authority_and_path = url.split_once("://").map_or(url, |(_, rest)| rest);
-    let path = authority_and_path
-        .find('/')
-        .map_or("/", |index| &authority_and_path[index..]);
-    path.split_once('?').map_or(path, |(path, _)| path)
-}
-
-fn write_response(
-    stream: &mut TcpStream,
-    status: u16,
-    content_type: &str,
-    body: &[u8],
-) -> Result<(), Box<dyn std::error::Error>> {
-    write!(
-        stream,
-        "HTTP/1.1 {status} {}\r\nContent-Type: {content_type}\r\n\
-         Content-Length: {}\r\nConnection: close\r\n\r\n",
-        reason(status),
-        body.len()
-    )?;
-    stream.write_all(body)?;
-    Ok(())
-}
-
 fn finish_request(
     stream: &mut TcpStream,
     execution: hyperlight_unikraft::workerd::RequestExecution,
@@ -1031,7 +1015,12 @@ fn finish_request(
         );
     }
     if let Some(error) = execution.submit_error {
-        write_error(stream, 503, submit_error_message(error))?;
+        write_http_error(
+            stream,
+            503,
+            submit_error_message(error),
+            ConnectionMode::Close,
+        )?;
         return Ok(());
     }
     match execution.result {
@@ -1041,7 +1030,7 @@ fn finish_request(
                 stream,
                 "HTTP/1.1 {} {}\r\n",
                 response.status,
-                reason(response.status)
+                http_reason(response.status)
             )?;
             for header in response.headers {
                 if !header.name.eq_ignore_ascii_case("content-length")
@@ -1058,11 +1047,16 @@ fn finish_request(
             stream.write_all(&body)?;
         }
         Err(hyperlight_unikraft::workerd::Error::Timeout) => {
-            write_error(stream, 504, "Worker timed out")?
+            write_http_error(stream, 504, "Worker timed out", ConnectionMode::Close)?
         }
         Err(error) => {
             eprintln!("Worker {request_id} failed: {error}");
-            write_error(stream, 502, "Worker execution failed")?;
+            write_http_error(
+                stream,
+                502,
+                "Worker execution failed",
+                ConnectionMode::Close,
+            )?;
         }
     }
     Ok(())
@@ -1085,120 +1079,6 @@ fn submit_error_message(error: hyperlight_unikraft::workerd::PoolSubmitError) ->
         hyperlight_unikraft::workerd::PoolSubmitError::Unavailable => {
             "Worker request pool is unavailable"
         }
-    }
-}
-
-fn read_request(stream: &mut TcpStream, request_id: String) -> Result<RequestEnvelope, String> {
-    let mut bytes = Vec::new();
-    let mut chunk = [0u8; 4096];
-    let head_end = loop {
-        if bytes.len() > MAX_REQUEST_HEAD_BYTES {
-            return Err("request headers exceed limit".into());
-        }
-        let count = stream.read(&mut chunk).map_err(|e| e.to_string())?;
-        if count == 0 {
-            return Err("connection closed before request headers".into());
-        }
-        bytes.extend_from_slice(&chunk[..count]);
-        if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
-            break end + 4;
-        }
-    };
-    let head = std::str::from_utf8(&bytes[..head_end])
-        .map_err(|_| "headers are not UTF-8")?
-        .to_owned();
-    let mut lines = head[..head.len() - 4].split("\r\n");
-    let mut request_line = lines
-        .next()
-        .ok_or_else(|| "missing request line".to_string())?
-        .split_ascii_whitespace();
-    let method = request_line
-        .next()
-        .ok_or_else(|| "missing method".to_string())?;
-    let target = request_line
-        .next()
-        .ok_or_else(|| "missing request target".to_string())?;
-    if request_line.next() != Some("HTTP/1.1") || request_line.next().is_some() {
-        return Err("only HTTP/1.1 is supported".into());
-    }
-    let mut headers = Vec::new();
-    let mut host = None;
-    let mut content_length = 0usize;
-    for line in lines {
-        let (name, value) = line
-            .split_once(':')
-            .ok_or_else(|| "malformed header".to_string())?;
-        let value = value.trim();
-        if name.eq_ignore_ascii_case("host") {
-            host = Some(value);
-        } else if name.eq_ignore_ascii_case("content-length") {
-            content_length = value
-                .parse()
-                .map_err(|_| "invalid Content-Length".to_string())?;
-        } else if name.eq_ignore_ascii_case("transfer-encoding") {
-            return Err("Transfer-Encoding is not supported".into());
-        }
-        headers.push(Header {
-            name: name.into(),
-            value: value.into(),
-        });
-    }
-    if content_length > MAX_BODY_BYTES {
-        return Err("request body exceeds limit".into());
-    }
-    while bytes.len() - head_end < content_length {
-        let count = stream.read(&mut chunk).map_err(|e| e.to_string())?;
-        if count == 0 {
-            return Err("connection closed before request body".into());
-        }
-        bytes.extend_from_slice(&chunk[..count]);
-        if bytes.len() - head_end > content_length {
-            return Err("bytes after request body".into());
-        }
-    }
-    if bytes.len() - head_end != content_length {
-        return Err("bytes after request body".into());
-    }
-    let url = if target.starts_with("http://") || target.starts_with("https://") {
-        target.into()
-    } else {
-        let host = host.ok_or_else(|| "missing Host header".to_string())?;
-        format!("http://{host}{target}")
-    };
-    let request = RequestEnvelope {
-        protocol_version: PROTOCOL_VERSION,
-        request_id,
-        method: method.into(),
-        url,
-        headers,
-        body_base64: STANDARD.encode(&bytes[head_end..]),
-    };
-    request.validate().map_err(|error| error.to_string())?;
-    Ok(request)
-}
-
-fn write_error(stream: &mut TcpStream, status: u16, message: &str) -> std::io::Result<()> {
-    write!(
-        stream,
-        "HTTP/1.1 {status} {}\r\nContent-Type: text/plain\r\n\
-         Content-Length: {}\r\nConnection: close\r\n\r\n{message}",
-        reason(status),
-        message.len()
-    )
-}
-
-fn reason(status: u16) -> &'static str {
-    match status {
-        200 => "OK",
-        201 => "Created",
-        204 => "No Content",
-        400 => "Bad Request",
-        404 => "Not Found",
-        500 => "Internal Server Error",
-        502 => "Bad Gateway",
-        503 => "Service Unavailable",
-        504 => "Gateway Timeout",
-        _ => "Worker Response",
     }
 }
 
