@@ -48,6 +48,14 @@ enum Command {
 
     /// Initialize, snapshot, fresh-restore and fetch a trusted Worker bundle.
     Workerd(WorkerdArgs),
+
+    /// Orchestrator-ready resident Workerd host: a long-running,
+    /// multi-app, multi-process-friendly server with liveness/readiness/
+    /// status contract endpoints and a graceful signal-driven drain. Not a
+    /// replacement for `workerd` (single-request CLI): this is the host
+    /// Boundaries 1-3's resident VM, bounded pool, and multi-app routing
+    /// are meant to run under.
+    WorkerdHost(WorkerdHostArgs),
 }
 
 #[derive(Subcommand)]
@@ -100,6 +108,35 @@ struct WorkerdArgs {
     /// Fetch timeout in milliseconds.
     #[arg(long, default_value_t = 10_000)]
     request_timeout_ms: u64,
+}
+
+/// Arguments for `workerd-host` — the orchestrator-ready multi-app,
+/// multi-process-friendly resident Workerd host (Boundary 4).
+#[derive(clap::Args)]
+struct WorkerdHostArgs {
+    /// Host configuration JSON: shared rootfs/executor plus every app's
+    /// route, bundle, and pool (disposable or resident). See
+    /// `hyperlight_unikraft::workerd::HostConfig`.
+    #[arg(long)]
+    config: PathBuf,
+
+    /// Address the host listens on for app traffic, and — unless
+    /// `--admin-bind` is set — the `/__hyperlight/*` contract endpoints.
+    #[arg(long, default_value = "127.0.0.1:8080")]
+    bind: String,
+
+    /// Optional separate address serving only the `/__hyperlight/*`
+    /// contract endpoints (liveness/readiness/status), so an orchestrator
+    /// can probe them on a port never exposed to app traffic. Defaults to
+    /// sharing `--bind`.
+    #[arg(long)]
+    admin_bind: Option<String>,
+
+    /// How long to wait for in-flight requests to finish after SIGTERM/
+    /// SIGINT before giving up and exiting with a drain-timeout error
+    /// (exit code 1).
+    #[arg(long, default_value_t = 10_000)]
+    drain_timeout_ms: u64,
 }
 
 /// Arguments for `run` — boot the embedded kernel + initrd and dispatch.
@@ -560,6 +597,503 @@ fn cmd_workerd(args: WorkerdArgs) -> CliResult<()> {
     Ok(())
 }
 
+/// Shared state for `workerd-host`'s background app-initialization thread
+/// and its accept loop: apps are loaded/initialized off the accept thread
+/// so `/__hyperlight/healthz` can serve immediately while VMs are still
+/// warming up, and `/__hyperlight/readyz` only flips once every app is up.
+enum WorkerdHostState {
+    Initializing,
+    Ready(hyperlight_unikraft::workerd::AppRegistry),
+    Failed(String),
+}
+
+/// `workerd-host` — Boundary 4 of the resident Workerd host: an
+/// orchestrator-ready, long-running multi-app server.
+///
+/// Exit codes are deterministic and checked by orchestrators, not just
+/// logged: 0 clean shutdown, 1 drain timeout or panic, 2 config
+/// load/validation failure, 3 app initialization failure, 4 listener bind
+/// failure. Config/bind failures happen before any port is bound or any
+/// app is started; an app-initialization failure can only be observed
+/// after the listener is already serving `/__hyperlight/healthz`, since
+/// every app's bundle/VM is loaded on a background thread so one slow app
+/// cannot delay the others or the health endpoint.
+///
+/// The HTTP read/write primitives below come from `src/workerd/http.rs`
+/// (boundary 5), the same functions `examples/workerd-demo.rs` uses, so the
+/// parsing/writing logic is no longer duplicated between the two call
+/// sites.
+/// How many WHP surrogate processes (Windows only) `workerd-host` needs for
+/// `args.config`'s apps: the sum of each resident app's pool `capacity` and
+/// each disposable app's `max_concurrent_sandboxes`, since every app's pool
+/// can have that many sandboxes alive at once and every app runs
+/// concurrently in one process (unlike every other `hluk` subcommand, which
+/// uses exactly one sandbox at a time). Called before `cmd_workerd_host`
+/// loads the config itself, so on any read/parse failure this falls back to
+/// `0` (today's single-guest default) and lets `cmd_workerd_host`'s own
+/// load report the real error and exit code.
+#[cfg(windows)]
+fn workerd_host_surrogate_capacity(args: &WorkerdHostArgs) -> usize {
+    use hyperlight_unikraft::workerd::{AppPoolConfig, HostConfig};
+
+    let Ok(config) = HostConfig::from_path(&args.config) else {
+        return 0;
+    };
+    config
+        .apps
+        .iter()
+        .map(|app| match &app.pool {
+            AppPoolConfig::Disposable(pool) => pool.max_concurrent_sandboxes,
+            AppPoolConfig::Resident(pool) => pool.capacity,
+        })
+        .sum()
+}
+
+fn cmd_workerd_host(args: WorkerdHostArgs) -> CliResult<()> {
+    use hyperlight_unikraft::workerd::{
+        AppHandle, AppRegistry, ConnectionAffinity, ConnectionMode, HostConfig, MAX_HEADER_BYTES,
+        RequestExecution, ResidentHandle, read_http_request, wants_keep_alive, write_http_error,
+        write_http_response,
+    };
+    use std::io::Write as _;
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::RwLock;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::mpsc;
+
+    const MAX_REQUEST_HEAD_BYTES: usize = MAX_HEADER_BYTES + 8 * 1024;
+    const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+    const CONNECTION_IO_TIMEOUT: Duration = Duration::from_secs(5);
+    const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+    /// Runs one request against `handle`'s pool and blocks until the result
+    /// is known, bracketing `in_flight` the same way the (now removed)
+    /// per-request completion closure used to. When `reserved` holds a
+    /// connection-affine [`ResidentHandle`] (boundary 5 sticky affinity)
+    /// the request bypasses the shared pool entirely and runs on that
+    /// handle's dedicated resident VM instead.
+    fn execute_request(
+        handle: &AppHandle,
+        reserved: Option<&ResidentHandle>,
+        envelope: hyperlight_unikraft::workerd::RequestEnvelope,
+        timeout: Duration,
+        in_flight: &Arc<AtomicUsize>,
+    ) -> RequestExecution {
+        in_flight.fetch_add(1, Ordering::AcqRel);
+        let execution = if let Some(resident) = reserved {
+            resident.execute(envelope, timeout)
+        } else {
+            let request_id = envelope.request_id.clone();
+            let (tx, rx) = mpsc::channel();
+            // On admission `try_submit`'s completion runs later on a pool
+            // owner thread; on rejection it already ran synchronously
+            // before `try_submit` returns. Either way `rx.recv()` below
+            // observes exactly one `RequestExecution`.
+            let _ = handle.try_submit(envelope, timeout, move |execution| {
+                let _ = tx.send(execution);
+            });
+            rx.recv().unwrap_or_else(|_| RequestExecution {
+                request_id,
+                result: Err(hyperlight_unikraft::workerd::Error::State(
+                    "worker request pool unavailable".into(),
+                )),
+                profile: Default::default(),
+                submit_error: Some(hyperlight_unikraft::workerd::PoolSubmitError::ShuttingDown),
+            })
+        };
+        in_flight.fetch_sub(1, Ordering::AcqRel);
+        execution
+    }
+
+    /// Writes `execution`'s outcome as an HTTP response with `connection`'s
+    /// `Connection` header. Mirrors `examples/workerd-demo.rs`'s
+    /// `finish_request` passthrough (header filtering, Content-Length) —
+    /// deliberately not extracted into `http.rs` alongside the other four
+    /// functions, since the plan names only those four and the two call
+    /// sites map submit errors to different messages.
+    fn write_execution_response(
+        stream: &mut TcpStream,
+        execution: RequestExecution,
+        connection: ConnectionMode,
+    ) -> std::io::Result<()> {
+        if execution.submit_error.is_some() {
+            return write_http_error(stream, 503, "worker request pool unavailable", connection);
+        }
+        match execution.result {
+            Ok(response) => {
+                let body = STANDARD.decode(response.body_base64).unwrap_or_default();
+                write!(
+                    stream,
+                    "HTTP/1.1 {} {}\r\n",
+                    response.status,
+                    hyperlight_unikraft::workerd::http_reason(response.status)
+                )?;
+                for header in response.headers {
+                    if !header.name.eq_ignore_ascii_case("content-length")
+                        && !header.name.eq_ignore_ascii_case("connection")
+                    {
+                        write!(stream, "{}: {}\r\n", header.name, header.value)?;
+                    }
+                }
+                write!(
+                    stream,
+                    "Content-Length: {}\r\nConnection: {}\r\n\r\n",
+                    body.len(),
+                    match connection {
+                        ConnectionMode::Close => "close",
+                        ConnectionMode::KeepAlive => "keep-alive",
+                    }
+                )?;
+                stream.write_all(&body)
+            }
+            Err(hyperlight_unikraft::workerd::Error::Timeout) => {
+                write_http_error(stream, 504, "Worker timed out", connection)
+            }
+            Err(_) => write_http_error(stream, 502, "Worker execution failed", connection),
+        }
+    }
+
+    /// Serves every request on one accepted connection, including a
+    /// keep-alive loop (boundary 5): while the client keeps asking for
+    /// `Connection: keep-alive` on an app-routed request, the same thread
+    /// keeps reading further requests off the same `stream` instead of
+    /// returning after one. The `/__hyperlight/*` contract endpoints always
+    /// close after responding regardless of what the client asked for —
+    /// they are infrequent control-plane calls, not the affinity feature's
+    /// target, so keeping them simple avoids complicating the already-
+    /// validated Boundary 4 contract tests.
+    ///
+    /// `reserved` holds a connection-affine [`ResidentHandle`] once a
+    /// `Sticky` resident app has been routed to on this connection, tagged
+    /// with the app id it belongs to so a later request that routes to a
+    /// *different* app (unusual, but HTTP permits a different `Host` header
+    /// per request on a keep-alive connection) drops the stale reservation
+    /// instead of misusing it.
+    fn handle_host_connection(
+        mut stream: TcpStream,
+        state: &Arc<RwLock<WorkerdHostState>>,
+        in_flight: &Arc<AtomicUsize>,
+        connection_sequence: u64,
+    ) {
+        let _ = stream.set_read_timeout(Some(CONNECTION_IO_TIMEOUT));
+        let _ = stream.set_write_timeout(Some(CONNECTION_IO_TIMEOUT));
+        let mut reserved: Option<(String, ResidentHandle)> = None;
+        let mut request_index: u64 = 0;
+        loop {
+            request_index += 1;
+            let request_id = format!("host-{connection_sequence}-{request_index}");
+            let parsed = match read_http_request(&mut stream, request_id, MAX_REQUEST_HEAD_BYTES) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    // Past the first request, a read failure almost always
+                    // just means the client closed the keep-alive
+                    // connection; only the first request's parse failure is
+                    // a client-visible 400.
+                    if request_index == 1 {
+                        let _ = write_http_error(&mut stream, 400, &error, ConnectionMode::Close);
+                    }
+                    return;
+                }
+            };
+            let keep_alive = wants_keep_alive(&parsed.envelope);
+            let connection_mode = if keep_alive {
+                ConnectionMode::KeepAlive
+            } else {
+                ConnectionMode::Close
+            };
+
+            match parsed.path.as_str() {
+                "/__hyperlight/healthz" => {
+                    let _ = write_http_response(
+                        &mut stream,
+                        200,
+                        "application/json",
+                        b"{\"status\":\"ok\"}",
+                        ConnectionMode::Close,
+                    );
+                    return;
+                }
+                "/__hyperlight/readyz" => {
+                    let ready = matches!(
+                        *state.read().expect("workerd-host state lock poisoned"),
+                        WorkerdHostState::Ready(_)
+                    );
+                    let (status, body): (u16, &[u8]) = if ready {
+                        (200, b"{\"status\":\"ready\"}")
+                    } else {
+                        (503, b"{\"status\":\"initializing\"}")
+                    };
+                    let _ = write_http_response(
+                        &mut stream,
+                        status,
+                        "application/json",
+                        body,
+                        ConnectionMode::Close,
+                    );
+                    return;
+                }
+                "/__hyperlight/status" => {
+                    let guard = state.read().expect("workerd-host state lock poisoned");
+                    let (status, body) = match &*guard {
+                        WorkerdHostState::Ready(registry) => {
+                            (200, serde_json::json!(registry.status_json()))
+                        }
+                        WorkerdHostState::Initializing => {
+                            (503, serde_json::json!({"status": "initializing"}))
+                        }
+                        WorkerdHostState::Failed(message) => (
+                            503,
+                            serde_json::json!({"status": "failed", "error": message}),
+                        ),
+                    };
+                    drop(guard);
+                    let body = serde_json::to_vec(&body).unwrap_or_default();
+                    let _ = write_http_response(
+                        &mut stream,
+                        status,
+                        "application/json",
+                        &body,
+                        ConnectionMode::Close,
+                    );
+                    return;
+                }
+                _ => {}
+            }
+
+            let host_header = parsed
+                .envelope
+                .headers
+                .iter()
+                .find(|header| header.name.eq_ignore_ascii_case("host"))
+                .map(|header| header.value.as_str());
+            let guard = state.read().expect("workerd-host state lock poisoned");
+            let registry = match &*guard {
+                WorkerdHostState::Ready(registry) => registry,
+                _ => {
+                    drop(guard);
+                    let _ =
+                        write_http_error(&mut stream, 503, "host is not ready", connection_mode);
+                    if !keep_alive {
+                        return;
+                    }
+                    continue;
+                }
+            };
+            let handle = match registry.route(host_header, &parsed.path) {
+                Some(handle) => handle,
+                None => {
+                    drop(guard);
+                    let _ = write_http_error(
+                        &mut stream,
+                        404,
+                        "no app matches this request",
+                        connection_mode,
+                    );
+                    if !keep_alive {
+                        return;
+                    }
+                    continue;
+                }
+            };
+            if reserved
+                .as_ref()
+                .is_some_and(|(app_id, _)| app_id != handle.app_id())
+            {
+                // The connection's requests now route to a different app
+                // than the one this reservation was made for; releasing it
+                // (dropping the `ResidentHandle`) frees the owner thread
+                // back to its pool immediately rather than holding it idle
+                // for the rest of this connection.
+                reserved = None;
+            }
+            if reserved.is_none() && keep_alive && handle.affinity() == ConnectionAffinity::Sticky {
+                // Only worth reserving a whole resident VM when the
+                // connection might actually send more than one request;
+                // a pool-full reservation attempt silently falls back to
+                // the shared pool below rather than failing the request.
+                if let Some(resident) = handle.reserve() {
+                    reserved = Some((handle.app_id().to_string(), resident));
+                }
+            }
+            let execution = execute_request(
+                handle,
+                reserved.as_ref().map(|(_, resident)| resident),
+                parsed.envelope,
+                DEFAULT_REQUEST_TIMEOUT,
+                in_flight,
+            );
+            drop(guard);
+            if let Err(error) = write_execution_response(&mut stream, execution, connection_mode) {
+                eprintln!("workerd-host: response write failed: {error}");
+                return;
+            }
+            if !keep_alive {
+                return;
+            }
+        }
+    }
+
+    // Step 1: load + validate the config's *shape* before binding anything
+    // (duplicate app ids, missing hostnames, ambiguous routes) — exit 2.
+    // Loading each app's bundle/VM happens later, off the accept thread.
+    let config = match HostConfig::from_path(&args.config) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::exit(2);
+        }
+    };
+    if let Err(error) = AppRegistry::validate(&config) {
+        eprintln!("error: {error}");
+        std::process::exit(2);
+    }
+
+    // Step 2: bind before any app finishes initializing, so healthz can
+    // serve while a slow app's VM is still warming up — exit 4 on failure.
+    let listener = match TcpListener::bind(&args.bind) {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("error: failed to bind {}: {error}", args.bind);
+            std::process::exit(4);
+        }
+    };
+    listener.set_nonblocking(true)?;
+    let admin_listener = match &args.admin_bind {
+        Some(addr) => match TcpListener::bind(addr) {
+            Ok(listener) => {
+                listener.set_nonblocking(true)?;
+                Some(listener)
+            }
+            Err(error) => {
+                eprintln!("error: failed to bind admin {addr}: {error}");
+                std::process::exit(4);
+            }
+        },
+        None => None,
+    };
+    eprintln!(
+        "workerd-host listening on http://{} (admin {})",
+        listener.local_addr()?,
+        admin_listener
+            .as_ref()
+            .and_then(|l| l.local_addr().ok())
+            .map(|addr| addr.to_string())
+            .unwrap_or_else(|| "shared with app traffic".into())
+    );
+
+    // Step 3: build every app's worker + pool off the accept thread.
+    let state = Arc::new(RwLock::new(WorkerdHostState::Initializing));
+    {
+        let state = state.clone();
+        std::thread::spawn(move || {
+            let built = AppRegistry::from_host_config(config);
+            let mut guard = state.write().expect("workerd-host state lock poisoned");
+            *guard = match built {
+                Ok(registry) => WorkerdHostState::Ready(registry),
+                Err(error) => WorkerdHostState::Failed(error.to_string()),
+            };
+        });
+    }
+
+    let shutting_down = Arc::new(AtomicBool::new(false));
+    {
+        let shutting_down = shutting_down.clone();
+        ctrlc::set_handler(move || {
+            shutting_down.store(true, Ordering::SeqCst);
+        })?;
+    }
+
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let sequence = Arc::new(AtomicUsize::new(1));
+    let drain_timeout = Duration::from_millis(args.drain_timeout_ms);
+    let mut fatal_exit_code: Option<i32> = None;
+    let mut logged_ready = false;
+    loop {
+        if shutting_down.load(Ordering::SeqCst) {
+            break;
+        }
+        {
+            let guard = state.read().expect("workerd-host state lock poisoned");
+            match &*guard {
+                WorkerdHostState::Failed(message) => {
+                    eprintln!("error: {message}");
+                    fatal_exit_code = Some(3);
+                }
+                WorkerdHostState::Ready(registry) if !logged_ready => {
+                    let apps: Vec<&str> = registry.app_ids().collect();
+                    println!("{}", serde_json::json!({"event": "ready", "apps": apps}));
+                    logged_ready = true;
+                }
+                _ => {}
+            }
+        }
+        if fatal_exit_code.is_some() {
+            break;
+        }
+        for incoming in [Some(&listener), admin_listener.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            match incoming.accept() {
+                Ok((stream, _addr)) => {
+                    // The accepted socket inherits the listening socket's
+                    // non-blocking mode on Windows (unlike POSIX, where a
+                    // fresh accepted socket starts blocking regardless of
+                    // the listener's mode); revert it so the per-connection
+                    // thread's `set_read_timeout`/`set_write_timeout` below
+                    // actually block up to their timeout instead of
+                    // returning `WouldBlock` immediately whenever no bytes
+                    // are queued yet — needed once boundary 5's keep-alive
+                    // loop reads a second request that genuinely has to
+                    // wait for the client. Same fix as
+                    // `workerd::fetch`'s loopback listener and the
+                    // `dotnet_jit`/`workerd_sandbox` test harnesses use.
+                    if let Err(error) = stream.set_nonblocking(false) {
+                        eprintln!(
+                            "workerd-host: failed to clear non-blocking mode on accepted connection: {error}"
+                        );
+                        continue;
+                    }
+                    let state = state.clone();
+                    let in_flight = in_flight.clone();
+                    let request_sequence = sequence.fetch_add(1, Ordering::Relaxed) as u64;
+                    std::thread::spawn(move || {
+                        handle_host_connection(stream, &state, &in_flight, request_sequence);
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => eprintln!("workerd-host: accept failed: {error}"),
+            }
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+
+    // Drain: no new connections are accepted once we reach here; wait for
+    // every in-flight request's response to finish.
+    let drain_start = Instant::now();
+    while in_flight.load(Ordering::SeqCst) > 0 && drain_start.elapsed() < drain_timeout {
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    let drained = in_flight.load(Ordering::SeqCst) == 0;
+    // Dropping every app's pool runs its own `Drop` (already exercised and
+    // validated by Boundaries 1-3): resident pools retire every resident
+    // VM, disposable pools stop admitting and join their owners.
+    drop(state);
+
+    if let Some(code) = fatal_exit_code {
+        std::process::exit(code);
+    }
+    if !drained {
+        eprintln!("error: drain timeout exceeded with requests still in flight");
+        std::process::exit(1);
+    }
+    println!(
+        "{}",
+        serde_json::json!({"event": "shutdown", "reason": "signal"})
+    );
+    Ok(())
+}
+
 /// Run the workload in a booted guest.  With nothing to run and no driver
 /// to run it, the entry point is a plain program (`--entry /bin/server`):
 /// drive it to its exit the way a container runtime would, and exit with
@@ -1013,16 +1547,22 @@ fn cli_main() -> CliResult<()> {
     }
 
     // One guest at a time, so skip Hyperlight's 512 pre-spawned helper
-    // processes on Windows; `bench parallel` needs one per VM.
+    // processes on Windows; `bench parallel` needs one per VM, and
+    // `workerd-host` needs one per concurrently-alive sandbox across every
+    // configured app (each resident app's pool capacity, plus each
+    // disposable app's `max_concurrent_sandboxes`) since its apps' pools
+    // run concurrently in one process.
     #[cfg(windows)]
     hyperlight_unikraft::configure_surrogates(match &cli.command {
         Command::Bench(BenchCommand::Parallel(args)) => args.vms,
+        Command::WorkerdHost(args) => workerd_host_surrogate_capacity(args),
         _ => 0,
     });
 
     match cli.command {
         Command::Run(args) => cmd_run(args),
         Command::Workerd(args) => cmd_workerd(args),
+        Command::WorkerdHost(args) => cmd_workerd_host(args),
         Command::Snapshot(cmd) => match cmd {
             SnapshotCommand::Save(args) => cmd_snapshot_save(args),
             SnapshotCommand::Run(args) => cmd_snapshot_run(args),

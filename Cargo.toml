@@ -13,7 +13,7 @@ path = "src/main.rs"
 
 [features]
 default = ["cli"]
-cli = ["dep:clap", "dep:tracing-subscriber"]
+cli = ["dep:clap", "dep:tracing-subscriber", "dep:ctrlc"]
 # Also target the Microsoft Hypervisor (Azure Linux / Mariner) on Linux, in
 # addition to the default KVM.  Off by default because enabling mshv3 opts the
 # whole build out of the MADV_DONTNEED fast restore path (see the dependency
@@ -46,6 +46,12 @@ rustix = { version = "1", features = ["net", "event"] }
 # Optional — CLI only.
 clap = { version = "4", features = ["derive"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+# `workerd-host`'s graceful SIGTERM/SIGINT drain (Boundary 4 of the resident
+# Workerd host contract). The `termination` feature is required on Unix:
+# without it, `ctrlc` only installs a handler for SIGINT, so a real
+# `kill -TERM` falls through to the default disposition (process dies
+# immediately, exit 128+15) instead of running the drain loop.
+ctrlc = { version = "3", optional = true, features = ["termination"] }
 
 # hyperlight-host's hypervisor backend is chosen at compile time by feature.
 # We keep every backend hyperlight supports reachable, but tune the default:
