@@ -72,7 +72,7 @@ Preview the complete audience-facing narration without KVM or built artifacts:
 
 ```bash
 tools/hyperlight-demo --preview
-tools/hyperlight-demo --describe d1
+tools/hyperlight-demo --describe sql
 ```
 
 Run the guided interactive journey:
@@ -112,7 +112,7 @@ artifact location, and final 30 log lines.
 | `ingress` | Scheduled events and message batches | A host passes an event or batch through the VM and receives completion, acknowledge, or retry decisions |
 | `kv` | KV key/value data | Stored data remains after the temporary VM is replaced |
 | `cache` | Cache API | Cached state survives a fresh VM reset |
-| `d1` | D1 / SQL | A transactional batch commits atomically and persists across reset |
+| `sql` | SQL transactions | A transactional batch commits atomically and persists across reset |
 | `durable-objects` | Durable Objects | Each object's data stays separate and survives VM replacement |
 | `storage` | Packaged files and host folders | Packaged files and host-allowed folders work; all other host paths, read-only writes, and excess use are denied |
 | `node` | Node-style modules and files | Included modules and allowed files work; processes, worker threads, native add-ons, and other host files remain unavailable |
@@ -134,7 +134,7 @@ options when presenting the lower-level route checks.
 
 ### Independent backing-store verification
 
-The KV, Cache, D1, and Durable Object demos do not rely only on text emitted by
+The KV, Cache, SQL, and Durable Object demos do not rely only on text emitted by
 the presenter. Each demo:
 
 1. clears its named SQLite backing files;
@@ -181,7 +181,7 @@ and cryptography.
 | Core web APIs | URL and request/response APIs, FormData, Blob/File, text codecs, digest, secure random values, timers, readable/writable/transform/compression streams, MessagePort, and byte streams with caller-provided buffers | Support status is not yet documented for WinterTC APIs outside this list |
 | Network clients | Outbound fetch through a Workerd request VM; TCP/TLS, UDP, and WebSocket through the separately tested host broker | Denied by default; the current sandbox executor does not yet connect Workerd's standard socket APIs to the host broker |
 | Files | Packaged files, fresh temporary files, supported device files, and specific host folders granted to the Worker | Every other host path is inaccessible; temporary files are discarded with the VM |
-| Saved application data | KV, Cache, D1, and Durable Objects backed by host-kept data | Access is limited to configured services and allowed operations |
+| Saved application data | KV, Cache, SQL, and Durable Objects backed by host-kept data | Access is limited to configured services and allowed operations |
 | Request isolation | A fresh VM and fresh mutable module state for each request or event | VM-local state does not persist after the VM is destroyed |
 | Code and WebAssembly | Bundled JavaScript modules, core Wasm, and the WebAssembly Component example | `eval()`, `new Function()`, native add-ons, arbitrary host extensions, and native Component Model loading are unavailable |
 
@@ -216,7 +216,7 @@ external interfaces they use.
 | Fast VM startup | Starts and manages its normal runtime processes | Saves a ready VM image, restores it on demand, or keeps an adaptive pool ready |
 | Worker permissions and limits | Uses configuration, bindings, and runtime limits | Before a VM starts, the host selects the Worker bundle and registers its allowed network, timer, and file services. Each external operation is sent to the host, which checks the policy, performs or denies the operation, and counts usage. A replacement VM gets fresh per-request counters, while Worker code cannot read or change the host policy. |
 | Scheduled events and message batches | Runs scheduled and queue handlers for supplied events | Passes a scheduled event or logical queue name plus message batch into the VM and returns completion, acknowledge, retry, batch-retry, or no-retry decisions |
-| KV, Cache, D1, and Durable Objects | Provides these APIs and configured local or remote data services | Connects them to host-kept data that survives destruction of the temporary VM |
+| KV, Cache, SQL, and Durable Objects | Provides these APIs and configured local or remote data services | Connects them to host-kept data that survives destruction of the temporary VM |
 | Host folders | Provides bundle files, directory services, and virtual Node files | Before launch, the host opens each allowed folder and exposes it at a fixed path inside the VM. Worker code can use paths only inside that folder. The host blocks path escapes and writes to read-only folders, counts operations and transferred bytes, and rejects further access when the configured limit is reached. |
 | TCP and TLS | Workerd has standard outbound socket APIs. | The host broker performs real TCP and TLS 1.3 exchanges, checks policy before connect, owns trust roots, audits activity, and invalidates handles between assignments. Connecting Workerd's socket channel to this broker remains outstanding. |
 | WebSockets | Workerd can create and use WebSocket connections. | The host broker performs real WebSocket exchanges and enforces endpoint, message-size, lifetime, and assignment-reset rules. Connecting Workerd's WebSocket channel to this broker remains outstanding. |

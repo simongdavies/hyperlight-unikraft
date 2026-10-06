@@ -57,7 +57,7 @@ demos=(
     ingress
     kv
     cache
-    d1
+    sql
     durable-objects
     storage
     node
@@ -110,7 +110,7 @@ title() {
         ingress) echo "Scheduled events and message batches" ;;
         kv) echo "KV persistence" ;;
         cache) echo "Cache persistence" ;;
-        d1) echo "D1 / SQL transactions" ;;
+        sql) echo "SQL transactions" ;;
         durable-objects) echo "Durable Objects keep separate state" ;;
         storage) echo "Virtual filesystems and named storage" ;;
         node) echo "Node-style modules and file access" ;;
@@ -136,7 +136,7 @@ description() {
         ingress) echo "A host can pass a scheduled event or message batch into a temporary VM and receive completion, acknowledge, or retry decisions. No scheduler or external queue service is connected." ;;
         kv) echo "Store a key and value outside the temporary VM, then read it after the VM is replaced." ;;
         cache) echo "Cache a response outside the temporary VM, then read it after the VM is replaced." ;;
-        d1) echo "Commit a group of SQL changes together and keep them after the VM is replaced." ;;
+        sql) echo "Commit a group of SQL changes together and keep them after the VM is replaced." ;;
         durable-objects) echo "Keep each Durable Object's data separate and available after VM replacement." ;;
         storage) echo "Use packaged files and named mounts while denied paths stay denied." ;;
         node) echo "Load included Node-style modules and allowed files; attempts to start processes, threads, or native add-ons remain unavailable." ;;
@@ -162,7 +162,7 @@ action() {
         ingress) echo "Pass a scheduled event and a named message batch into a temporary VM." ;;
         kv) echo "Write and read a deterministic KV entry before and after VM reset." ;;
         cache) echo "Populate a deterministic cache entry, replace the VM, and read it again." ;;
-        d1) echo "Execute a transactional SQL batch, replace the VM, and verify committed rows." ;;
+        sql) echo "Execute a transactional SQL batch, replace the VM, and verify committed rows." ;;
         durable-objects) echo "Write two objects' data, replace the VM, and verify the data stays separate." ;;
         storage) echo "Read and write declared paths, then probe traversal and quota boundaries." ;;
         node) echo "Load both common JavaScript module formats and use the supported file API." ;;
@@ -188,7 +188,7 @@ takeaway() {
         ingress) echo "The result comes back out of the VM; another program must connect a real service." ;;
         kv) echo "Configuration and application state can outlive disposable request VMs." ;;
         cache) echo "Cached responses can be reused without coupling them to one request VM." ;;
-        d1) echo "Relational updates remain atomic even though request VMs are disposable." ;;
+        sql) echo "Relational updates remain atomic even though request VMs are disposable." ;;
         durable-objects) echo "Each Durable Object keeps its own data across temporary VMs." ;;
         storage) echo "Filesystem access remains named, bounded, and least-privileged." ;;
         node) echo "Node-style code can use included APIs and files but cannot control the host operating system." ;;
@@ -222,8 +222,8 @@ result_lines() {
         cache)
             echo "RESULT: The cached response survived a fresh VM reset."
             ;;
-        d1)
-            echo "RESULT: The D1 / SQL batch committed transactionally and rows persisted after reset."
+        sql)
+            echo "RESULT: The SQL batch committed transactionally and rows persisted after reset."
             ;;
         durable-objects)
             echo "RESULT: Durable Object data survived VM replacement and stayed separate."
@@ -285,11 +285,17 @@ result_lines() {
 
 render_demo() {
     local demo="$1"
-    printf '\n============================================================\n'
-    printf '%s\n' "$(title "$demo")"
-    print_wrapped "Demonstrates: " "$(description "$demo")"
-    print_wrapped "Why it matters: " "$(takeaway "$demo")"
-    print_wrapped "Action: " "$(action "$demo")"
+    printf '\n%b+--------------------------------------------------------------------+%b\n' \
+        "$c_cyan" "$c_reset"
+    printf '%b  %s%b\n' "$c_bold" "$(title "$demo")" "$c_reset"
+    printf '%b+--------------------------------------------------------------------+%b\n\n' \
+        "$c_cyan" "$c_reset"
+    printf '%bDEMONSTRATES%b\n' "$c_cyan" "$c_reset"
+    print_wrapped "  " "$(description "$demo")"
+    printf '\n%bWHY IT MATTERS%b\n' "$c_cyan" "$c_reset"
+    print_wrapped "  " "$(takeaway "$demo")"
+    printf '\n%bACTION%b\n' "$c_cyan" "$c_reset"
+    print_wrapped "  " "$(action "$demo")"
 }
 
 print_wrapped() {
@@ -306,7 +312,7 @@ print_wrapped() {
     done < <(printf '%s\n' "$text" | fold -s -w "$((96 - ${#prefix}))")
 }
 
-if [[ -t 1 ]] && [[ "${NO_COLOR:-}" == "" ]]; then
+if [[ "${NO_COLOR:-}" == "" ]]; then
     c_bold=$'\033[1m'
     c_green=$'\033[32m'
     c_cyan=$'\033[36m'
@@ -327,7 +333,7 @@ evidence_row() {
 }
 
 evidence_heading() {
-    printf '\n%bEVIDENCE%b\n' "$c_bold" "$c_reset"
+    printf '\n%bEVIDENCE%b\n\n' "$c_bold$c_green" "$c_reset"
 }
 
 print_result_lines() {
@@ -412,25 +418,25 @@ print_demo_evidence() {
                 evidence_row "CLI row" "$key -> HTTP $status, $body"
             done <"$output_dir/cache-cli.tsv"
             ;;
-        d1)
+        sql)
             evidence_row "Runtime" "$(jq -r '.runtime' "$proof")"
-            evidence_row "SQL 1" "$(jq -r '.d1.statements[0]' "$proof")"
-            evidence_row "SQL 2" "$(jq -r '.d1.statements[1]' "$proof")"
-            evidence_row "Transaction" "$(jq -r '"status=\(.d1.batch.status), statements=\(.d1.batch.results | length)"' "$proof")"
-            evidence_row "VM 1 teardown" "$(jq -r '"\(.d1.batch_vm_profile.vm_teardown_ms) ms"' "$proof")"
-            evidence_row "SQL 3" "$(jq -r '.d1.statements[2]' "$proof")"
-            evidence_row "VM 2 teardown" "$(jq -r '"\(.d1.query_vm_profile.vm_teardown_ms) ms"' "$proof")"
-            evidence_row "Backing file" "$(jq -r '.d1.backing_file' "$proof")"
+            evidence_row "SQL 1" "$(jq -r '.sql.statements[0]' "$proof")"
+            evidence_row "SQL 2" "$(jq -r '.sql.statements[1]' "$proof")"
+            evidence_row "Transaction" "$(jq -r '"status=\(.sql.batch.status), statements=\(.sql.batch.results | length)"' "$proof")"
+            evidence_row "VM 1 teardown" "$(jq -r '"\(.sql.batch_vm_profile.vm_teardown_ms) ms"' "$proof")"
+            evidence_row "SQL 3" "$(jq -r '.sql.statements[2]' "$proof")"
+            evidence_row "VM 2 teardown" "$(jq -r '"\(.sql.query_vm_profile.vm_teardown_ms) ms"' "$proof")"
+            evidence_row "Backing file" "$(jq -r '.sql.backing_file' "$proof")"
             evidence_row "Clear down" "tools/hyperlight-demo --clear"
-            evidence_row "Before command" "$(cat "$output_dir/d1-before-command.txt")"
+            evidence_row "Before command" "$(cat "$output_dir/sql-before-command.txt")"
             evidence_row "Before result" "0 application tables"
-            evidence_row "Database SHA-256" "$(cut -d' ' -f1 "$output_dir/d1-cli.sha256")"
+            evidence_row "Database SHA-256" "$(cut -d' ' -f1 "$output_dir/sql-cli.sha256")"
             evidence_row "External CLI" "$(sqlite3 --version | awk '{print "sqlite3 " $1}')"
-            evidence_row "After command" "$(cat "$output_dir/d1-cli-command.txt")"
+            evidence_row "After command" "$(cat "$output_dir/sql-cli-command.txt")"
             evidence_row "CLI SQL" "SELECT id, name FROM users ORDER BY id"
             while IFS=$'\t' read -r id name; do
                 evidence_row "CLI row" "id=$id, name=$name"
-            done <"$output_dir/d1-cli.tsv"
+            done <"$output_dir/sql-cli.tsv"
             ;;
         durable-objects)
             evidence_row "Runtime" "$(jq -r '.runtime' "$proof")"
@@ -705,10 +711,11 @@ run_isolation() {
 }
 
 run_policy() {
-    ensure_capability_proof
+    ensure_capability_proof || return
 }
 
 ensure_capability_proof() {
+    local scope="${1:-all}"
     local proof="$output_dir/capability-proof.json"
     local state_dir="$output_dir/capability-state"
     if "$capability_proof_ran"; then
@@ -716,7 +723,11 @@ ensure_capability_proof() {
     fi
     mkdir -p "$output_dir" "$state_dir"
     local database
-    for database in kv cache d1 durable; do
+    local databases=(kv cache sql durable)
+    if [[ "$scope" == sql ]]; then
+        databases=(sql)
+    fi
+    for database in "${databases[@]}"; do
         rm -f -- \
             "$state_dir/$database.sqlite" \
             "$state_dir/$database.sqlite-shm" \
@@ -734,8 +745,15 @@ ensure_capability_proof() {
         "$root/build-elfloader/workerd-executor/executor" \
         344 \
         "$state_dir" \
+        "$scope" \
         >"$temporary"
-    jq -e '
+    if [[ "$scope" == sql ]]; then
+        jq -e '
+            .runtime == "workerd-on-hyperlight" and
+            .sql.query_after_fresh_vm.results[0].rows == [[{"type":"integer","value":1},{"type":"text","value":"Ada"}]]
+        ' "$temporary" >/dev/null
+    else
+        jq -e '
         .runtime == "workerd-on-hyperlight" and
         .scheduled.outcome == "ok" and
         .queue.explicit_acks == ["message-1"] and
@@ -747,15 +765,16 @@ ensure_capability_proof() {
         .policy.quota_denied.status == "quota_exceeded" and
         .kv.get_after_fresh_vm.value_base64 == "ZGFyaw==" and
         .cache.match_after_fresh_vm.cached_status == 200 and
-        .d1.query_after_fresh_vm.results[0].rows == [[{"type":"integer","value":1},{"type":"text","value":"Ada"}]] and
+        .sql.query_after_fresh_vm.results[0].rows == [[{"type":"integer","value":1},{"type":"text","value":"Ada"}]] and
         .durable_object.get_after_fresh_vm.value_base64 == "aHlwZXJsaWdodA=="
-    ' "$temporary" >/dev/null
+        ' "$temporary" >/dev/null
+    fi
     mv "$temporary" "$proof"
     capability_proof_ran=true
 }
 
 run_ingress() {
-    ensure_capability_proof
+    ensure_capability_proof || return
 }
 
 readonly_sqlite_query() {
@@ -791,7 +810,7 @@ clear_output() {
 }
 
 run_kv() {
-    ensure_capability_proof
+    ensure_capability_proof || return
     readonly_sqlite_query \
         "$(jq -r '.kv.backing_file' "$output_dir/capability-proof.json")" \
         "SELECT key, CAST(value AS TEXT) FROM _hluk_kv ORDER BY key" \
@@ -800,7 +819,7 @@ run_kv() {
 }
 
 run_cache() {
-    ensure_capability_proof
+    ensure_capability_proof || return
     readonly_sqlite_query \
         "$(jq -r '.cache.backing_file' "$output_dir/capability-proof.json")" \
         "SELECT key, status, CAST(body AS TEXT) FROM _hluk_cache ORDER BY key" \
@@ -808,17 +827,17 @@ run_cache() {
     [[ "$(cat "$output_dir/cache-cli.tsv")" == $'https://example.test/app.js\t200\tconsole.log(1)' ]]
 }
 
-run_d1() {
-    ensure_capability_proof
+run_sql() {
+    ensure_capability_proof sql || return
     readonly_sqlite_query \
-        "$(jq -r '.d1.backing_file' "$output_dir/capability-proof.json")" \
+        "$(jq -r '.sql.backing_file' "$output_dir/capability-proof.json")" \
         "SELECT id, name FROM users ORDER BY id" \
-        "$output_dir/d1-cli.tsv"
-    [[ "$(cat "$output_dir/d1-cli.tsv")" == $'1\tAda' ]]
+        "$output_dir/sql-cli.tsv"
+    [[ "$(cat "$output_dir/sql-cli.tsv")" == $'1\tAda' ]]
 }
 
 run_durable_objects() {
-    ensure_capability_proof
+    ensure_capability_proof || return
     readonly_sqlite_query \
         "$(jq -r '.durable_object.backing_file' "$output_dir/capability-proof.json")" \
         "SELECT namespace, actor_key, key, CAST(value AS TEXT) FROM _hluk_do_state ORDER BY namespace, actor_key, key" \
@@ -1094,7 +1113,7 @@ run_demo_command() {
         ingress) run_ingress ;;
         kv) run_kv ;;
         cache) run_cache ;;
-        d1) run_d1 ;;
+        sql) run_sql ;;
         durable-objects) run_durable_objects ;;
         storage) run_storage ;;
         node) run_node ;;
@@ -1118,7 +1137,8 @@ run_one() {
     local log="$output_dir/$demo.log"
     mkdir -p "$output_dir"
     render_demo "$demo"
-    printf 'Running... raw output is being saved to %s\n' "$log"
+    printf '\n%bRUNNING%b\n' "$c_yellow" "$c_reset"
+    printf '  Raw log: %s\n\n' "$log"
     local status=0
     if "$verbose"; then
         (
@@ -1134,15 +1154,15 @@ run_one() {
         ) >"$log" 2>&1 || status=$?
     fi
     if ((status == 0)); then
-        printf '\n%bPASS%b %s\n' "$c_green" "$c_reset" "$(title "$demo")"
+        printf '\n%bPASS%b  %s\n' "$c_green$c_bold" "$c_reset" "$(title "$demo")"
         print_demo_evidence "$demo"
         print_wrapped "TAKEAWAY: " "$(takeaway "$demo")"
         printf 'LOG: %s\n' "$log"
         return 0
     fi
     stop_processes
-    printf '\nFAIL: %s\n' "$(title "$demo")" >&2
-    printf 'LOG: %s\n' "$log" >&2
+    printf '\n%bFAIL%b  %s\n\n' "$c_yellow$c_bold" "$c_reset" "$(title "$demo")" >&2
+    printf 'LOG\n  %s\n\n' "$log" >&2
     printf '%bLAST 30 LOG LINES%b\n' "$c_yellow" "$c_reset" >&2
     tail -n 30 "$log" | sed 's/^/  /' >&2
     return 1

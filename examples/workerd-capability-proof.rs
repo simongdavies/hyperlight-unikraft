@@ -10,9 +10,9 @@ use hyperlight_unikraft::broker_runtime::{
     LogicalWireService,
 };
 use hyperlight_unikraft::data::{
-    CacheBinding, CacheLimits, CacheService, D1Binding, D1Limits, D1Service,
-    DurableDeliveryContext, DurableObjectBinding, DurableObjectLimits, DurableObjectService,
-    KvBinding, KvLimits, KvService,
+    CacheBinding, CacheLimits, CacheService, DurableDeliveryContext, DurableObjectBinding,
+    DurableObjectLimits, DurableObjectService, KvBinding, KvLimits, KvService, SqlBinding,
+    SqlLimits, SqlService,
 };
 use hyperlight_unikraft::workerd::{
     ExecutionProfile, FetchBroker, Header, ModuleType, PROTOCOL_VERSION, QueueMessage,
@@ -78,7 +78,7 @@ struct ProofEvidence {
     policy: Value,
     kv: Value,
     cache: Value,
-    d1: Value,
+    sql: Value,
     durable_object: Value,
 }
 
@@ -167,7 +167,12 @@ fn execute_profiled(
     );
     let response = response?;
     if response.status != 200 {
-        return Err(format!("{id} returned HTTP {}", response.status).into());
+        let body = STANDARD
+            .decode(&response.body_base64)
+            .ok()
+            .and_then(|body| String::from_utf8(body).ok())
+            .unwrap_or_else(|| "<non-UTF-8 response body>".into());
+        return Err(format!("{id} returned HTTP {}: {body}", response.status).into());
     }
     Ok((
         serde_json::from_slice(&STANDARD.decode(response.body_base64)?)?,
@@ -181,7 +186,7 @@ fn data_worker(
     scratch_mib: usize,
     kv_path: &PathBuf,
     cache_path: &PathBuf,
-    d1_path: &PathBuf,
+    sql_path: &PathBuf,
     durable_path: &PathBuf,
 ) -> Result<(WorkerVersionSandbox, WorkerVersionId, BrokerRuntime), Box<dyn std::error::Error>> {
     let identity = RequestIdentity::new("capability-proof", "snapshot-1", 0)?;
@@ -209,11 +214,11 @@ fn data_worker(
         )?
         .with_service(
             "database",
-            D1Service::new([D1Binding::persistent(
+            SqlService::new([SqlBinding::persistent(
                 "database",
-                d1_path,
+                sql_path,
                 false,
-                D1Limits::default(),
+                SqlLimits::default(),
             )?])?,
         )?
         .with_service(
@@ -235,10 +240,7 @@ fn data_worker(
             name: "assets".into(),
             kind: WorkerBindingKind::Cache,
         },
-        WorkerBinding {
-            name: "database".into(),
-            kind: WorkerBindingKind::D1,
-        },
+        WorkerBinding::sql("database"),
         WorkerBinding {
             name: "rooms".into(),
             kind: WorkerBindingKind::DurableObject,
@@ -272,6 +274,74 @@ fn data_worker(
     Ok((worker, version, evidence_runtime))
 }
 
+fn run_sql_proof(
+    rootfs: &PathBuf,
+    executor: &PathBuf,
+    scratch_mib: usize,
+    state_dir: &PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let kv_path = state_dir.join("kv.sqlite");
+    let cache_path = state_dir.join("cache.sqlite");
+    let sql_path = state_dir.join("sql.sqlite");
+    let durable_path = state_dir.join("durable.sqlite");
+    let (worker, version, _) = data_worker(
+        rootfs,
+        executor,
+        scratch_mib,
+        &kv_path,
+        &cache_path,
+        &sql_path,
+        &durable_path,
+    )?;
+    let (batch, batch_profile) = execute_profiled(
+        &worker,
+        &version,
+        "sql-batch",
+        "database",
+        json!({
+            "kind":"sql_batch",
+            "statements":[
+                {"sql":"CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT NOT NULL)","parameters":[]},
+                {"sql":"INSERT INTO users(id, name) VALUES (?1, ?2)","parameters":[
+                    {"type":"integer","value":1},
+                    {"type":"text","value":"Ada"}
+                ]}
+            ]
+        }),
+    )?;
+    let (query, query_profile) = execute_profiled(
+        &worker,
+        &version,
+        "sql-query",
+        "database",
+        json!({
+            "kind":"sql_batch",
+            "statements":[{"sql":"SELECT id, name FROM users ORDER BY id","parameters":[]}]
+        }),
+    )?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "schema_version":1,
+            "runtime":"workerd-on-hyperlight",
+            "worker_version":version.as_str(),
+            "sql":{
+                "backing_file":std::fs::canonicalize(&sql_path)?,
+                "statements":[
+                    "CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+                    "INSERT INTO users(id, name) VALUES (1, 'Ada')",
+                    "SELECT id, name FROM users ORDER BY id"
+                ],
+                "batch":batch,
+                "batch_vm_profile":batch_profile,
+                "query_after_fresh_vm":query,
+                "query_vm_profile":query_profile
+            }
+        }))?
+    );
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let rootfs = PathBuf::from(args.next().unwrap_or_else(|| DEFAULT_ROOTFS.into()));
@@ -285,15 +355,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.next()
             .unwrap_or_else(|| "demo-output/capability-state".into()),
     );
+    let scope = args.next().unwrap_or_else(|| "all".into());
     if args.next().is_some() {
         return Err(
-            "usage: workerd-capability-proof [ROOTFS] [EXECUTOR] [SCRATCH_MIB] [STATE_DIR]".into(),
+            "usage: workerd-capability-proof [ROOTFS] [EXECUTOR] [SCRATCH_MIB] [STATE_DIR] [all|sql]"
+                .into(),
         );
     }
     std::fs::create_dir_all(&state_dir)?;
+    if scope == "sql" {
+        return run_sql_proof(&rootfs, &executor, scratch_mib, &state_dir);
+    }
+    if scope != "all" {
+        return Err(format!("unsupported proof scope: {scope}").into());
+    }
     let kv_path = state_dir.join("kv.sqlite");
     let cache_path = state_dir.join("cache.sqlite");
-    let d1_path = state_dir.join("d1.sqlite");
+    let sql_path = state_dir.join("sql.sqlite");
     let durable_path = state_dir.join("durable.sqlite");
 
     let ingress_bundle = WorkerBundle::single_script(
@@ -409,7 +487,7 @@ export default {
         scratch_mib,
         &kv_path,
         &cache_path,
-        &d1_path,
+        &sql_path,
         &durable_path,
     )?;
     let (kv_put, kv_put_profile) = execute_profiled(
@@ -447,13 +525,13 @@ export default {
         "assets",
         json!({"kind":"cache_match","key":"https://example.test/app.js"}),
     )?;
-    let (d1_batch, d1_batch_profile) = execute_profiled(
+    let (sql_batch, sql_batch_profile) = execute_profiled(
         &data,
         &data_version,
-        "d1-batch",
+        "sql-batch",
         "database",
         json!({
-            "kind":"d1_batch",
+            "kind":"sql_batch",
             "statements":[
                 {"sql":"CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT NOT NULL)","parameters":[]},
                 {"sql":"INSERT INTO users(id, name) VALUES (?1, ?2)","parameters":[
@@ -463,13 +541,13 @@ export default {
             ]
         }),
     )?;
-    let (d1_query, d1_query_profile) = execute_profiled(
+    let (sql_query, sql_query_profile) = execute_profiled(
         &data,
         &data_version,
-        "d1-query",
+        "sql-query",
         "database",
         json!({
-            "kind":"d1_batch",
+            "kind":"sql_batch",
             "statements":[{"sql":"SELECT id, name FROM users ORDER BY id","parameters":[]}]
         }),
     )?;
@@ -544,17 +622,17 @@ export default {
             "match_after_fresh_vm":cache_match,
             "match_vm_profile":cache_match_profile
         }),
-        d1: json!({
-            "backing_file":std::fs::canonicalize(&d1_path)?,
+        sql: json!({
+            "backing_file":std::fs::canonicalize(&sql_path)?,
             "statements":[
                 "CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
                 "INSERT INTO users(id, name) VALUES (1, 'Ada')",
                 "SELECT id, name FROM users ORDER BY id"
             ],
-            "batch":d1_batch,
-            "batch_vm_profile":d1_batch_profile,
-            "query_after_fresh_vm":d1_query,
-            "query_vm_profile":d1_query_profile
+            "batch":sql_batch,
+            "batch_vm_profile":sql_batch_profile,
+            "query_after_fresh_vm":sql_query,
+            "query_vm_profile":sql_query_profile
         }),
         durable_object: json!({
             "backing_file":std::fs::canonicalize(&durable_path)?,

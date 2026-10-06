@@ -161,7 +161,7 @@ pub struct D1Request {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 pub enum D1Operation {
-    #[serde(rename = "d1_batch")]
+    #[serde(rename = "d1_batch", alias = "sql_batch")]
     Batch { statements: Vec<D1Statement> },
 }
 
@@ -548,6 +548,33 @@ mod tests {
 
     fn response(runtime: &BrokerRuntime, request: &[u8]) -> D1Response {
         serde_json::from_slice(&runtime.dispatch_logical(request)).unwrap()
+    }
+
+    #[test]
+    fn sql_batch_alias_decodes_to_batch_operation() {
+        let request: D1Request = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "request_id": "sql-query",
+            "binding": "database",
+            "operation": {
+                "kind": "sql_batch",
+                "statements": [{
+                    "sql": "SELECT 1",
+                    "parameters": []
+                }]
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            request.operation,
+            D1Operation::Batch {
+                statements: vec![D1Statement {
+                    sql: "SELECT 1".to_string(),
+                    parameters: Vec::new(),
+                }],
+            }
+        );
     }
 
     #[test]

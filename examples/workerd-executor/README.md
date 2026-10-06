@@ -225,7 +225,7 @@ header data, 8 KiB URL, 32-byte method, 64-byte request ID, 256-byte Worker
 version ID. Serialization escaping/base64 and actual FlatBuffer framing are
 accounted for; the whole encoded call fits the unchanged 64 KiB transport.
 The response stream allows only two additional bytes for the console CRLF. Unknown JSON
-fields and invalid base64 are rejected. Fetch/D1 traits are extension
+fields and invalid base64 are rejected. Fetch/SQL traits are extension
 interfaces only unless the host installs the outbound fetch broker described
 below.
 

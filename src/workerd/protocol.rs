@@ -153,6 +153,15 @@ pub struct WorkerBinding {
     pub kind: WorkerBindingKind,
 }
 
+impl WorkerBinding {
+    pub fn sql(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            kind: WorkerBindingKind::D1,
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct ExecutorStorageBinding<'a> {
     name: &'a str,
