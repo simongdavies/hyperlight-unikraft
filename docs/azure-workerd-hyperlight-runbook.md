@@ -75,6 +75,23 @@ tools/hyperlight-demo --preview
 tools/hyperlight-demo --describe sql
 ```
 
+`--preview` shows the narration for every demo. `--describe NAME` shows one
+demo's narration and a `WORKER CODE` section without starting a VM. For example:
+
+```bash
+tools/hyperlight-demo --describe ingress
+tools/hyperlight-demo --describe node
+tools/hyperlight-demo --describe benchmark-prewarmed
+```
+
+The code section identifies each module by name and type, decodes JavaScript
+stored in bundle JSON with `jq`, and preserves the source's indentation. The
+capability proof uses the checked-in files under
+`examples/workerd-capability-workers/`, so the displayed code is the same
+source compiled into the proof executable. Component demos show both their
+entry module and generated JavaScript module. Host-only WASI and network-broker
+demos state explicitly that they do not run JavaScript inside Workerd.
+
 Run the guided interactive journey:
 
 ```bash
@@ -96,12 +113,13 @@ tools/hyperlight-demo --clear
 ```
 
 Each successful step prints a compact evidence table containing the values
-that were actually observed, not only a PASS label. Ordinary logs and JSON
-output go to `demo-output/`; override that location with
-`--output-dir DIR` or `HYPERLIGHT_DEMO_OUTPUT`. Raw command output stays in
-those logs so the default presenter view remains concise. Add `--verbose` when
-you want to stream it during a run. A failed step prints the failing stage,
-artifact location, and final 30 log lines.
+that were actually observed, not only a PASS label. Before execution, each
+selected demo also prints the same `WORKER CODE` section available through
+`--describe`. Ordinary logs and JSON output go to `demo-output/`; override
+that location with `--output-dir DIR` or `HYPERLIGHT_DEMO_OUTPUT`. Raw command
+output stays in those logs so the default presenter view remains concise. Add
+`--verbose` when you want to stream it during a run. A failed step prints the
+failing stage, artifact location, and final 30 log lines.
 
 ## Demo index
 

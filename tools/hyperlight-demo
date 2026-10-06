@@ -336,6 +336,108 @@ evidence_heading() {
     printf '\n%bEVIDENCE%b\n\n' "$c_bold$c_green" "$c_reset"
 }
 
+worker_code_heading() {
+    printf '\n%bWORKER CODE%b\n\n' "$c_bold$c_green" "$c_reset"
+}
+
+print_worker_module() {
+    local name="$1"
+    local module_type="$2"
+    local source="$3"
+    printf '  %b%s%b (%s)\n' "$c_cyan" "$name" "$c_reset" "$module_type"
+    sed 's/^/    /' "$source"
+    printf '\n'
+}
+
+print_bundle_worker_code() {
+    local bundle="$1"
+    local name module_type
+    while IFS=$'\t' read -r name module_type; do
+        printf '  %b%s%b (%s)\n' "$c_cyan" "$name" "$c_reset" "$module_type"
+        jq -r --arg name "$name" \
+            '.modules[] | select(.name == $name) | .source' \
+            "$bundle" |
+            sed 's/^/    /'
+        printf '\n'
+    done < <(
+        jq -r '
+            .modules[] |
+            select(.type == "esModule" or .type == "commonJsModule") |
+            [.name, .type] | @tsv
+        ' "$bundle"
+    )
+}
+
+print_source_worker_code() {
+    local name="$1"
+    local module_type="$2"
+    local source="$3"
+    print_worker_module "$name" "$module_type" "$source"
+}
+
+print_worker_code() {
+    local demo="$1"
+    worker_code_heading
+    case "$demo" in
+        isolation)
+            print_bundle_worker_code "$root/examples/workerd-bundles/acceptance.json"
+            ;;
+        policy|kv|cache|sql|durable-objects)
+            print_source_worker_code \
+                "worker.js" "esModule" \
+                "$root/examples/workerd-capability-workers/data-worker.js"
+            ;;
+        ingress)
+            print_source_worker_code \
+                "worker.js" "esModule" \
+                "$root/examples/workerd-capability-workers/ingress-worker.js"
+            ;;
+        node)
+            print_source_worker_code \
+                "worker.js" "esModule" \
+                "$root/examples/workerd-capability-workers/node-worker.js"
+            print_source_worker_code \
+                "legacy.cjs" "commonJsModule" \
+                "$root/examples/workerd-capability-workers/legacy.cjs"
+            print_bundle_worker_code \
+                "$root/examples/workerd-bundles/workerd-vfs-evidence.json"
+            ;;
+        storage)
+            print_bundle_worker_code \
+                "$root/examples/workerd-bundles/workerd-vfs-evidence.json"
+            ;;
+        core-wasm|web-apis)
+            print_bundle_worker_code \
+                "$root/examples/workerd-bundles/workerd-wintertc-demo.json"
+            ;;
+        component)
+            print_source_worker_code \
+                "worker.mjs" "esModule" \
+                "$root/experiments/workerd-component-model/worker.mjs"
+            print_source_worker_code \
+                "generated/component.js" "esModule" \
+                "$root/experiments/workerd-component-model/generated/component.js"
+            ;;
+        fetch)
+            print_bundle_worker_code \
+                "$root/examples/workerd-bundles/fetch-policy-demo.json"
+            ;;
+        benchmark-on-demand|benchmark-prewarmed)
+            print_bundle_worker_code \
+                "$root/examples/workerd-bundles/workerd-pool-benchmark.json"
+            ;;
+        wasi-p2|wasi-p3)
+            printf '  No JavaScript runs in Workerd for this WASI host-contract demo.\n\n'
+            ;;
+        tcp-tls|udp|websocket)
+            printf '  No JavaScript runs in Workerd for this host-broker contract demo.\n\n'
+            ;;
+        *)
+            printf '  No Worker JavaScript source is associated with this demo.\n\n'
+            ;;
+    esac
+}
+
 print_result_lines() {
     local line
     while IFS= read -r line; do
@@ -1202,6 +1304,7 @@ run_one() {
     local log="$output_dir/$demo.log"
     mkdir -p "$output_dir"
     render_demo "$demo"
+    print_worker_code "$demo"
     printf '\n%bRUNNING%b\n' "$c_yellow" "$c_reset"
     printf '  Raw log: %s\n\n' "$log"
     local status=0
@@ -1318,6 +1421,7 @@ if [[ "$mode" == clear ]]; then
 fi
 if [[ "$mode" == describe ]]; then
     render_preview "$selected"
+    print_worker_code "$selected"
     exit 0
 fi
 if [[ "$mode" == interactive ]] && [[ ! -t 0 ]]; then

@@ -32,41 +32,10 @@ const DEFAULT_EXECUTOR: &str = "build-elfloader/workerd-executor/executor";
 const DEFAULT_SCRATCH_MIB: usize = 344;
 const TIMEOUT: Duration = Duration::from_secs(30);
 
-const DATA_WORKER: &str = r#"
-export default {
-  async fetch(request, env) {
-    const input = await request.json();
-    const { kind, ...operationFields } = input.operation;
-    const response = await env[input.binding].fetch("https://logical.invalid/", {
-      method: "POST",
-      body: JSON.stringify({
-        version: 2,
-        request_id: input.request_id,
-        binding: input.binding,
-        operation: { kind, ...operationFields },
-      }),
-    });
-    return new Response(await response.text(), {
-      status: response.status,
-      headers: { "content-type": "application/json" },
-    });
-  },
-};
-"#;
-
-const INGRESS_WORKER: &str = r#"
-export default {
-  scheduled(controller) {
-    if (controller.cron !== "0 0 * * *") {
-      throw new Error(`unexpected cron ${controller.cron}`);
-    }
-  },
-  queue(batch) {
-    batch.messages[0].ack();
-    batch.messages[1].retry({ delaySeconds: 7 });
-  },
-};
-"#;
+const DATA_WORKER: &str = include_str!("workerd-capability-workers/data-worker.js");
+const INGRESS_WORKER: &str = include_str!("workerd-capability-workers/ingress-worker.js");
+const NODE_WORKER: &str = include_str!("workerd-capability-workers/node-worker.js");
+const NODE_LEGACY: &str = include_str!("workerd-capability-workers/legacy.cjs");
 
 #[derive(Serialize)]
 struct ProofEvidence {
@@ -465,24 +434,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 WorkerModule {
                     name: "worker.js".into(),
                     module_type: ModuleType::EsModule,
-                    source: r#"
-import legacy from "legacy.cjs";
-import { Buffer } from "node:buffer";
-export default {
-  fetch() {
-    return Response.json({
-      commonjs: legacy.answer,
-      bufferHex: Buffer.from("hyperlight").toString("hex"),
-    });
-  },
-};
-"#
-                    .into(),
+                    source: NODE_WORKER.into(),
                 },
                 WorkerModule {
                     name: "legacy.cjs".into(),
                     module_type: ModuleType::CommonJsModule,
-                    source: "module.exports = { answer: 42 };".into(),
+                    source: NODE_LEGACY.into(),
                 },
             ],
         }
