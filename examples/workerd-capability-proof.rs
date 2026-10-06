@@ -10,9 +10,10 @@ use hyperlight_unikraft::broker_runtime::{
     LogicalWireService,
 };
 use hyperlight_unikraft::data::{
-    CacheBinding, CacheLimits, CacheService, DurableDeliveryContext, DurableObjectBinding,
-    DurableObjectLimits, DurableObjectService, KvBinding, KvLimits, KvService, SqlBinding,
-    SqlLimits, SqlOperation, SqlParameter, SqlService, SqlStatement,
+    CacheBinding, CacheLimits, CacheOperation, CacheService, DurableDeliveryContext,
+    DurableObjectBinding, DurableObjectLimits, DurableObjectOperation, DurableObjectService,
+    KvBinding, KvLimits, KvOperation, KvService, SqlBinding, SqlLimits, SqlOperation, SqlParameter,
+    SqlService, SqlStatement,
 };
 use hyperlight_unikraft::workerd::{
     ExecutionProfile, FetchBroker, Header, ModuleType, PROTOCOL_VERSION, QueueMessage,
@@ -22,6 +23,7 @@ use hyperlight_unikraft::workerd::{
 };
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -181,8 +183,12 @@ fn execute_profiled(
     ))
 }
 
+fn operation_value(operation: impl Serialize) -> Result<Value, serde_json::Error> {
+    serde_json::to_value(operation)
+}
+
 fn sql_batch_operation(statements: Vec<SqlStatement>) -> Result<Value, serde_json::Error> {
-    serde_json::to_value(SqlOperation::Batch { statements })
+    operation_value(SqlOperation::Batch { statements })
 }
 
 fn data_worker(
@@ -500,35 +506,41 @@ export default {
         &data_version,
         "kv-put",
         "settings",
-        json!({"kind":"kv_put","key":"theme","value_base64":STANDARD.encode("dark")}),
+        operation_value(KvOperation::Put {
+            key: "theme".into(),
+            value_base64: STANDARD.encode("dark"),
+        })?,
     )?;
     let (kv_get, kv_get_profile) = execute_profiled(
         &data,
         &data_version,
         "kv-get",
         "settings",
-        json!({"kind":"kv_get","key":"theme"}),
+        operation_value(KvOperation::Get {
+            key: "theme".into(),
+        })?,
     )?;
     let (cache_put, cache_put_profile) = execute_profiled(
         &data,
         &data_version,
         "cache-put",
         "assets",
-        json!({
-            "kind":"cache_put",
-            "key":"https://example.test/app.js",
-            "status":200,
-            "headers":[{"name":"content-type","value":"text/javascript"}],
-            "body_base64":STANDARD.encode("console.log(1)"),
-            "ttl_ms":60000
-        }),
+        operation_value(CacheOperation::Put {
+            key: "https://example.test/app.js".into(),
+            status: 200,
+            headers: BTreeMap::from([("content-type".into(), "text/javascript".into())]),
+            body_base64: STANDARD.encode("console.log(1)"),
+            ttl_ms: 60_000,
+        })?,
     )?;
     let (cache_match, cache_match_profile) = execute_profiled(
         &data,
         &data_version,
         "cache-match",
         "assets",
-        json!({"kind":"cache_match","key":"https://example.test/app.js"}),
+        operation_value(CacheOperation::Match {
+            key: "https://example.test/app.js".into(),
+        })?,
     )?;
     let (sql_batch, sql_batch_profile) = execute_profiled(
         &data,
@@ -561,14 +573,19 @@ export default {
         &data_version,
         "do-put",
         "rooms",
-        json!({"kind":"do_storage_put","key":"topic","value_base64":STANDARD.encode("hyperlight")}),
+        operation_value(DurableObjectOperation::StoragePut {
+            key: "topic".into(),
+            value_base64: STANDARD.encode("hyperlight"),
+        })?,
     )?;
     let (durable_get, durable_get_profile) = execute_profiled(
         &data,
         &data_version,
         "do-get",
         "rooms",
-        json!({"kind":"do_storage_get","key":"topic"}),
+        operation_value(DurableObjectOperation::StorageGet {
+            key: "topic".into(),
+        })?,
     )?;
     let logical_request = |id: &str, binding: &str| {
         serde_json::to_vec(&json!({
