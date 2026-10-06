@@ -714,6 +714,20 @@ run_policy() {
     ensure_capability_proof || return
 }
 
+check_capability_evidence() {
+    local proof="$1"
+    local label="$2"
+    local predicate="$3"
+    local actual="$4"
+    if jq -e "$predicate" "$proof" >/dev/null; then
+        return 0
+    fi
+    printf 'capability evidence mismatch: %s\n' "$label" >&2
+    printf 'actual: ' >&2
+    jq -c "$actual" "$proof" >&2 || true
+    return 1
+}
+
 ensure_capability_proof() {
     local scope="${1:-all}"
     local proof="$output_dir/capability-proof.json"
@@ -740,6 +754,7 @@ ensure_capability_proof() {
         [[ ! -s "$output_dir/$database-before.tsv" ]]
     done
     local temporary="$proof.tmp"
+    rm -f -- "$output_dir/capability-proof.failed.json"
     if ! cargo +1.98.0 run --release --locked --example workerd-capability-proof -- \
         "$root/build-elfloader/workerd-executor/rootfs.img" \
         "$root/build-elfloader/workerd-executor/executor" \
@@ -751,32 +766,71 @@ ensure_capability_proof() {
         return 1
     fi
     if [[ "$scope" == sql ]]; then
-        if ! jq -e '
-            .runtime == "workerd-on-hyperlight" and
-            .sql.query_after_fresh_vm.results[0].rows == [[{"type":"integer","value":1},{"type":"text","value":"Ada"}]]
-        ' "$temporary" >/dev/null; then
-            rm -f -- "$temporary"
+        check_capability_evidence \
+            "$temporary" "runtime" \
+            '.runtime == "workerd-on-hyperlight"' '.runtime' &&
+            check_capability_evidence \
+                "$temporary" "SQL rows" \
+                '.sql.query_after_fresh_vm.results[0].rows == [[{"type":"integer","value":1},{"type":"text","value":"Ada"}]]' \
+                '.sql.query_after_fresh_vm.results[0].rows' || {
+            mv -f -- "$temporary" "$output_dir/capability-proof.failed.json"
+            printf 'failed evidence: %s\n' \
+                "$output_dir/capability-proof.failed.json" >&2
             return 1
-        fi
+        }
     else
-        if ! jq -e '
-        .runtime == "workerd-on-hyperlight" and
-        .scheduled.outcome == "ok" and
-        .queue.explicit_acks == ["message-1"] and
-        .queue.retry_messages == [{"id":"message-2","delay_seconds":7}] and
-        .node.commonjs == 42 and
-        .node.bufferHex == "68797065726c69676874" and
-        .policy.identity_denied.code == "identity_mismatch" and
-        .policy.binding_denied.code == "binding_denied" and
-        .policy.quota_denied.status == "quota_exceeded" and
-        .kv.get_after_fresh_vm.value_base64 == "ZGFyaw==" and
-        .cache.match_after_fresh_vm.cached_status == 200 and
-        .sql.query_after_fresh_vm.results[0].rows == [[{"type":"integer","value":1},{"type":"text","value":"Ada"}]] and
-        .durable_object.get_after_fresh_vm.value_base64 == "aHlwZXJsaWdodA=="
-        ' "$temporary" >/dev/null; then
-            rm -f -- "$temporary"
+        check_capability_evidence \
+            "$temporary" "runtime" \
+            '.runtime == "workerd-on-hyperlight"' '.runtime' &&
+            check_capability_evidence \
+                "$temporary" "scheduled outcome" \
+                '.scheduled.outcome == "ok"' '.scheduled' &&
+            check_capability_evidence \
+                "$temporary" "queue acknowledgements" \
+                '.queue.explicit_acks == ["message-1"]' '.queue.explicit_acks' &&
+            check_capability_evidence \
+                "$temporary" "queue retries" \
+                '.queue.retry_messages == [{"id":"message-2","delay_seconds":7}]' \
+                '.queue.retry_messages' &&
+            check_capability_evidence \
+                "$temporary" "CommonJS result" \
+                '.node.commonjs == 42' '.node.commonjs' &&
+            check_capability_evidence \
+                "$temporary" "node:buffer result" \
+                '.node.bufferHex == "68797065726c69676874"' '.node.bufferHex' &&
+            check_capability_evidence \
+                "$temporary" "identity denial" \
+                '.policy.identity_denied.code == "identity_mismatch"' \
+                '.policy.identity_denied' &&
+            check_capability_evidence \
+                "$temporary" "binding denial" \
+                '.policy.binding_denied.code == "binding_denied"' \
+                '.policy.binding_denied' &&
+            check_capability_evidence \
+                "$temporary" "operation quota denial" \
+                '.policy.quota_denied.status == "quota_exceeded"' \
+                '.policy.quota_denied' &&
+            check_capability_evidence \
+                "$temporary" "KV value" \
+                '.kv.get_after_fresh_vm.value_base64 == "ZGFyaw=="' \
+                '.kv.get_after_fresh_vm' &&
+            check_capability_evidence \
+                "$temporary" "Cache status" \
+                '.cache.match_after_fresh_vm.cached_status == 200' \
+                '.cache.match_after_fresh_vm' &&
+            check_capability_evidence \
+                "$temporary" "SQL rows" \
+                '.sql.query_after_fresh_vm.results[0].rows == [[{"type":"integer","value":1},{"type":"text","value":"Ada"}]]' \
+                '.sql.query_after_fresh_vm.results[0].rows' &&
+            check_capability_evidence \
+                "$temporary" "Durable Object value" \
+                '.durable_object.get_after_fresh_vm.value_base64 == "aHlwZXJsaWdodA=="' \
+                '.durable_object.get_after_fresh_vm' || {
+            mv -f -- "$temporary" "$output_dir/capability-proof.failed.json"
+            printf 'failed evidence: %s\n' \
+                "$output_dir/capability-proof.failed.json" >&2
             return 1
-        fi
+        }
     fi
     mv "$temporary" "$proof"
     capability_proof_ran=true
