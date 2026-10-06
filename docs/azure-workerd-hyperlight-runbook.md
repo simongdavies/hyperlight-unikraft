@@ -46,6 +46,9 @@ The setup script builds on the same Debian Trixie base used by Workerd's
 release container. It creates a matching libc++ 22 shared runtime from the
 packaged static archive for Bazel host tools, then verifies the
 `std::__1::__hash_memory` link before starting the expensive Workerd build.
+On a fresh machine, `--install-deps` also installs Rustup when `rustup` or
+`cargo` is missing, then installs the pinned Rust toolchain and development
+tools as the current user.
 Builder-specific Bazel output and action caches are namespaced by the exact
 builder image ID; downloaded repositories remain shared. A packaged executor
 that passes its self-test is stamped with the Workerd commit and builder image

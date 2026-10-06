@@ -147,6 +147,16 @@ if "$install_deps"; then
     sudo apt-get install -y "${host_packages[@]}"
 fi
 
+if ! command -v rustup >/dev/null || ! command -v cargo >/dev/null; then
+    "$install_deps" ||
+        fail "missing Rustup/Cargo (rerun with --install-deps or install Rustup first)"
+    step "Installing Rustup"
+    curl --proto '=https' --tlsv1.2 --fail --show-error --silent \
+        https://sh.rustup.rs |
+        sh -s -- -y --profile minimal --default-toolchain none
+    export PATH="$CARGO_HOME/bin:$PATH"
+fi
+
 for command in cargo curl docker file git go patch python3 sqlite3 \
     readelf rustup sha256sum; do
     command -v "$command" >/dev/null ||
