@@ -20,7 +20,12 @@ pub const MAX_HEADERS: usize = 64;
 pub const MAX_HEADER_BYTES: usize = 8 * 1024;
 pub const MAX_REQUEST_ID_BYTES: usize = 64;
 const EXECUTOR_INIT_PROTOCOL_VERSION: u16 = 2;
+const EXECUTOR_BINDING_PROTOCOL_VERSION: u16 = 3;
 const MAX_EXECUTOR_STORAGE_BINDINGS: usize = 8;
+const MAX_EXECUTOR_BINDINGS: usize = 32;
+const MAX_QUEUE_MESSAGES: usize = 100;
+const MAX_QUEUE_NAME_BYTES: usize = 64;
+const MAX_CRON_BYTES: usize = 256;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -133,10 +138,31 @@ pub struct WorkerBundle {
     pub modules: Vec<WorkerModule>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerBindingKind {
+    Kv,
+    Cache,
+    D1,
+    DurableObject,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WorkerBinding {
+    pub name: String,
+    pub kind: WorkerBindingKind,
+}
+
 #[derive(Serialize)]
 struct ExecutorStorageBinding<'a> {
     name: &'a str,
     mode: &'static str,
+}
+
+#[derive(Serialize)]
+struct ExecutorBinding<'a> {
+    name: &'a str,
+    kind: WorkerBindingKind,
 }
 
 #[derive(Serialize)]
@@ -148,6 +174,80 @@ struct ExecutorInit<'a> {
     main_module: &'a str,
     modules: &'a [WorkerModule],
     storage: &'a [ExecutorStorageBinding<'a>],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bindings: Option<&'a [ExecutorBinding<'a>]>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScheduledRequest {
+    pub protocol_version: u16,
+    pub request_id: String,
+    pub scheduled_time_unix_ms: u64,
+    pub cron: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScheduledResponse {
+    pub protocol_version: u16,
+    pub request_id: String,
+    pub outcome: String,
+    pub retry: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueueMessage {
+    pub id: String,
+    pub timestamp_unix_ms: u64,
+    pub body_base64: String,
+    pub content_type: Option<String>,
+    pub attempts: u16,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueueMetadata {
+    pub backlog_count: f64,
+    pub backlog_bytes: f64,
+    pub oldest_message_timestamp_unix_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueueRequest {
+    pub protocol_version: u16,
+    pub request_id: String,
+    pub queue: String,
+    pub messages: Vec<QueueMessage>,
+    pub metadata: QueueMetadata,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueueBatchRetry {
+    pub retry: bool,
+    pub delay_seconds: Option<i32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueueMessageRetry {
+    pub id: String,
+    pub delay_seconds: Option<i32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueueResponse {
+    pub protocol_version: u16,
+    pub request_id: String,
+    pub outcome: String,
+    pub ack_all: bool,
+    pub retry_batch: QueueBatchRetry,
+    pub explicit_acks: Vec<String>,
+    pub retry_messages: Vec<QueueMessageRetry>,
 }
 
 fn invalid(message: &str) -> Error {
@@ -320,9 +420,10 @@ impl WorkerBundle {
         Ok(json)
     }
 
-    pub(super) fn to_executor_init_json<'a>(
+    pub(super) fn to_executor_init_json_with_bindings<'a>(
         &self,
         storage: impl IntoIterator<Item = (&'a str, bool)>,
+        bindings: impl IntoIterator<Item = &'a WorkerBinding>,
     ) -> Result<String> {
         self.validate()?;
         let mut storage: Vec<_> = storage
@@ -333,8 +434,8 @@ impl WorkerBundle {
             })
             .collect();
         storage.sort_by(|left, right| left.name.cmp(right.name));
-        if storage.is_empty() || storage.len() > MAX_EXECUTOR_STORAGE_BINDINGS {
-            return Err(invalid("invalid executor storage binding count"));
+        if storage.len() > MAX_EXECUTOR_STORAGE_BINDINGS {
+            return Err(invalid("too many executor storage bindings"));
         }
         let mut previous = None;
         for binding in &storage {
@@ -350,18 +451,54 @@ impl WorkerBundle {
             }
             previous = Some(binding.name);
         }
+        let mut bindings: Vec<_> = bindings
+            .into_iter()
+            .map(|binding| ExecutorBinding {
+                name: &binding.name,
+                kind: binding.kind,
+            })
+            .collect();
+        bindings.sort_by(|left, right| left.name.cmp(right.name));
+        if bindings.len() > MAX_EXECUTOR_BINDINGS {
+            return Err(invalid("too many executor bindings"));
+        }
+        let mut previous = None;
+        for binding in &bindings {
+            identifier(binding.name, 64)?;
+            if previous.is_some_and(|name| name == binding.name) {
+                return Err(invalid("duplicate executor binding"));
+            }
+            previous = Some(binding.name);
+        }
+        let protocol_version = if bindings.is_empty() {
+            if storage.is_empty() {
+                return Err(invalid("executor capabilities are empty"));
+            }
+            EXECUTOR_INIT_PROTOCOL_VERSION
+        } else {
+            EXECUTOR_BINDING_PROTOCOL_VERSION
+        };
         let init = ExecutorInit {
-            protocol_version: EXECUTOR_INIT_PROTOCOL_VERSION,
+            protocol_version,
             worker_version: &self.worker_version,
             compatibility_date: &self.compatibility_date,
             compatibility_flags: &self.compatibility_flags,
             main_module: &self.main_module,
             modules: &self.modules,
             storage: &storage,
+            bindings: (!bindings.is_empty()).then_some(&bindings),
         };
         let json = serde_json::to_string(&init)?;
         bounded(json.as_bytes())?;
         Ok(json)
+    }
+
+    #[cfg(test)]
+    pub(super) fn to_executor_init_json<'a>(
+        &self,
+        storage: impl IntoIterator<Item = (&'a str, bool)>,
+    ) -> Result<String> {
+        self.to_executor_init_json_with_bindings(storage, std::iter::empty())
     }
 
     pub fn sha256(&self) -> Result<String> {
@@ -397,6 +534,100 @@ impl WorkerBundle {
         }
         self.modules.insert(0, main);
         Ok(())
+    }
+}
+
+impl ScheduledRequest {
+    pub fn to_json(&self) -> Result<String> {
+        if self.protocol_version != PROTOCOL_VERSION {
+            return Err(invalid("unsupported scheduled protocol version"));
+        }
+        identifier(&self.request_id, MAX_REQUEST_ID_BYTES)?;
+        if self.cron.is_empty()
+            || self.cron.len() > MAX_CRON_BYTES
+            || self.cron.bytes().any(|byte| byte < b' ' || byte == 0x7f)
+        {
+            return Err(invalid("invalid scheduled cron"));
+        }
+        let json = serde_json::to_string(self)?;
+        bounded(json.as_bytes())?;
+        Ok(json)
+    }
+}
+
+impl ScheduledResponse {
+    pub fn from_json(input: &[u8]) -> Result<Self> {
+        bounded(input)?;
+        let response: Self = serde_json::from_slice(input)?;
+        if response.protocol_version != PROTOCOL_VERSION {
+            return Err(invalid("unsupported scheduled protocol version"));
+        }
+        identifier(&response.request_id, MAX_REQUEST_ID_BYTES)?;
+        identifier(&response.outcome, 64)?;
+        Ok(response)
+    }
+}
+
+impl QueueRequest {
+    pub fn to_json(&self) -> Result<String> {
+        if self.protocol_version != PROTOCOL_VERSION {
+            return Err(invalid("unsupported queue protocol version"));
+        }
+        identifier(&self.request_id, MAX_REQUEST_ID_BYTES)?;
+        identifier(&self.queue, MAX_QUEUE_NAME_BYTES)?;
+        if self.messages.is_empty() || self.messages.len() > MAX_QUEUE_MESSAGES {
+            return Err(invalid("invalid queue batch"));
+        }
+        let mut body_bytes = 0usize;
+        let mut previous = None;
+        for message in &self.messages {
+            identifier(&message.id, MAX_REQUEST_ID_BYTES)?;
+            if previous.is_some_and(|id: &String| id >= &message.id) {
+                return Err(invalid("queue message IDs are not unique and sorted"));
+            }
+            previous = Some(&message.id);
+            body_bytes = body_bytes
+                .checked_add(
+                    STANDARD
+                        .decode(&message.body_base64)
+                        .map_err(|_| invalid("invalid queue message body"))?
+                        .len(),
+                )
+                .ok_or_else(|| invalid("queue batch body exceeds limit"))?;
+            if body_bytes > MAX_BODY_BYTES {
+                return Err(invalid("queue batch body exceeds limit"));
+            }
+            if message
+                .content_type
+                .as_deref()
+                .is_some_and(|value| !matches!(value, "text" | "bytes" | "json" | "v8"))
+            {
+                return Err(invalid("invalid queue message content type"));
+            }
+        }
+        if !self.metadata.backlog_count.is_finite()
+            || self.metadata.backlog_count < 0.0
+            || !self.metadata.backlog_bytes.is_finite()
+            || self.metadata.backlog_bytes < 0.0
+        {
+            return Err(invalid("invalid queue metadata"));
+        }
+        let json = serde_json::to_string(self)?;
+        bounded(json.as_bytes())?;
+        Ok(json)
+    }
+}
+
+impl QueueResponse {
+    pub fn from_json(input: &[u8]) -> Result<Self> {
+        bounded(input)?;
+        let response: Self = serde_json::from_slice(input)?;
+        if response.protocol_version != PROTOCOL_VERSION {
+            return Err(invalid("unsupported queue protocol version"));
+        }
+        identifier(&response.request_id, MAX_REQUEST_ID_BYTES)?;
+        identifier(&response.outcome, 64)?;
+        Ok(response)
     }
 }
 
@@ -552,6 +783,70 @@ mod tests {
                 source: "export default { fetch() { return new Response('ok') } }".into(),
             }],
         }
+    }
+
+    #[test]
+    fn scheduled_and_queue_envelopes_are_canonical_and_bounded() {
+        let scheduled = ScheduledRequest {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: "scheduled-1".into(),
+            scheduled_time_unix_ms: 1_767_225_600_000,
+            cron: "0 0 * * *".into(),
+        };
+        assert_eq!(
+            scheduled.to_json().unwrap(),
+            r#"{"protocol_version":1,"request_id":"scheduled-1","scheduled_time_unix_ms":1767225600000,"cron":"0 0 * * *"}"#
+        );
+        assert_eq!(
+                ScheduledResponse::from_json(
+                    br#"{"protocol_version":1,"request_id":"scheduled-1","outcome":"ok","retry":false}"#
+                )
+                .unwrap(),
+                ScheduledResponse {
+                    protocol_version: PROTOCOL_VERSION,
+                    request_id: "scheduled-1".into(),
+                    outcome: "ok".into(),
+                    retry: false,
+                }
+            );
+
+        let queue = QueueRequest {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: "queue-1".into(),
+            queue: "jobs".into(),
+            messages: vec![QueueMessage {
+                id: "message-1".into(),
+                timestamp_unix_ms: 1_767_225_600_000,
+                body_base64: "aGVsbG8=".into(),
+                content_type: Some("text".into()),
+                attempts: 2,
+            }],
+            metadata: QueueMetadata {
+                backlog_count: 3.0,
+                backlog_bytes: 5.0,
+                oldest_message_timestamp_unix_ms: Some(1_767_225_500_000),
+            },
+        };
+        assert_eq!(
+            queue.to_json().unwrap(),
+            r#"{"protocol_version":1,"request_id":"queue-1","queue":"jobs","messages":[{"id":"message-1","timestamp_unix_ms":1767225600000,"body_base64":"aGVsbG8=","content_type":"text","attempts":2}],"metadata":{"backlog_count":3.0,"backlog_bytes":5.0,"oldest_message_timestamp_unix_ms":1767225500000}}"#
+        );
+    }
+
+    #[test]
+    fn executor_binding_manifest_uses_protocol_three() {
+        let binding = WorkerBinding {
+            name: "settings".into(),
+            kind: WorkerBindingKind::Kv,
+        };
+        let json = bundle()
+            .to_executor_init_json_with_bindings(std::iter::empty(), [&binding])
+            .unwrap();
+
+        assert_eq!(
+            json,
+            r#"{"protocol_version":3,"worker_version":"v1","compatibility_date":"2025-01-01","compatibility_flags":["nodejs_compat"],"main_module":"worker.js","modules":[{"name":"worker.js","type":"esModule","source":"export default { fetch() { return new Response('ok') } }"}],"storage":[],"bindings":[{"name":"settings","kind":"kv"}]}"#
+        );
     }
 
     #[test]

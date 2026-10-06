@@ -137,7 +137,7 @@ if "$install_deps"; then
     host_packages=(
         binutils build-essential ca-certificates containerd cpio curl \
         docker.io file git golang-go jq patch pkg-config python3 \
-        rsync unzip
+        rsync sqlite3 unzip
     )
     if apt-cache show docker-buildx >/dev/null 2>&1; then
         host_packages+=(docker-buildx)
@@ -147,7 +147,7 @@ if "$install_deps"; then
     sudo apt-get install -y "${host_packages[@]}"
 fi
 
-for command in cargo curl docker file git go patch python3 \
+for command in cargo curl docker file git go patch python3 sqlite3 \
     readelf rustup sha256sum; do
     command -v "$command" >/dev/null ||
         fail "missing '$command' (rerun with --install-deps where applicable)"

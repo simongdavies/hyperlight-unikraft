@@ -89,11 +89,19 @@ tools/hyperlight-demo --demo kv
 tools/hyperlight-demo --demo benchmark-prewarmed
 ```
 
-Each step prints its purpose, action, key result, and takeaway. Ordinary logs
-and JSON output go to `demo-output/`; override that location with
+Clear all generated output for this checkout before a presentation:
+
+```bash
+tools/hyperlight-demo --clear
+```
+
+Each successful step prints a compact evidence table containing the values
+that were actually observed, not only a PASS label. Ordinary logs and JSON
+output go to `demo-output/`; override that location with
 `--output-dir DIR` or `HYPERLIGHT_DEMO_OUTPUT`. Raw command output stays in
 those logs so the default presenter view remains concise. Add `--verbose` when
-you want to stream it during a run.
+you want to stream it during a run. A failed step prints the failing stage,
+artifact location, and final 30 log lines.
 
 ## Demo index
 
@@ -110,11 +118,11 @@ you want to stream it during a run.
 | `node` | Node-style modules and files | Included modules and allowed files work; processes, worker threads, native add-ons, and other host files remain unavailable |
 | `core-wasm` | Core WebAssembly | The packaged Wasm export runs in disposable request VMs |
 | `component` | WebAssembly Component example | The example builds and runs in Workerd on Hyperlight |
-| `wasi-p2` | WASI Preview 2 | Portable HTTP, streams, clock, random, cleanup, and allowed-access checks pass |
-| `wasi-p3` | WASI Preview 3 | Ordering, backpressure, deadlines, cancellation, and cleanup pass |
-| `tcp-tls` | TCP and encrypted TCP connections | Network access is denied by default; destinations allowed by the host connect and everything else is blocked before a connection opens |
-| `udp` | Controlled UDP messages | Bounded messages work only for host-approved destinations |
-| `websocket` | Controlled WebSocket connections | Configured endpoint, message-size, lifetime, reset, and denial checks pass |
+| `wasi-p2` | WASI Preview 2 executable contract | A standalone proof prints observed HTTP, stream, clock, random, CLI, quota, and denial results |
+| `wasi-p3` | WASI Preview 3 executable contract | A standalone proof prints observed future, stream-ordering, backpressure, cancellation, and import-policy results |
+| `tcp-tls` | TCP and encrypted TCP broker boundary | Real local TCP and TLS 1.3 exchanges pass through the host broker; denied destinations fail before connect |
+| `udp` | Controlled UDP broker boundary | Real bounded datagrams work only for host-approved destinations |
+| `websocket` | Controlled WebSocket broker boundary | Real local WebSocket exchanges enforce endpoint, message-size, lifetime, reset, and denial rules |
 | `web-apis` | WinterTC and Web APIs | Timers, streams, handlers, MessagePort, and state reset pass |
 | `fetch` | Constrained outbound fetch | One declared loopback service works; other routes and redirects stay bounded |
 | `benchmark-on-demand` | Create VMs as requests arrive | Sends 320 requests, with up to 32 running at once, and confirms every request succeeds and cleanup finishes |
@@ -123,6 +131,32 @@ you want to stream it during a run.
 The presenter reuses the repository's existing VFS, named-storage, WinterTC,
 and fetch scripts and their checked-in Worker bundles. Use their `--list`
 options when presenting the lower-level route checks.
+
+### Independent backing-store verification
+
+The KV, Cache, D1, and Durable Object demos do not rely only on text emitted by
+the presenter. Each demo:
+
+1. clears its named SQLite backing files;
+2. creates a new empty database;
+3. prints a copy-paste `sqlite3 -readonly` command that proves the database has
+   zero application tables;
+4. performs the write and fresh-VM read through Workerd;
+5. prints measured VM teardown times;
+6. prints the database path and SHA-256; and
+7. prints a second copy-paste `sqlite3 -readonly` command plus the unmodified
+   CLI rows.
+
+The proof executable has exited before the second CLI query runs. An audience
+member can paste the displayed command into another terminal and query the same
+backing file directly. Raw JSON, CLI output, hashes, and logs remain below
+`demo-output/`.
+
+The WASI P2 and P3 entries run standalone proof executables rather than parsing
+unit-test names. Their complete JSON output is saved as
+`demo-output/wasi-p2-proof.json` and `demo-output/wasi-p3-proof.json`. These are
+typed host-interface contract demonstrations; they are not claims that a
+native WASI component was loaded inside the Workerd VM.
 
 ## Compatibility at a glance
 
@@ -145,7 +179,7 @@ and cryptography.
 | Capability group | Supported | Missing or restricted |
 |---|---|---|
 | Core web APIs | URL and request/response APIs, FormData, Blob/File, text codecs, digest, secure random values, timers, readable/writable/transform/compression streams, MessagePort, and byte streams with caller-provided buffers | Support status is not yet documented for WinterTC APIs outside this list |
-| Network clients | Outbound fetch, TCP/TLS, UDP, and WebSocket through host-provided interfaces | Denied by default; only allowed destinations and operations work; direct host sockets and listeners are unavailable |
+| Network clients | Outbound fetch through a Workerd request VM; TCP/TLS, UDP, and WebSocket through the separately tested host broker | Denied by default; the current sandbox executor does not yet connect Workerd's standard socket APIs to the host broker |
 | Files | Packaged files, fresh temporary files, supported device files, and specific host folders granted to the Worker | Every other host path is inaccessible; temporary files are discarded with the VM |
 | Saved application data | KV, Cache, D1, and Durable Objects backed by host-kept data | Access is limited to configured services and allowed operations |
 | Request isolation | A fresh VM and fresh mutable module state for each request or event | VM-local state does not persist after the VM is destroyed |
@@ -164,7 +198,7 @@ compatibility.
 | JavaScript modules and common APIs | Both ES modules and CommonJS (the two common JavaScript module formats), plus text, JSON, core Wasm, and selected Buffer/path/URL/stream/crypto-style APIs work. |
 | Files | `node:fs` can read packaged files and use fresh temporary files. The host may also grant the Worker access to specific folders. Every other host path is inaccessible. |
 | `process` information | Applications see stable placeholder values such as `pid=1`, not the real host process. |
-| Networking | The host controls every external connection, and access is denied by default. It may allow a Worker to use outbound fetch, TCP/TLS, UDP, or WebSocket only for approved destinations and operations. Loading a module grants no network access. |
+| Networking | The host controls every external connection, and access is denied by default. Outbound fetch is wired through the Workerd request path. TCP/TLS, UDP, and WebSocket have real host-broker socket proofs but are not yet wired to Workerd's standard socket APIs. Loading a module grants no network access. |
 | Loading code | Applications can load modules included in their bundle. They cannot install packages at runtime, search host folders, or use `eval()`/`new Function()`. |
 | Child processes | `node:child_process` can be imported, but process-creation methods report `ERR_METHOD_NOT_IMPLEMENTED`. |
 | Worker threads | Code cannot create additional JavaScript worker threads. `node:worker_threads` reports that code is running on the main thread. MessageChannel and MessagePort can pass messages, but they do not create another thread. |
@@ -184,10 +218,10 @@ external interfaces they use.
 | Scheduled events and message batches | Runs scheduled and queue handlers for supplied events | Passes a scheduled event or logical queue name plus message batch into the VM and returns completion, acknowledge, retry, batch-retry, or no-retry decisions |
 | KV, Cache, D1, and Durable Objects | Provides these APIs and configured local or remote data services | Connects them to host-kept data that survives destruction of the temporary VM |
 | Host folders | Provides bundle files, directory services, and virtual Node files | Before launch, the host opens each allowed folder and exposes it at a fixed path inside the VM. Worker code can use paths only inside that folder. The host blocks path escapes and writes to read-only folders, counts operations and transferred bytes, and rejects further access when the configured limit is reached. |
-| TCP and TLS | Workerd can open outbound TCP connections. TLS adds encryption to that connection. | Worker code sends the requested destination and encryption requirements to the host. The host checks them before DNS lookup or connection setup, opens an allowed socket, and relays bytes for the VM. A denied request fails before a connection opens, and the Worker never receives general host socket access. |
-| WebSockets | Workerd can create and use WebSocket connections. | Worker code requests an endpoint through the host interface. The host checks the endpoint, opens an allowed connection, relays messages, and enforces message-size and lifetime limits. Denied endpoints never connect. |
-| UDP | UDP support depends on which Workerd API is being used. | Worker code sends the destination and message to the host. The host checks the address, port, and message size before sending it and returns allowed replies to the VM. Other destinations and oversized messages are denied; the Worker never receives a general UDP socket. |
-| WASI and Components | Supports core Wasm and Worker APIs | Implements selected WASI Preview 2 and Preview 3 host interfaces and runs the included WebAssembly Component example. |
+| TCP and TLS | Workerd has standard outbound socket APIs. | The host broker performs real TCP and TLS 1.3 exchanges, checks policy before connect, owns trust roots, audits activity, and invalidates handles between assignments. Connecting Workerd's socket channel to this broker remains outstanding. |
+| WebSockets | Workerd can create and use WebSocket connections. | The host broker performs real WebSocket exchanges and enforces endpoint, message-size, lifetime, and assignment-reset rules. Connecting Workerd's WebSocket channel to this broker remains outstanding. |
+| UDP | UDP support depends on which Workerd API is being used. | The host broker performs real UDP exchanges and checks address, port, and message size before send. Connecting a Workerd UDP API to this broker remains outstanding. |
+| WASI and Components | Supports core Wasm and Worker APIs | Runs executable typed-contract proofs for selected WASI Preview 2 and Preview 3 host interfaces and runs the included WebAssembly Component example. Native WASI Component loading in the Workerd VM is not claimed. |
 | Measurements | Provides its own runtime diagnostics | Shows how many VMs are ready, running, waiting, or being cleaned up, plus time spent in each step |
 
 ### Scheduled jobs and external queues

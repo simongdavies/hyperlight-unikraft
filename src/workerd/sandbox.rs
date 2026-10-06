@@ -2,11 +2,11 @@
 // Copyright 2026 The Hyperlight Authors.
 
 use super::{
-    Error, FetchBroker, RequestEnvelope, ResponseEnvelope, Result, SnapshotBinding, TimerLimits,
-    VerifiedSnapshot, WorkerBundle, WorkerVersionId, snapshot::kernel_for_rootfs,
-    timer::TimerBroker,
+    Error, FetchBroker, QueueRequest, QueueResponse, RequestEnvelope, ResponseEnvelope, Result,
+    ScheduledRequest, ScheduledResponse, SnapshotBinding, TimerLimits, VerifiedSnapshot,
+    WorkerBinding, WorkerBundle, WorkerVersionId, snapshot::kernel_for_rootfs, timer::TimerBroker,
 };
-use crate::{AppSandbox, Mount, MountLimits, Yield};
+use crate::{AppSandbox, Mount, MountLimits, Yield, broker_runtime::BrokerRuntime};
 use hyperlight_host::func::Registerable;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -57,7 +57,7 @@ impl std::error::Error for InitializationFailure {}
 #[derive(Default)]
 struct RequestState {
     id: Option<String>,
-    response: Option<ResponseEnvelope>,
+    response: Option<String>,
     violation: Option<String>,
     bytes: Vec<u8>,
 }
@@ -87,8 +87,13 @@ impl Responses {
             .lock()
             .map_err(|_| Error::State("response mutex poisoned".into()))?;
         let result = (|| {
-            let response = ResponseEnvelope::from_json(json.as_bytes())?;
-            if state.id.as_deref() != Some(&response.request_id) {
+            let envelope: serde_json::Value = serde_json::from_str(json)?;
+            let request_id = envelope
+                .as_object()
+                .and_then(|object| object.get("request_id"))
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| Error::Protocol("response has no request ID".into()))?;
+            if state.id.as_deref() != Some(request_id) {
                 return Err(Error::State(
                     "stale response ID or no active request".into(),
                 ));
@@ -97,7 +102,7 @@ impl Responses {
             if state.response.is_some() {
                 return Err(Error::State("duplicate response".into()));
             }
-            state.response = Some(response);
+            state.response = Some(json.into());
             Ok(())
         })();
         if let Err(error) = &result {
@@ -156,7 +161,7 @@ impl Responses {
         Ok(())
     }
 
-    fn finish(&self) -> Result<ResponseEnvelope> {
+    fn finish_raw(&self) -> Result<String> {
         let mut state = self
             .0
             .lock()
@@ -168,6 +173,23 @@ impl Responses {
         completed
             .response
             .ok_or_else(|| Error::State("guest returned without a response".into()))
+    }
+
+    fn finish_fetch(&self) -> Result<ResponseEnvelope> {
+        ResponseEnvelope::from_json(self.finish_raw()?.as_bytes())
+    }
+
+    #[cfg(test)]
+    fn finish(&self) -> Result<ResponseEnvelope> {
+        self.finish_fetch()
+    }
+
+    fn finish_scheduled(&self) -> Result<ScheduledResponse> {
+        ScheduledResponse::from_json(self.finish_raw()?.as_bytes())
+    }
+
+    fn finish_queue(&self) -> Result<QueueResponse> {
+        QueueResponse::from_json(self.finish_raw()?.as_bytes())
     }
 
     fn clear(&self) -> Result<()> {
@@ -230,6 +252,8 @@ pub struct WorkerVersionSandbox {
     fetch_broker: FetchBroker,
     timer_broker: TimerBroker,
     storage_policy: StoragePolicy,
+    broker_runtime: Option<BrokerRuntime>,
+    capability_policy_sha256: String,
 }
 
 const STORAGE_GUEST_ROOT: &str = "/mnt/workerd-storage";
@@ -391,6 +415,8 @@ pub struct WorkerCapabilityPolicy {
     fetch_broker: FetchBroker,
     timer_limits: TimerLimits,
     storage_policy: StoragePolicy,
+    broker_runtime: Option<BrokerRuntime>,
+    bindings: Vec<WorkerBinding>,
 }
 
 impl WorkerCapabilityPolicy {
@@ -401,9 +427,60 @@ impl WorkerCapabilityPolicy {
     ) -> Self {
         Self {
             fetch_broker,
-            timer_limits,
+            timer_limits: timer_limits.clone(),
             storage_policy,
+            broker_runtime: None,
+            bindings: Vec::new(),
         }
+    }
+
+    pub fn with_broker_runtime(
+        mut self,
+        broker_runtime: BrokerRuntime,
+        bindings: impl IntoIterator<Item = WorkerBinding>,
+    ) -> Result<Self> {
+        let mut bindings: Vec<_> = bindings.into_iter().collect();
+        bindings.sort_by(|left, right| left.name.cmp(&right.name));
+        if bindings.is_empty() {
+            return Err(Error::State(
+                "broker runtime requires at least one Workerd binding".into(),
+            ));
+        }
+        if !broker_runtime.has_logical() {
+            return Err(Error::State(
+                "Workerd bindings require a logical broker runtime".into(),
+            ));
+        }
+        let mut names = HashSet::new();
+        for binding in &bindings {
+            if !names.insert(binding.name.clone()) {
+                return Err(Error::State(format!(
+                    "duplicate Workerd binding {:?}",
+                    binding.name
+                )));
+            }
+        }
+        self.broker_runtime = Some(broker_runtime);
+        self.bindings = bindings;
+        Ok(self)
+    }
+
+    pub(super) fn sha256(&self) -> String {
+        let mut digest = Sha256::new();
+        digest.update(b"workerd-capability-policy:v2\0");
+        digest.update(self.storage_policy.sha256().as_bytes());
+        digest.update(b"\0");
+        for binding in &self.bindings {
+            digest.update(binding.name.as_bytes());
+            digest.update(b"\0");
+            digest.update(format!("{:?}", binding.kind).as_bytes());
+            digest.update(b"\0");
+        }
+        digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
     }
 }
 
@@ -592,7 +669,17 @@ impl WorkerVersionSandbox {
             fetch_broker,
             timer_limits,
             storage_policy,
+            broker_runtime,
+            bindings,
         } = policy;
+        let policy_sha256 = WorkerCapabilityPolicy {
+            fetch_broker: fetch_broker.clone(),
+            timer_limits: timer_limits.clone(),
+            storage_policy: storage_policy.clone(),
+            broker_runtime: broker_runtime.clone(),
+            bindings: bindings.clone(),
+        }
+        .sha256();
         let mut profile = InitializationProfile::default();
         let timer_broker = TimerBroker::new(timer_limits)
             .map_err(|error| Self::initialization_failure("assemble", error, &profile))?;
@@ -606,17 +693,20 @@ impl WorkerVersionSandbox {
         let started = Instant::now();
         let kernel = kernel_for_rootfs(rootfs.as_ref())
             .map_err(|error| Self::initialization_failure("binding", error, &profile))?;
-        let init_json = if storage_policy.bindings().is_empty() {
+        let init_json = if storage_policy.bindings().is_empty() && bindings.is_empty() {
             bundle.to_canonical_json()
         } else {
-            bundle.to_executor_init_json(storage_policy.executor_bindings())
+            bundle.to_executor_init_json_with_bindings(
+                storage_policy.executor_bindings(),
+                bindings.iter(),
+            )
         }
         .map_err(|error| Self::initialization_failure("binding", error, &profile))?;
-        let binding = SnapshotBinding::from_artifacts_with_storage(
+        let binding = SnapshotBinding::from_artifacts_with_policy(
             &bundle,
             &rootfs,
             executor,
-            storage_policy.sha256(),
+            policy_sha256.clone(),
         )
         .map_err(|error| Self::initialization_failure("binding", error, &profile))?;
         profile.binding_ms = Self::elapsed_ms(started);
@@ -697,6 +787,8 @@ impl WorkerVersionSandbox {
                 fetch_broker,
                 timer_broker,
                 storage_policy,
+                broker_runtime,
+                capability_policy_sha256: policy_sha256,
             },
             profile,
         ))
@@ -719,11 +811,14 @@ impl WorkerVersionSandbox {
     }
 
     pub fn from_verified_snapshot(image: VerifiedSnapshot) -> Self {
+        let capability_policy_sha256 = image.binding().capability_policy_sha256().into();
         Self {
             image,
             fetch_broker: FetchBroker::denied(),
             timer_broker: TimerBroker::default(),
             storage_policy: StoragePolicy::denied(),
+            broker_runtime: None,
+            capability_policy_sha256,
         }
     }
 
@@ -731,11 +826,14 @@ impl WorkerVersionSandbox {
         image: VerifiedSnapshot,
         fetch_broker: FetchBroker,
     ) -> Self {
+        let capability_policy_sha256 = image.binding().capability_policy_sha256().into();
         Self {
             image,
             fetch_broker,
             timer_broker: TimerBroker::default(),
             storage_policy: StoragePolicy::denied(),
+            broker_runtime: None,
+            capability_policy_sha256,
         }
     }
 
@@ -758,9 +856,14 @@ impl WorkerVersionSandbox {
         timer_limits: TimerLimits,
         storage_policy: StoragePolicy,
     ) -> Result<Self> {
-        if image.binding().storage_policy_sha256() != storage_policy.sha256() {
+        let policy = WorkerCapabilityPolicy::new(
+            fetch_broker.clone(),
+            timer_limits.clone(),
+            storage_policy.clone(),
+        );
+        if image.binding().capability_policy_sha256() != policy.sha256() {
             return Err(Error::Snapshot(
-                "snapshot storage policy binding mismatch".into(),
+                "snapshot capability policy binding mismatch".into(),
             ));
         }
         Ok(Self {
@@ -768,6 +871,8 @@ impl WorkerVersionSandbox {
             fetch_broker,
             timer_broker: TimerBroker::new(timer_limits)?,
             storage_policy,
+            broker_runtime: None,
+            capability_policy_sha256: policy.sha256(),
         })
     }
 
@@ -786,6 +891,36 @@ impl WorkerVersionSandbox {
         timeout: Duration,
     ) -> Result<ResponseEnvelope> {
         self.execute_profiled(version, request, timeout).0
+    }
+
+    pub fn execute_scheduled(
+        &self,
+        version: &WorkerVersionId,
+        request: ScheduledRequest,
+        timeout: Duration,
+    ) -> Result<ScheduledResponse> {
+        if version != self.worker_version() {
+            return Err(Error::State(
+                "sandbox cannot be reassigned across Worker versions".into(),
+            ));
+        }
+        let (restored, _) = self.restore()?;
+        restored.execute_scheduled(request, timeout)
+    }
+
+    pub fn execute_queue(
+        &self,
+        version: &WorkerVersionId,
+        request: QueueRequest,
+        timeout: Duration,
+    ) -> Result<QueueResponse> {
+        if version != self.worker_version() {
+            return Err(Error::State(
+                "sandbox cannot be reassigned across Worker versions".into(),
+            ));
+        }
+        let (restored, _) = self.restore()?;
+        restored.execute_queue(request, timeout)
     }
 
     pub fn execute_profiled(
@@ -820,15 +955,20 @@ impl WorkerVersionSandbox {
     }
 
     pub(super) fn restore(&self) -> Result<(RestoredWorkerVersionSandbox, f64)> {
-        if self.image.binding().storage_policy_sha256() != self.storage_policy.sha256() {
+        if self.image.binding().capability_policy_sha256() != self.capability_policy_sha256 {
             return Err(Error::Snapshot(
-                "snapshot storage policy binding mismatch".into(),
+                "snapshot capability policy binding mismatch".into(),
             ));
         }
         let restore_started = Instant::now();
         let responses = Responses::default();
         let fetch_session = self.fetch_broker.session(Instant::now());
         let timer_session = self.timer_broker.session();
+        if let Some(runtime) = &self.broker_runtime {
+            runtime
+                .reset_for_fresh_vm()
+                .map_err(|error| Error::State(error.to_string()))?;
+        }
         let (sandbox, config) = crate::restore_snapshot_with(
             self.image.snapshot.clone(),
             self.storage_policy.mounts(),
@@ -840,6 +980,26 @@ impl WorkerVersionSandbox {
                     .register(functions, fetch_session.clone())?;
                 self.timer_broker
                     .register(functions, timer_session.clone())?;
+                if let Some(runtime) = &self.broker_runtime {
+                    if runtime.has_network() {
+                        let runtime = runtime.clone();
+                        functions.register_host_function(
+                            crate::broker_runtime::NETWORK_BROKER_HOST_FUNCTION,
+                            move |payload: Vec<u8>| -> hyperlight_host::Result<Vec<u8>> {
+                                Ok(runtime.dispatch_network(&payload))
+                            },
+                        )?;
+                    }
+                    if runtime.has_logical() {
+                        let runtime = runtime.clone();
+                        functions.register_host_function(
+                            crate::broker_runtime::LOGICAL_BROKER_HOST_FUNCTION,
+                            move |payload: Vec<u8>| -> hyperlight_host::Result<Vec<u8>> {
+                                Ok(runtime.dispatch_logical(&payload))
+                            },
+                        )?;
+                    }
+                }
                 Ok::<(), Error>(())
             },
         )?;
@@ -862,6 +1022,73 @@ impl WorkerVersionSandbox {
 }
 
 impl RestoredWorkerVersionSandbox {
+    fn execute_scheduled(
+        self,
+        request: ScheduledRequest,
+        timeout: Duration,
+    ) -> Result<ScheduledResponse> {
+        let request_id = request.request_id.clone();
+        self.execute_event(
+            "scheduled",
+            request_id,
+            request.to_json()?,
+            timeout,
+            |responses| responses.finish_scheduled(),
+        )
+    }
+
+    fn execute_queue(self, request: QueueRequest, timeout: Duration) -> Result<QueueResponse> {
+        let request_id = request.request_id.clone();
+        self.execute_event(
+            "queue",
+            request_id,
+            request.to_json()?,
+            timeout,
+            |responses| responses.finish_queue(),
+        )
+    }
+
+    fn execute_event<T>(
+        self,
+        function: &str,
+        request_id: String,
+        encoded: String,
+        timeout: Duration,
+        finish: impl FnOnce(&Responses) -> Result<T>,
+    ) -> Result<T> {
+        let Self {
+            mut app,
+            responses,
+            fetch_session,
+            timer_session,
+        } = self;
+        if timeout.is_zero() {
+            return Err(Error::Timeout);
+        }
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| Error::State("timeout too large".into()))?;
+        fetch_session.set_deadline(deadline);
+        responses.begin(&request_id)?;
+        let result = with_watchdog(
+            &mut app,
+            deadline,
+            Some((fetch_session, timer_session)),
+            |app, deadline| {
+                app.resume()?;
+                drive_call(app, function, encoded, deadline)
+            },
+        );
+        drop(app);
+        match result {
+            Ok(()) => finish(&responses),
+            Err(error) => match responses.clear() {
+                Ok(()) => Err(error),
+                Err(clear_error) => Err(clear_error),
+            },
+        }
+    }
+
     pub(super) fn execute_profiled(
         self,
         request: RequestEnvelope,
@@ -930,7 +1157,7 @@ impl RestoredWorkerVersionSandbox {
 
         let finish_started = Instant::now();
         let result = match result {
-            Ok(()) => responses.finish(),
+            Ok(()) => responses.finish_fetch(),
             Err(error) => match responses.clear() {
                 Ok(()) => Err(error),
                 Err(clear_error) => Err(clear_error),

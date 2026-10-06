@@ -76,10 +76,13 @@ impl LogicalInvocation {
 }
 
 /// Logical wire inspection failure before typed adapter execution.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum LogicalWireError {
+    #[error("malformed logical-service request")]
     Malformed,
+    #[error("unsupported logical-service protocol version")]
     UnsupportedVersion,
+    #[error("invalid logical-service binding")]
     InvalidBinding,
 }
 
@@ -106,6 +109,101 @@ pub trait LogicalWireService: Send {
 
     /// Reset request-scoped transport state for a fresh VM.
     fn reset_for_fresh_vm(&mut self) -> Result<(), BrokerHostError>;
+}
+
+/// Routes Workerd's composite logical-service protocol to typed host services.
+pub struct LogicalServiceRouter {
+    services: std::collections::HashMap<String, Box<dyn LogicalWireService>>,
+}
+
+impl LogicalServiceRouter {
+    pub fn new() -> Self {
+        Self {
+            services: std::collections::HashMap::new(),
+        }
+    }
+
+    pub fn with_service(
+        mut self,
+        binding: impl Into<String>,
+        service: impl LogicalWireService + 'static,
+    ) -> Result<Self, LogicalWireError> {
+        let binding = binding.into();
+        LogicalInvocation::new(binding.clone())?;
+        if self.services.insert(binding, Box::new(service)).is_some() {
+            return Err(LogicalWireError::InvalidBinding);
+        }
+        Ok(self)
+    }
+
+    fn request(payload: &[u8]) -> Result<(String, Vec<u8>), LogicalWireError> {
+        let value: serde_json::Value =
+            serde_json::from_slice(payload).map_err(|_| LogicalWireError::Malformed)?;
+        let object = value.as_object().ok_or(LogicalWireError::Malformed)?;
+        if object.get("version").and_then(serde_json::Value::as_u64) != Some(2) {
+            return Err(LogicalWireError::UnsupportedVersion);
+        }
+        let binding = object
+            .get("binding")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(LogicalWireError::InvalidBinding)?
+            .to_string();
+        let mut translated = payload.to_vec();
+        let prefix = br#"{"version":2,"#;
+        if !translated.starts_with(prefix) {
+            return Err(LogicalWireError::Malformed);
+        }
+        translated[prefix.len() - 2] = b'1';
+        Ok((binding, translated))
+    }
+
+    fn response(mut response: Vec<u8>) -> Vec<u8> {
+        let prefix = br#"{"version":1,"#;
+        if response.starts_with(prefix) {
+            response[prefix.len() - 2] = b'2';
+        }
+        response
+    }
+}
+
+impl Default for LogicalServiceRouter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LogicalWireService for LogicalServiceRouter {
+    fn inspect(&self, payload: &[u8]) -> Result<LogicalInvocation, LogicalWireError> {
+        let (binding, _) = Self::request(payload)?;
+        LogicalInvocation::new(binding)
+    }
+
+    fn dispatch(&mut self, identity: &RequestIdentity, payload: &[u8]) -> Vec<u8> {
+        let Ok((binding, translated)) = Self::request(payload) else {
+            return self.reject(LogicalRuntimeStatus::InvalidRequest, "invalid_request");
+        };
+        let Some(service) = self.services.get_mut(&binding) else {
+            return self.reject(LogicalRuntimeStatus::Denied, "binding_denied");
+        };
+        Self::response(service.dispatch(identity, &translated))
+    }
+
+    fn reject(&self, status: LogicalRuntimeStatus, code: &'static str) -> Vec<u8> {
+        let status = match status {
+            LogicalRuntimeStatus::Denied => "denied",
+            LogicalRuntimeStatus::InvalidRequest => "invalid_request",
+            LogicalRuntimeStatus::HostError => "host_error",
+        };
+        format!("{{\"version\":2,\"request_id\":\"\",\"status\":\"{status}\",\"code\":\"{code}\"}}")
+            .into_bytes()
+    }
+
+    fn reset_for_fresh_vm(&mut self) -> Result<(), BrokerHostError> {
+        for service in self.services.values_mut() {
+            service.reset_for_fresh_vm()?;
+        }
+        Ok(())
+    }
 }
 
 /// Cloneable runtime handle stored by a sandbox and captured by host functions.
@@ -489,6 +587,54 @@ mod tests {
                 dispatches.load(Ordering::Relaxed),
             ),
             ("Denied:binding_denied".to_string(), 0)
+        );
+    }
+
+    struct VersionOneService;
+
+    impl LogicalWireService for VersionOneService {
+        fn inspect(&self, payload: &[u8]) -> Result<LogicalInvocation, LogicalWireError> {
+            let value: serde_json::Value =
+                serde_json::from_slice(payload).map_err(|_| LogicalWireError::Malformed)?;
+            if value["version"] != 1 {
+                return Err(LogicalWireError::UnsupportedVersion);
+            }
+            LogicalInvocation::new(value["binding"].as_str().unwrap_or_default())
+        }
+
+        fn dispatch(&mut self, _identity: &RequestIdentity, payload: &[u8]) -> Vec<u8> {
+            let value: serde_json::Value = serde_json::from_slice(payload).unwrap();
+            format!(
+                "{{\"version\":1,\"request_id\":\"{}\",\"status\":\"ok\",\"code\":\"ok\",\"value_base64\":\"ZGFyaw==\"}}",
+                value["request_id"].as_str().unwrap()
+            )
+            .into_bytes()
+        }
+
+        fn reject(&self, _status: LogicalRuntimeStatus, _code: &'static str) -> Vec<u8> {
+            unreachable!()
+        }
+
+        fn reset_for_fresh_vm(&mut self) -> Result<(), BrokerHostError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn composite_router_translates_workerd_protocol_to_typed_service_protocol() {
+        let router = LogicalServiceRouter::new()
+            .with_service("settings", VersionOneService)
+            .unwrap();
+        let runtime = BrokerRuntime::deny_all(identity())
+            .with_logical(["settings".to_string()], router)
+            .unwrap();
+
+        assert_eq!(
+            String::from_utf8(runtime.dispatch_logical(
+                br#"{"version":2,"request_id":"req-1","binding":"settings","operation":{"kind":"kv_get","key":"theme"}}"#
+            ))
+            .unwrap(),
+            r#"{"version":2,"request_id":"req-1","status":"ok","code":"ok","value_base64":"ZGFyaw=="}"#
         );
     }
 

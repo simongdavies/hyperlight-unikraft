@@ -171,6 +171,9 @@ fn tcp_stream_is_policy_bound_bounded_audited_and_reset() {
             Some("invalid_stream_handle")
         )
     );
+    println!(
+        r#"DEMO_EVIDENCE={{"demo":"tcp","connected":true,"sent_bytes":4,"received":"pong","audit_events":3,"after_reset":"invalid_stream_handle"}}"#
+    );
     server.join().unwrap();
 }
 
@@ -254,6 +257,9 @@ fn tls_is_host_terminated_with_host_owned_roots() {
             binary: true,
         }
     );
+    println!(
+        r#"DEMO_EVIDENCE={{"demo":"tls","connected":true,"tls_version":"1.3","trust_roots":"host-owned","sent_bytes":4,"received":"pong"}}"#
+    );
     server.join().unwrap();
 }
 
@@ -270,5 +276,8 @@ fn deny_all_rejects_before_connecting() {
     assert_eq!(
         (response.status(), response.code()),
         (BrokerWireStatus::Denied, Some("policy_denied"))
+    );
+    println!(
+        r#"DEMO_EVIDENCE={{"demo":"tcp-denial","status":"denied","code":"policy_denied","connected":false}}"#
     );
 }

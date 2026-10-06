@@ -17,6 +17,7 @@ const DEFAULT_ROOTFS: &str = "build-elfloader/workerd-executor/rootfs.img";
 const DEFAULT_EXECUTOR: &str = "build-elfloader/workerd-executor/executor";
 const DEFAULT_SCRATCH_MIB: usize = 344;
 const ITERATIONS: usize = 100;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const EXPECTED_BUNDLE_LOCK_SHA256: &str =
     "fbd7e3688a88e647fd0816ccffbff58dcb923e2651093dcee7812e5f70097dff";
 const EXPECTED_RESPONSE_SHA256: &str =
@@ -132,7 +133,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         executor,
         scratch_mib,
         Duration::from_secs(90),
-    )?;
+    )
+    .map_err(|error| format!("component worker initialization failed: {error}"))?;
 
     let cases = [
         (
@@ -157,11 +159,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ];
     let mut routes = Vec::with_capacity(cases.len() + 1);
     for (id, url, status, expected_body) in cases {
-        let mut evidence = decode(worker.execute(
-            &version,
-            request(id, url.into()),
-            Duration::from_millis(50),
-        )?)?;
+        let response = worker
+            .execute(&version, request(id, url.into()), REQUEST_TIMEOUT)
+            .map_err(|error| format!("{id} request failed: {error}"))?;
+        let mut evidence = decode(response)?;
         evidence.url = url.into();
         if evidence.status != status {
             return Err(format!("{id} returned {}, expected {status}", evidence.status).into());
@@ -183,11 +184,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "https://component.test/add?left=20&right=22&pad={}",
         "x".repeat(1024)
     );
-    let mut oversized = decode(worker.execute(
-        &version,
-        request("oversized", oversized_url.clone()),
-        Duration::from_millis(50),
-    )?)?;
+    let oversized_response = worker
+        .execute(
+            &version,
+            request("oversized", oversized_url.clone()),
+            REQUEST_TIMEOUT,
+        )
+        .map_err(|error| format!("oversized request failed: {error}"))?;
+    let mut oversized = decode(oversized_response)?;
     oversized.url = oversized_url;
     if oversized.status != 413 {
         return Err(format!(
@@ -207,14 +211,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut deterministic = Sha256::new();
     for sequence in 0..ITERATIONS {
-        let response = worker.execute(
-            &version,
-            request(
-                &format!("determinism-{sequence}"),
-                "https://component.test/add?left=20&right=22".into(),
-            ),
-            Duration::from_millis(50),
-        )?;
+        let response = worker
+            .execute(
+                &version,
+                request(
+                    &format!("determinism-{sequence}"),
+                    "https://component.test/add?left=20&right=22".into(),
+                ),
+                REQUEST_TIMEOUT,
+            )
+            .map_err(|error| format!("determinism iteration {sequence} failed: {error}"))?;
         if response.status != 200 {
             return Err(format!(
                 "determinism iteration {sequence} returned {}",

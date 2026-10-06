@@ -179,6 +179,17 @@ fn websocket_is_policy_bound_bounded_audited_and_reset() {
             Some("invalid_websocket_handle")
         )
     );
+    println!(
+        "DEMO_EVIDENCE={}",
+        serde_json::json!({
+            "demo": "websocket",
+            "opened": true,
+            "sent": {"type": "text", "bytes": 4},
+            "received": {"type": "binary", "body": "pong"},
+            "audit_events": 3,
+            "after_reset": "invalid_websocket_handle",
+        })
+    );
     server_thread.join().unwrap();
 }
 
@@ -217,6 +228,15 @@ fn websocket_message_limit_rejects_before_host_send() {
     assert_eq!(
         (rejected.status(), rejected.code()),
         (BrokerWireStatus::QuotaExceeded, Some("message_size_quota"))
+    );
+    println!(
+        "DEMO_EVIDENCE={}",
+        serde_json::json!({
+            "demo": "websocket-limit",
+            "status": "quota_exceeded",
+            "code": "message_size_quota",
+            "host_send": false,
+        })
     );
     server_thread.join().unwrap();
 }
@@ -309,6 +329,16 @@ fn secure_websocket_is_host_terminated_with_host_owned_roots() {
             payload: b"pong".to_vec(),
             binary: false,
         }
+    );
+    println!(
+        "DEMO_EVIDENCE={}",
+        serde_json::json!({
+            "demo": "websocket-secure",
+            "opened": true,
+            "tls": "host-terminated",
+            "trust_roots": "host-owned",
+            "received": "pong",
+        })
     );
     server_thread.join().unwrap();
 }

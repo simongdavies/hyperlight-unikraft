@@ -25,11 +25,21 @@ configure_user_home() {
 configure_user_home CARGO_HOME "$HOME/.cargo"
 configure_user_home RUSTUP_HOME "$HOME/.rustup"
 
-root="$(cd "$(dirname "$0")/.." && pwd)"
+normalize_path() {
+    local value
+    value="$(realpath -m "$1")"
+    if [[ "$value" =~ ^([A-Za-z]):/(.*)$ ]]; then
+        value="/${BASH_REMATCH[1],,}/${BASH_REMATCH[2]}"
+    fi
+    printf '%s\n' "$value"
+}
+
+root="$(normalize_path "$(cd "$(dirname "$0")/.." && pwd)")"
 output_dir="${HYPERLIGHT_DEMO_OUTPUT:-$root/demo-output}"
 demo_pid=""
 upstream_pid=""
 verbose=false
+capability_proof_ran=false
 go_bin="${GOBIN:-}"
 if [[ -z "$go_bin" ]] && command -v go >/dev/null; then
     go_bin="$(go env GOBIN 2>/dev/null || true)"
@@ -74,6 +84,7 @@ Usage:
   tools/hyperlight-demo --list
   tools/hyperlight-demo --preview
   tools/hyperlight-demo --describe NAME
+  tools/hyperlight-demo --clear
   tools/hyperlight-demo --help
 
 With no selection, the runner presents each demo interactively. Logs and
@@ -85,6 +96,7 @@ Options:
   --list            Show the formatted feature menu
   --preview         Render the complete presenter narration without running
   --describe NAME   Render one demo's narration without running
+  --clear           Remove this checkout's generated demo output and exit
   --output-dir DIR  Override the output directory
   --verbose         Stream raw command output as well as saving it
   -h, --help        Show this help
@@ -132,9 +144,9 @@ description() {
         component) echo "Build and run the WebAssembly Component example in Workerd on Hyperlight." ;;
         wasi-p2) echo "Exercise portable HTTP, streams, clock, and random-number support." ;;
         wasi-p3) echo "Exercise ordering, backpressure, deadlines, cancellation, and cleanup." ;;
-        tcp-tls) echo "Workerd can open outbound TCP connections. TLS adds encryption to that connection. The host opens the connection for the temporary VM and allows only configured hostnames, IP addresses, ports, and encryption settings." ;;
-        udp) echo "UDP support depends on which Workerd API is being used. The host can send and receive UDP messages for the temporary VM only for configured addresses and ports and within configured size limits." ;;
-        websocket) echo "Workerd can create and use WebSocket connections. The host allows only configured WebSocket endpoints and limits message size and connection lifetime." ;;
+        tcp-tls) echo "Exercise the host broker that will carry Workerd TCP and TLS traffic. It permits only configured destinations and encryption settings; Workerd socket-channel wiring remains separate." ;;
+        udp) echo "Exercise the host broker that will carry bounded UDP messages for configured addresses and ports; Workerd UDP-channel wiring remains separate." ;;
+        websocket) echo "Exercise the host broker that will carry WebSocket traffic and enforce endpoint, message-size, and lifetime limits; Workerd WebSocket-channel wiring remains separate." ;;
         web-apis) echo "Exercise timers, streams, handlers, MessagePort, and fresh state." ;;
         fetch) echo "Reach one declared loopback service while other destinations stay denied." ;;
         benchmark-on-demand) echo "Measure requests when VMs are created or restored as they are needed." ;;
@@ -238,16 +250,19 @@ result_lines() {
             echo "RESULT: Ordering, backpressure, deadlines, cancellation, and cleanup all completed."
             ;;
         tcp-tls)
-            echo "RESULT: The host opened allowed TCP and encrypted TLS connections for the VM."
+            echo "RESULT: The host broker completed real TCP and encrypted TLS exchanges."
             echo "EXPECTED DENIAL: An unlisted address or port failed before a connection was opened."
+            echo "LIMIT: The current sandbox executor does not yet connect Workerd's standard socket API to this broker."
             ;;
         udp)
-            echo "RESULT: UDP messages were exchanged with the configured address and port."
+            echo "RESULT: The host broker exchanged real UDP messages with the configured address and port."
             echo "EXPECTED DENIAL: Unlisted destinations and oversized messages were rejected."
+            echo "LIMIT: The current sandbox executor does not yet connect a Workerd UDP API to this broker."
             ;;
         websocket)
-            echo "RESULT: The configured WebSocket exchanged messages and reset cleanly."
+            echo "RESULT: The host broker completed real WebSocket exchanges and reset cleanly."
             echo "EXPECTED DENIAL: Oversized messages and unlisted endpoints were rejected."
+            echo "LIMIT: The current sandbox executor does not yet connect Workerd's WebSocket channel to this broker."
             ;;
         web-apis)
             echo "RESULT: Timers, streams, handlers, MessagePort, and fresh-state routes completed."
@@ -291,11 +306,268 @@ print_wrapped() {
     done < <(printf '%s\n' "$text" | fold -s -w "$((96 - ${#prefix}))")
 }
 
+if [[ -t 1 ]] && [[ "${NO_COLOR:-}" == "" ]]; then
+    c_bold=$'\033[1m'
+    c_green=$'\033[32m'
+    c_cyan=$'\033[36m'
+    c_yellow=$'\033[33m'
+    c_reset=$'\033[0m'
+else
+    c_bold=""
+    c_green=""
+    c_cyan=""
+    c_yellow=""
+    c_reset=""
+fi
+
+evidence_row() {
+    local label="$1"
+    local value="$2"
+    printf '  %b%-18s%b %s\n' "$c_cyan" "$label" "$c_reset" "$value"
+}
+
+evidence_heading() {
+    printf '\n%bEVIDENCE%b\n' "$c_bold" "$c_reset"
+}
+
 print_result_lines() {
     local line
     while IFS= read -r line; do
-        print_wrapped "  " "$line"
+        case "$line" in
+            RESULT:*)
+                printf '  %bRESULT%b %s\n' "$c_green" "$c_reset" "${line#RESULT: }"
+                ;;
+            "EXPECTED DENIAL:"*)
+                printf '  %bDENIED%b %s\n' "$c_yellow" "$c_reset" \
+                    "${line#EXPECTED DENIAL: }"
+                ;;
+            LIMIT:*)
+                printf '  %bLIMIT%b %s\n' "$c_yellow" "$c_reset" "${line#LIMIT: }"
+                ;;
+            *) print_wrapped "  " "$line" ;;
+        esac
     done < <(result_lines "$1")
+}
+
+print_demo_evidence() {
+    local demo="$1"
+    local proof="$output_dir/capability-proof.json"
+    evidence_heading
+    case "$demo" in
+        policy)
+            evidence_row "Trusted identity" "$(jq -r '.policy.trusted_identity' "$proof")"
+            evidence_row "Wrong identity" "$(jq -r '.policy.identity_denied.code' "$proof")"
+            evidence_row "Unknown binding" "$(jq -r '.policy.binding_denied.code' "$proof")"
+            evidence_row "Operation budget" "$(jq -r '"2 allowed, third=\(.policy.quota_denied.status)"' "$proof")"
+            ;;
+        isolation)
+            evidence_row "Before timeout" "$(jq -r '"HTTP route \(.path), method \(.method)"' "$output_dir/isolation/before.json")"
+            evidence_row "Forced timeout" "HTTP 504"
+            evidence_row "Recovery VM" "$(jq -r '"HTTP route \(.path), method \(.method)"' "$output_dir/isolation/after.json")"
+            ;;
+        ingress)
+            evidence_row "Runtime" "$(jq -r '.runtime' "$proof")"
+            evidence_row "Scheduled input" "$(jq -r '"time=\(.scheduled_input.scheduled_time_unix_ms), cron=\(.scheduled_input.cron), id=\(.scheduled_input.request_id)"' "$proof")"
+            evidence_row "Scheduled output" "$(jq -r '"outcome=\(.scheduled.outcome), retry=\(.scheduled.retry), id=\(.scheduled.request_id)"' "$proof")"
+            while IFS=$'\t' read -r id attempts body_base64; do
+                evidence_row "Queue input" "$id: body=$(printf '%s' "$body_base64" | base64 -d), attempts=$attempts"
+            done < <(jq -r '.queue_input.messages[] | [.id, (.attempts|tostring), .body_base64] | @tsv' "$proof")
+            evidence_row "Queue metadata" "$(jq -r '"name=\(.queue_input.queue), backlog=\(.queue_input.metadata.backlog_count) messages / \(.queue_input.metadata.backlog_bytes) bytes"' "$proof")"
+            evidence_row "Queue output" "$(jq -r '"ack=\(.queue.explicit_acks | join(",")); retry=\(.queue.retry_messages | map(.id + " after " + (.delay_seconds|tostring) + "s") | join(","))"' "$proof")"
+            ;;
+        kv)
+            evidence_row "Runtime" "$(jq -r '.runtime' "$proof")"
+            evidence_row "Write" "$(jq -r '"status=\(.kv.put.status), code=\(.kv.put.code)"' "$proof")"
+            evidence_row "VM 1 teardown" "$(jq -r '"\(.kv.put_vm_profile.vm_teardown_ms) ms"' "$proof")"
+            evidence_row "Fresh VM read" "$(jq -r '.kv.get_after_fresh_vm.value_base64' "$proof" | base64 -d)"
+            evidence_row "VM 2 teardown" "$(jq -r '"\(.kv.get_vm_profile.vm_teardown_ms) ms"' "$proof")"
+            evidence_row "Backing file" "$(jq -r '.kv.backing_file' "$proof")"
+            evidence_row "Clear down" "tools/hyperlight-demo --clear"
+            evidence_row "Before command" "$(cat "$output_dir/kv-before-command.txt")"
+            evidence_row "Before result" "0 application tables"
+            evidence_row "Database SHA-256" "$(cut -d' ' -f1 "$output_dir/kv-cli.sha256")"
+            evidence_row "External CLI" "$(sqlite3 --version | awk '{print "sqlite3 " $1}')"
+            evidence_row "Rerun command" "$(cat "$output_dir/kv-cli-command.txt")"
+            evidence_row "CLI SQL" "SELECT key, value FROM _hluk_kv"
+            while IFS=$'\t' read -r key value; do
+                evidence_row "CLI row" "$key=$value"
+            done <"$output_dir/kv-cli.tsv"
+            ;;
+        cache)
+            evidence_row "Runtime" "$(jq -r '.runtime' "$proof")"
+            evidence_row "Populate" "$(jq -r '"status=\(.cache.put.status), code=\(.cache.put.code)"' "$proof")"
+            evidence_row "VM 1 teardown" "$(jq -r '"\(.cache.put_vm_profile.vm_teardown_ms) ms"' "$proof")"
+            evidence_row "Fresh VM match" "$(jq -r '"HTTP \(.cache.match_after_fresh_vm.cached_status)"' "$proof")"
+            evidence_row "Body" "$(jq -r '.cache.match_after_fresh_vm.body_base64' "$proof" | base64 -d)"
+            evidence_row "VM 2 teardown" "$(jq -r '"\(.cache.match_vm_profile.vm_teardown_ms) ms"' "$proof")"
+            evidence_row "Backing file" "$(jq -r '.cache.backing_file' "$proof")"
+            evidence_row "Clear down" "tools/hyperlight-demo --clear"
+            evidence_row "Before command" "$(cat "$output_dir/cache-before-command.txt")"
+            evidence_row "Before result" "0 application tables"
+            evidence_row "Database SHA-256" "$(cut -d' ' -f1 "$output_dir/cache-cli.sha256")"
+            evidence_row "External CLI" "$(sqlite3 --version | awk '{print "sqlite3 " $1}')"
+            evidence_row "Rerun command" "$(cat "$output_dir/cache-cli-command.txt")"
+            evidence_row "CLI SQL" "SELECT key, status, body FROM _hluk_cache"
+            while IFS=$'\t' read -r key status body; do
+                evidence_row "CLI row" "$key -> HTTP $status, $body"
+            done <"$output_dir/cache-cli.tsv"
+            ;;
+        d1)
+            evidence_row "Runtime" "$(jq -r '.runtime' "$proof")"
+            evidence_row "SQL 1" "$(jq -r '.d1.statements[0]' "$proof")"
+            evidence_row "SQL 2" "$(jq -r '.d1.statements[1]' "$proof")"
+            evidence_row "Transaction" "$(jq -r '"status=\(.d1.batch.status), statements=\(.d1.batch.results | length)"' "$proof")"
+            evidence_row "VM 1 teardown" "$(jq -r '"\(.d1.batch_vm_profile.vm_teardown_ms) ms"' "$proof")"
+            evidence_row "SQL 3" "$(jq -r '.d1.statements[2]' "$proof")"
+            evidence_row "VM 2 teardown" "$(jq -r '"\(.d1.query_vm_profile.vm_teardown_ms) ms"' "$proof")"
+            evidence_row "Backing file" "$(jq -r '.d1.backing_file' "$proof")"
+            evidence_row "Clear down" "tools/hyperlight-demo --clear"
+            evidence_row "Before command" "$(cat "$output_dir/d1-before-command.txt")"
+            evidence_row "Before result" "0 application tables"
+            evidence_row "Database SHA-256" "$(cut -d' ' -f1 "$output_dir/d1-cli.sha256")"
+            evidence_row "External CLI" "$(sqlite3 --version | awk '{print "sqlite3 " $1}')"
+            evidence_row "After command" "$(cat "$output_dir/d1-cli-command.txt")"
+            evidence_row "CLI SQL" "SELECT id, name FROM users ORDER BY id"
+            while IFS=$'\t' read -r id name; do
+                evidence_row "CLI row" "id=$id, name=$name"
+            done <"$output_dir/d1-cli.tsv"
+            ;;
+        durable-objects)
+            evidence_row "Runtime" "$(jq -r '.runtime' "$proof")"
+            evidence_row "Object" "rooms / room-7 / generation 1"
+            evidence_row "Write" "$(jq -r '"status=\(.durable_object.put.status), code=\(.durable_object.put.code)"' "$proof")"
+            evidence_row "VM 1 teardown" "$(jq -r '"\(.durable_object.put_vm_profile.vm_teardown_ms) ms"' "$proof")"
+            evidence_row "Fresh VM read" "$(jq -r '.durable_object.get_after_fresh_vm.value_base64' "$proof" | base64 -d)"
+            evidence_row "VM 2 teardown" "$(jq -r '"\(.durable_object.get_vm_profile.vm_teardown_ms) ms"' "$proof")"
+            evidence_row "Backing file" "$(jq -r '.durable_object.backing_file' "$proof")"
+            evidence_row "Clear down" "tools/hyperlight-demo --clear"
+            evidence_row "Before command" "$(cat "$output_dir/durable-before-command.txt")"
+            evidence_row "Before result" "0 application tables"
+            evidence_row "Database SHA-256" "$(cut -d' ' -f1 "$output_dir/durable-cli.sha256")"
+            evidence_row "External CLI" "$(sqlite3 --version | awk '{print "sqlite3 " $1}')"
+            evidence_row "Rerun command" "$(cat "$output_dir/durable-cli-command.txt")"
+            evidence_row "CLI SQL" "SELECT namespace, actor_key, key, value FROM _hluk_do_state"
+            while IFS=$'\t' read -r namespace actor key value; do
+                evidence_row "CLI row" "$namespace/$actor: $key=$value"
+            done <"$output_dir/durable-cli.tsv"
+            ;;
+        node)
+            evidence_row "Runtime" "$(jq -r '.runtime' "$proof")"
+            evidence_row "ES module" "worker.js loaded"
+            evidence_row "CommonJS" "$(jq -r '.node.commonjs' "$proof")"
+            evidence_row "node:buffer" "$(jq -r '.node.bufferHex' "$proof")"
+            evidence_row "node:fs" "$(jq -r '"readable=\(.readable), immutable=\(.immutable), entries=\(.entries | length)"' "$output_dir/node/vfs/bundle.json")"
+            ;;
+        storage)
+            evidence_row "/bundle" "$(jq -r '"readable=\(.readable), immutable=\(.immutable), entries=\(.entries | length)"' "$output_dir/storage/vfs/bundle.json")"
+            evidence_row "/tmp reset" "$(jq -r '"previousExists=\(.previousExists), body=\(.body)"' "$output_dir/storage/vfs/tmp-reset-second.json")"
+            evidence_row "Named read" "$(jq -c . "$output_dir/storage/named-storage/allowed-read.json")"
+            evidence_row "Denied probes" "read-only write, traversal, unlisted mount, quota"
+            ;;
+        core-wasm)
+            evidence_row "Runtime" "workerd-on-hyperlight"
+            evidence_row "Route" "/evidence/core-wasm"
+            evidence_row "Response" "$(jq -c . "$output_dir/core-wasm/checks/core-wasm.json")"
+            ;;
+        web-apis)
+            evidence_row "Core" "$(jq -r '.status // "pass"' "$output_dir/web-apis/checks/core.json")"
+            evidence_row "Timers" "$(jq -r '.status' "$output_dir/web-apis/checks/timers.json")"
+            evidence_row "Streams" "BYOB and byte-stream tee passed"
+            evidence_row "MessagePort" "8 lifecycle/transfer stages passed"
+            evidence_row "Fresh state" "$(jq -r '"first=\(.requestCount), previous=\(.previousStateToken)"' "$output_dir/web-apis/checks/state-second.json")"
+            ;;
+        fetch)
+            evidence_row "Allowed" "$(jq -r '"HTTP \(.status), body=\(.body | gsub("\\n$"; ""))"' "$output_dir/fetch/checks/allowed.json")"
+            evidence_row "Wrong port" "$(jq -r '.error.message // .code // .outcome' "$output_dir/fetch/checks/wrong-port-denied.json")"
+            evidence_row "Unlisted host" "$(jq -r '.error.message // .code // .outcome' "$output_dir/fetch/checks/unlisted-host-denied.json")"
+            evidence_row "Metadata/private" "denied"
+            evidence_row "Redirect" "returned without following"
+            ;;
+        benchmark-on-demand|benchmark-prewarmed)
+            local mode="${demo#benchmark-}"
+            local benchmark_dir="$output_dir/benchmark-$mode"
+            evidence_row "Requests" "320 / 320 HTTP 200"
+            evidence_row "Throughput" "$(grep -m1 'Requests/sec:' "$benchmark_dir/hey.txt" | xargs)"
+            evidence_row "Mean latency" "$(grep -m1 'Average:' "$benchmark_dir/hey.txt" | xargs)"
+            evidence_row "Restore mode" "$(jq -r '.restore_mode' "$benchmark_dir/pool-status.json")"
+            evidence_row "Final queues" "$(jq -r '"active=\(.active), queued=\(.queued), recycle=\(.recycle_queue_depth), completion=\(.completion_queue_depth)"' "$benchmark_dir/pool-status.json")"
+            if [[ "$mode" == prewarmed ]]; then
+                evidence_row "Warm inventory" "$(jq -r '"ready=\(.prewarmed_ready)/\(.prewarmed_inventory), replenishing=\(.prewarmed_replenishing)"' "$benchmark_dir/pool-status.json")"
+            fi
+            ;;
+        component)
+            local component="$output_dir/component/proof.json"
+            evidence_row "Runtime" "workerd-on-hyperlight"
+            while IFS=$'\t' read -r url status body; do
+                evidence_row "HTTP $status" "$url -> $body"
+            done < <(jq -r '.routes[] | [.url, (.status|tostring), .body] | @tsv' "$component")
+            evidence_row "Iterations" "$(jq -r '.iterations' "$component") deterministic fresh-VM requests"
+            evidence_row "Digest" "$(jq -r '.deterministic_response_sha256' "$component")"
+            ;;
+        tcp-tls)
+            local network_log="$output_dir/tcp-tls.log"
+            local tcp tls denied
+            tcp="$(grep -o 'DEMO_EVIDENCE=.*' "$network_log" | sed 's/^DEMO_EVIDENCE=//' | jq -rs 'map(select(.demo == "tcp"))[0]')"
+            tls="$(grep -o 'DEMO_EVIDENCE=.*' "$network_log" | sed 's/^DEMO_EVIDENCE=//' | jq -rs 'map(select(.demo == "tls"))[0]')"
+            denied="$(grep -o 'DEMO_EVIDENCE=.*' "$network_log" | sed 's/^DEMO_EVIDENCE=//' | jq -rs 'map(select(.demo == "tcp-denial"))[0]')"
+            evidence_row "Proof path" "real host-broker sockets"
+            evidence_row "TCP" "$(jq -r '"sent \(.sent_bytes) bytes, received \(.received), audit=\(.audit_events)"' <<<"$tcp")"
+            evidence_row "Fresh assignment" "$(jq -r '.after_reset' <<<"$tcp")"
+            evidence_row "TLS" "$(jq -r '"v\(.tls_version), roots=\(.trust_roots), received \(.received)"' <<<"$tls")"
+            evidence_row "Denied connect" "$(jq -r '"\(.code), connected=\(.connected)"' <<<"$denied")"
+            evidence_row "LIMIT" "Workerd socket channel not yet wired"
+            ;;
+        udp)
+            local udp_log="$output_dir/udp.log"
+            local udp limit
+            udp="$(grep -o 'DEMO_EVIDENCE=.*' "$udp_log" | sed 's/^DEMO_EVIDENCE=//' | jq -rs 'map(select(.demo == "udp"))[0]')"
+            limit="$(grep -o 'DEMO_EVIDENCE=.*' "$udp_log" | sed 's/^DEMO_EVIDENCE=//' | jq -rs 'map(select(.demo == "udp-limit"))[0]')"
+            evidence_row "Proof path" "real host-broker datagrams"
+            evidence_row "Datagram" "$(jq -r '"sent \(.sent_bytes) bytes, received \(.received), audit=\(.audit_events)"' <<<"$udp")"
+            evidence_row "Fresh assignment" "$(jq -r '.after_reset' <<<"$udp")"
+            evidence_row "Size limit" "$(jq -r '"\(.code), host_send=\(.host_send)"' <<<"$limit")"
+            evidence_row "LIMIT" "Workerd UDP channel not yet wired"
+            ;;
+        websocket)
+            local websocket_log="$output_dir/websocket.log"
+            local websocket ws_limit secure
+            websocket="$(grep -o 'DEMO_EVIDENCE=.*' "$websocket_log" | sed 's/^DEMO_EVIDENCE=//' | jq -rs 'map(select(.demo == "websocket"))[0]')"
+            ws_limit="$(grep -o 'DEMO_EVIDENCE=.*' "$websocket_log" | sed 's/^DEMO_EVIDENCE=//' | jq -rs 'map(select(.demo == "websocket-limit"))[0]')"
+            secure="$(grep -o 'DEMO_EVIDENCE=.*' "$websocket_log" | sed 's/^DEMO_EVIDENCE=//' | jq -rs 'map(select(.demo == "websocket-secure"))[0]')"
+            evidence_row "Proof path" "real host-broker WebSockets"
+            evidence_row "WebSocket" "$(jq -r '"sent \(.sent.type)/\(.sent.bytes)B, received \(.received.type)/\(.received.body)"' <<<"$websocket")"
+            evidence_row "Fresh assignment" "$(jq -r '.after_reset' <<<"$websocket")"
+            evidence_row "Message limit" "$(jq -r '"\(.code), host_send=\(.host_send)"' <<<"$ws_limit")"
+            evidence_row "Secure socket" "$(jq -r '"\(.tls), roots=\(.trust_roots), received \(.received)"' <<<"$secure")"
+            evidence_row "LIMIT" "Workerd WebSocket channel not yet wired"
+            ;;
+        wasi-p2)
+            local wasi_p2="$output_dir/wasi-p2-proof.json"
+            evidence_row "Proof path" "$(jq -r '.proof_path' "$wasi_p2")"
+            evidence_row "HTTP ingress" "$(jq -r '"id=\(.http.request_id), HTTP \(.http.status)"' "$wasi_p2")"
+            evidence_row "Input stream" "$(jq -r '"chunk=\(.streams.input_chunk), closed=\(.streams.closed_read)"' "$wasi_p2")"
+            evidence_row "Output stream" "$(jq -r '"wrote=\(.streams.first_write_bytes)B, limit=\(.streams.quota_write)"' "$wasi_p2")"
+            evidence_row "Clock" "$(jq -r '"wall=\(.clock.wall_ns)ns, monotonic=\(.clock.monotonic_ns), zone=\(.clock.timezone)"' "$wasi_p2")"
+            evidence_row "Random" "$(jq -r '"bytes=\(.random.secure_bytes), limit=\(.random.quota)"' "$wasi_p2")"
+            evidence_row "CLI" "$(jq -r '"env=\(.cli.environment), args=\(.cli.arguments), stdout=\(.cli.stdout_bytes)B"' "$wasi_p2")"
+            evidence_row "Denied imports" "$(jq -r '"unknown=\(.denials.unknown_import); udp=\(.denials.udp)"' "$wasi_p2")"
+            ;;
+        wasi-p3)
+            local wasi_p3="$output_dir/wasi-p3-proof.json"
+            evidence_row "Proof path" "$(jq -r '.proof_path' "$wasi_p3")"
+            evidence_row "Future pending" "$(jq -r '.future.pending_step' "$wasi_p3")"
+            evidence_row "Future completed" "$(jq -r '"\(.future.completed_step), value=\(.future.value)"' "$wasi_p3")"
+            evidence_row "Cancellation" "$(jq -r '"producer_cancelled=\(.future.producer_cancelled)"' "$wasi_p3")"
+            evidence_row "Stream order" "$(jq -r '"received=\(.stream.received), steps=\(.stream.steps)"' "$wasi_p3")"
+            evidence_row "Stream tasks" "$(jq -r '"producer=\(.stream.producer_state), consumer=\(.stream.consumer_state)"' "$wasi_p3")"
+            evidence_row "Terminal import" "$(jq -r '.imports.terminal' "$wasi_p3")"
+            evidence_row "Unknown version" "$(jq -r '"\(.imports.unsupported.category): \(.imports.unsupported.interface)"' "$wasi_p3")"
+            evidence_row "Process spawn" "$(jq -r '"\(.imports.capability_denied.category): \(.imports.capability_denied.interface)"' "$wasi_p3")"
+            ;;
+        *)
+            print_result_lines "$demo"
+            ;;
+    esac
 }
 
 render_preview() {
@@ -310,7 +582,9 @@ print_scope_context() {
 Scope: this is a guided view of tested Workerd-on-Hyperlight features, not a
 claim of complete WinterTC, Web Platform, or Node.js compatibility. The Web
 APIs listed as working run directly. Features that need files, saved data, or
-networking go through host checks. The Worker cannot open anything else.
+networking go through host checks. TCP/TLS, UDP, and WebSocket demonstrate the
+real host broker; wiring Workerd's socket channels to that broker is still
+outstanding. The Worker cannot open anything else.
 Prior selected Node compatibility runs passed 409/409 and 518/518 cases.
 EOF
 }
@@ -361,7 +635,7 @@ require_runtime() {
             exit 2
         }
     done
-    for required in cargo curl docker hey jq python3; do
+    for required in cargo curl docker hey jq python3 sha256sum sqlite3; do
         command -v "$required" >/dev/null || {
             echo "missing required command: $required" >&2
             exit 2
@@ -416,6 +690,7 @@ run_isolation() {
         --queue-capacity 1
     curl --fail-with-body --silent --show-error \
         http://127.0.0.1:8787/before |
+        tee "$dir/before.json" |
         jq -e '.path == "/before" and .method == "GET"' >/dev/null
     local status
     status="$(curl --silent --show-error --output "$dir/timeout.json" \
@@ -423,38 +698,132 @@ run_isolation() {
     [[ "$status" == 504 ]]
     curl --fail-with-body --silent --show-error \
         http://127.0.0.1:8787/after |
+        tee "$dir/after.json" |
         jq -e '.path == "/after" and .method == "GET"' >/dev/null
     stop_processes
     echo "HTTP 504 was isolated; the following fresh-VM request succeeded."
 }
 
 run_policy() {
-    run_exact_test data::kv::tests::runtime_identity_and_binding_checks_precede_dispatch
-    run_exact_test data::kv::tests::operation_and_storage_quotas_fail_closed
-    run_exact_test data::kv::tests::fresh_vm_reset_clears_request_budget_and_audit_buffer_only
+    ensure_capability_proof
+}
+
+ensure_capability_proof() {
+    local proof="$output_dir/capability-proof.json"
+    local state_dir="$output_dir/capability-state"
+    if "$capability_proof_ran"; then
+        return
+    fi
+    mkdir -p "$output_dir" "$state_dir"
+    local database
+    for database in kv cache d1 durable; do
+        rm -f -- \
+            "$state_dir/$database.sqlite" \
+            "$state_dir/$database.sqlite-shm" \
+            "$state_dir/$database.sqlite-wal"
+        sqlite3 "$state_dir/$database.sqlite" "VACUUM;"
+        readonly_sqlite_query \
+            "$state_dir/$database.sqlite" \
+            "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name" \
+            "$output_dir/$database-before.tsv"
+        [[ ! -s "$output_dir/$database-before.tsv" ]]
+    done
+    local temporary="$proof.tmp"
+    cargo +1.98.0 run --release --locked --example workerd-capability-proof -- \
+        "$root/build-elfloader/workerd-executor/rootfs.img" \
+        "$root/build-elfloader/workerd-executor/executor" \
+        344 \
+        "$state_dir" \
+        >"$temporary"
+    jq -e '
+        .runtime == "workerd-on-hyperlight" and
+        .scheduled.outcome == "ok" and
+        .queue.explicit_acks == ["message-1"] and
+        .queue.retry_messages == [{"id":"message-2","delay_seconds":7}] and
+        .node.commonjs == 42 and
+        .node.bufferHex == "68797065726c69676874" and
+        .policy.identity_denied.code == "identity_mismatch" and
+        .policy.binding_denied.code == "binding_denied" and
+        .policy.quota_denied.status == "quota_exceeded" and
+        .kv.get_after_fresh_vm.value_base64 == "ZGFyaw==" and
+        .cache.match_after_fresh_vm.cached_status == 200 and
+        .d1.query_after_fresh_vm.results[0].rows == [[{"type":"integer","value":1},{"type":"text","value":"Ada"}]] and
+        .durable_object.get_after_fresh_vm.value_base64 == "aHlwZXJsaWdodA=="
+    ' "$temporary" >/dev/null
+    mv "$temporary" "$proof"
+    capability_proof_ran=true
 }
 
 run_ingress() {
-    "$root/build-elfloader/workerd-executor/executor" --self-test
+    ensure_capability_proof
+}
+
+readonly_sqlite_query() {
+    local database="$1"
+    local sql="$2"
+    local output="$3"
+    local prefix="${output%.tsv}"
+    printf "sqlite3 -readonly -batch -noheader -separator \$'\\t' %q %q\n" \
+        "$database" "$sql" >"$prefix-command.txt"
+    sha256sum "$database" >"$prefix.sha256"
+    sqlite3 -readonly -batch -noheader -separator $'\t' \
+        "$database" "$sql" >"$output"
+}
+
+clear_output() {
+    local resolved
+    resolved="$(normalize_path "$output_dir")"
+    case "$resolved" in
+        "$root"/*) ;;
+        *)
+            printf 'refusing to clear output outside this checkout: output=%s root=%s\n' \
+                "$resolved" "$root" >&2
+            return 2
+            ;;
+    esac
+    [[ "$resolved" != "$root" ]] || {
+        echo "refusing to clear the repository root" >&2
+        return 2
+    }
+    rm -rf -- "$resolved"
+    mkdir -p "$resolved"
+    printf 'Cleared generated demo output: %s\n' "$resolved"
 }
 
 run_kv() {
-    run_exact_test \
-        data::kv::tests::deterministic_fixture_put_round_trips_and_persists_across_vm_reset
+    ensure_capability_proof
+    readonly_sqlite_query \
+        "$(jq -r '.kv.backing_file' "$output_dir/capability-proof.json")" \
+        "SELECT key, CAST(value AS TEXT) FROM _hluk_kv ORDER BY key" \
+        "$output_dir/kv-cli.tsv"
+    [[ "$(cat "$output_dir/kv-cli.tsv")" == $'theme\tdark' ]]
 }
 
 run_cache() {
-    run_exact_test data::cache::tests::deterministic_fixture_survives_fresh_vm_reset
+    ensure_capability_proof
+    readonly_sqlite_query \
+        "$(jq -r '.cache.backing_file' "$output_dir/capability-proof.json")" \
+        "SELECT key, status, CAST(body AS TEXT) FROM _hluk_cache ORDER BY key" \
+        "$output_dir/cache-cli.tsv"
+    [[ "$(cat "$output_dir/cache-cli.tsv")" == $'https://example.test/app.js\t200\tconsole.log(1)' ]]
 }
 
 run_d1() {
-    run_exact_test \
-        data::d1::tests::deterministic_batch_is_transactional_and_persists_across_reset
+    ensure_capability_proof
+    readonly_sqlite_query \
+        "$(jq -r '.d1.backing_file' "$output_dir/capability-proof.json")" \
+        "SELECT id, name FROM users ORDER BY id" \
+        "$output_dir/d1-cli.tsv"
+    [[ "$(cat "$output_dir/d1-cli.tsv")" == $'1\tAda' ]]
 }
 
 run_durable_objects() {
-    run_exact_test \
-        data::durable::tests::trusted_context_partitions_persistent_state_across_fresh_vm_reset
+    ensure_capability_proof
+    readonly_sqlite_query \
+        "$(jq -r '.durable_object.backing_file' "$output_dir/capability-proof.json")" \
+        "SELECT namespace, actor_key, key, CAST(value AS TEXT) FROM _hluk_do_state ORDER BY namespace, actor_key, key" \
+        "$output_dir/durable-cli.tsv"
+    [[ "$(cat "$output_dir/durable-cli.tsv")" == $'rooms\troom-7\ttopic\thyperlight' ]]
 }
 
 run_storage() {
@@ -480,7 +849,18 @@ run_storage() {
 }
 
 run_node() {
-    "$root/build-elfloader/workerd-executor/executor" --self-test
+    ensure_capability_proof
+    local dir="$output_dir/node"
+    mkdir -p "$dir/readonly" "$dir/scratch"
+    printf 'fixture-read-ok\n' >"$dir/readonly/message.txt"
+    start_server "$dir/server.log" \
+        --bundle "$root/examples/workerd-bundles/workerd-vfs-evidence.json" \
+        --scratch-mb 384 \
+        --restore-mode on-demand \
+        --storage-ro readonly="$dir/readonly" \
+        --storage-rw scratch="$dir/scratch"
+    "$root/tools/run-workerd-vfs-demo.sh" --output-dir "$dir/vfs" bundle
+    stop_processes
 }
 
 run_wintertc() {
@@ -505,6 +885,8 @@ run_core_wasm() {
 }
 
 run_component() {
+    local dir="$output_dir/component"
+    mkdir -p "$dir"
     docker run --rm \
         --user "$(id -u):$(id -g)" \
         --mount "type=bind,src=$root,dst=/repo" \
@@ -522,15 +904,39 @@ run_component() {
     aggregate_bytes=$((generated_bytes + worker_bytes + wasm_bytes))
     ((generated_bytes <= 48 * 1024))
     ((aggregate_bytes <= 48 * 1024))
-    cargo +1.98.0 run --release --locked --example workerd-component-proof
+    cargo +1.98.0 run --release --locked --example workerd-component-proof \
+        >"$dir/proof.json"
+    jq -e '
+        .iterations == 100 and
+        (.routes | map(.status) == [200, 200, 400, 200, 413])
+    ' "$dir/proof.json" >/dev/null
 }
 
 run_wasi_p2() {
-    cargo +1.98.0 test --locked --lib wasi_preview2::proof::tests -- --nocapture
+    cargo +1.98.0 run --release --locked --example wasi-p2-proof \
+        >"$output_dir/wasi-p2-proof.json"
+    jq -e '
+        .http.status == 204 and
+        .streams.input_chunk == [1, 2] and
+        .streams.first_write_bytes == 2 and
+        .clock.monotonic_ns == [0, 5] and
+        .random.secure_bytes == [165, 165, 165, 165] and
+        (.denials.unknown_import | contains("UnsupportedImport")) and
+        (.denials.udp | contains("NotSupported"))
+    ' "$output_dir/wasi-p2-proof.json" >/dev/null
 }
 
 run_wasi_p3() {
-    cargo +1.98.0 test --locked --test wasi_p3 -- --nocapture
+    cargo +1.98.0 run --release --locked --example wasi-p3-proof \
+        >"$output_dir/wasi-p3-proof.json"
+    jq -e '
+        .future.producer_cancelled == true and
+        .stream.received == [1, 2] and
+        .imports.terminal == "denied" and
+        .imports.http_handler == "deferred" and
+        .imports.unsupported.category == "UnsupportedImport" and
+        .imports.capability_denied.category == "CapabilityDenied"
+    ' "$output_dir/wasi-p3-proof.json" >/dev/null
 }
 
 run_tcp_tls() {
@@ -728,8 +1134,8 @@ run_one() {
         ) >"$log" 2>&1 || status=$?
     fi
     if ((status == 0)); then
-        printf '\nPASS: %s\n' "$(title "$demo")"
-        print_result_lines "$demo"
+        printf '\n%bPASS%b %s\n' "$c_green" "$c_reset" "$(title "$demo")"
+        print_demo_evidence "$demo"
         print_wrapped "TAKEAWAY: " "$(takeaway "$demo")"
         printf 'LOG: %s\n' "$log"
         return 0
@@ -737,8 +1143,8 @@ run_one() {
     stop_processes
     printf '\nFAIL: %s\n' "$(title "$demo")" >&2
     printf 'LOG: %s\n' "$log" >&2
-    printf 'LAST OUTPUT:\n' >&2
-    tail -n 8 "$log" | sed 's/^/  /' >&2
+    printf '%bLAST 30 LOG LINES%b\n' "$c_yellow" "$c_reset" >&2
+    tail -n 30 "$log" | sed 's/^/  /' >&2
     return 1
 }
 
@@ -778,6 +1184,10 @@ while (($#)); do
             selected="$2"
             shift 2
             ;;
+        --clear)
+            mode=clear
+            shift
+            ;;
         --output-dir)
             (($# >= 2)) || {
                 echo "--output-dir requires a value" >&2
@@ -815,6 +1225,10 @@ if [[ "$mode" == preview ]]; then
         render_preview "$demo"
     done
     printf '\nPreview complete. The runbook contains the detailed compatibility boundaries.\n'
+    exit 0
+fi
+if [[ "$mode" == clear ]]; then
+    clear_output
     exit 0
 fi
 if [[ "$mode" == describe ]]; then

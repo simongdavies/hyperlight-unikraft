@@ -160,6 +160,9 @@ fn connected_udp_is_policy_bound_bounded_audited_and_reset() {
         (rejected.status(), rejected.code()),
         (BrokerWireStatus::InvalidRequest, Some("invalid_udp_handle"))
     );
+    println!(
+        r#"DEMO_EVIDENCE={{"demo":"udp","opened":true,"sent_bytes":4,"received":"pong","audit_events":3,"after_reset":"invalid_udp_handle"}}"#
+    );
     server_thread.join().unwrap();
 }
 
@@ -182,5 +185,8 @@ fn udp_datagram_limit_rejects_before_host_send() {
     assert_eq!(
         (response.status(), response.code()),
         (BrokerWireStatus::QuotaExceeded, Some("datagram_size_quota"))
+    );
+    println!(
+        r#"DEMO_EVIDENCE={{"demo":"udp-limit","status":"quota_exceeded","code":"datagram_size_quota","host_send":false}}"#
     );
 }
