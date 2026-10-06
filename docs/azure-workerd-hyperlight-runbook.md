@@ -275,12 +275,17 @@ Both demos derive their defaults from:
 LC_ALL=C lscpu | grep -E '^(CPU\(s\)|Socket|Core|Thread)'
 ```
 
-Total requests default to 100 times `CPU(s)`. Concurrent requests and
-concurrent request VMs both default to `CPU(s)`. The prewarmed inventory
-defaults to `CPU(s)` plus the physical core count (`Socket(s)` multiplied by
-`Core(s) per socket`). A machine with 32 logical CPUs, one socket, 16 cores,
-and two threads per core therefore defaults to 3200 total requests, 32
-concurrent requests, 32 concurrent request VMs, and 48 prewarmed VMs.
+The presenter calculates real cores as `Socket(s) × Core(s) per socket`. If
+those fields are unavailable, it falls back to
+`CPU(s) ÷ Thread(s) per core`. Total requests default to 100 times that
+real-core count. Concurrent requests and concurrent request VMs both default
+to the real-core count rather than the hyper-thread/vCPU count. The prewarmed
+inventory defaults to real cores plus one VM because the pool reserves one
+warm VM while allowing one active request VM per real core.
+
+A machine with 32 vCPUs, one socket, 16 cores, and two threads per core
+therefore defaults to 1600 total requests, 16 concurrent requests, 16
+concurrent request VMs, and 17 prewarmed VMs.
 `benchmark-on-demand` creates or restores VMs as requests arrive.
 `benchmark-prewarmed` begins with the derived ready inventory and prepares
 replacements as VMs are used.

@@ -51,12 +51,16 @@ if [[ ! "$logical_cpus" =~ ^[1-9][0-9]*$ ]]; then
     logical_cpus="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
 fi
 cpu_sockets="$(lscpu_value "Socket(s)")"
-[[ "$cpu_sockets" =~ ^[1-9][0-9]*$ ]] || cpu_sockets=1
 cores_per_socket="$(lscpu_value "Core(s) per socket")"
-[[ "$cores_per_socket" =~ ^[1-9][0-9]*$ ]] || cores_per_socket="$logical_cpus"
 threads_per_core="$(lscpu_value "Thread(s) per core")"
 [[ "$threads_per_core" =~ ^[1-9][0-9]*$ ]] || threads_per_core=1
-physical_cores=$((cpu_sockets * cores_per_socket))
+if [[ "$cpu_sockets" =~ ^[1-9][0-9]*$ ]] &&
+    [[ "$cores_per_socket" =~ ^[1-9][0-9]*$ ]]; then
+    physical_cores=$((cpu_sockets * cores_per_socket))
+else
+    physical_cores=$((logical_cpus / threads_per_core))
+    ((physical_cores > 0)) || physical_cores=1
+fi
 
 root="$(normalize_path "$(cd "$(dirname "$0")/.." && pwd)")"
 output_dir="${HYPERLIGHT_DEMO_OUTPUT:-$root/demo-output}"
@@ -64,10 +68,10 @@ demo_pid=""
 upstream_pid=""
 verbose=false
 capability_proof_ran=false
-benchmark_requests="${HYPERLIGHT_BENCHMARK_REQUESTS:-$((logical_cpus * 100))}"
-benchmark_concurrency="${HYPERLIGHT_BENCHMARK_CONCURRENCY:-$logical_cpus}"
-benchmark_vms="${HYPERLIGHT_BENCHMARK_VMS:-$logical_cpus}"
-benchmark_pool_vms="${HYPERLIGHT_BENCHMARK_POOL_VMS:-$((logical_cpus + physical_cores))}"
+benchmark_requests="${HYPERLIGHT_BENCHMARK_REQUESTS:-$((physical_cores * 100))}"
+benchmark_concurrency="${HYPERLIGHT_BENCHMARK_CONCURRENCY:-$physical_cores}"
+benchmark_vms="${HYPERLIGHT_BENCHMARK_VMS:-$physical_cores}"
+benchmark_pool_vms="${HYPERLIGHT_BENCHMARK_POOL_VMS:-$((physical_cores + 1))}"
 go_bin="${GOBIN:-}"
 if [[ -z "$go_bin" ]] && command -v go >/dev/null; then
     go_bin="$(go env GOBIN 2>/dev/null || true)"
@@ -127,12 +131,12 @@ Options:
   --clear           Remove this checkout's generated demo output and exit
   --output-dir DIR  Override the output directory
   --benchmark-requests N
-                    Total requests (default: 100 x detected CPU(s))
+                    Total requests (default: 100 x physical cores)
   --benchmark-concurrency N
-                    Concurrent hey requests (default: detected CPU(s))
-  --benchmark-vms N Concurrent request VMs (default: detected CPU(s))
+                    Concurrent hey requests (default: physical cores)
+  --benchmark-vms N Concurrent request VMs (default: physical cores)
   --benchmark-pool-vms N
-                    Prewarmed inventory (default: CPU(s) + physical cores)
+                    Prewarmed inventory (default: physical cores + 1)
   --verbose         Stream raw command output as well as saving it
   -h, --help        Show this help
 EOF
@@ -667,7 +671,7 @@ print_demo_evidence() {
             local benchmark_dir="$output_dir/benchmark-$mode"
             evidence_row "Requests" "$benchmark_requests / $benchmark_requests HTTP 200"
             evidence_row "Concurrency" "$benchmark_concurrency requests / $benchmark_vms VMs"
-            evidence_row "CPU topology" "$logical_cpus logical / $physical_cores physical / $threads_per_core threads per core"
+            evidence_row "CPU topology" "$logical_cpus vCPUs / $physical_cores real cores / $threads_per_core threads per core"
             if [[ "$mode" == prewarmed ]]; then
                 evidence_row "Configured pool" "$benchmark_pool_vms ready VMs"
             fi
