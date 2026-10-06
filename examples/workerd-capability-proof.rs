@@ -187,6 +187,25 @@ fn operation_value(operation: impl Serialize) -> Result<Value, serde_json::Error
     serde_json::to_value(operation)
 }
 
+#[derive(Serialize)]
+struct CanonicalLogicalRequest<'a> {
+    version: u16,
+    request_id: &'a str,
+    binding: &'a str,
+    operation: KvOperation,
+}
+
+fn logical_kv_get_request(id: &str, binding: &str) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec(&CanonicalLogicalRequest {
+        version: 2,
+        request_id: id,
+        binding,
+        operation: KvOperation::Get {
+            key: "theme".into(),
+        },
+    })
+}
+
 fn sql_batch_operation(statements: Vec<SqlStatement>) -> Result<Value, serde_json::Error> {
     operation_value(SqlOperation::Batch { statements })
 }
@@ -587,28 +606,19 @@ export default {
             key: "topic".into(),
         })?,
     )?;
-    let logical_request = |id: &str, binding: &str| {
-        serde_json::to_vec(&json!({
-            "version":2,
-            "request_id":id,
-            "binding":binding,
-            "operation":{"kind":"kv_get","key":"theme"}
-        }))
-        .unwrap()
-    };
     let wrong_identity = RequestIdentity::new("other-worker", "snapshot-1", 0)?;
     let identity_denied: Value = serde_json::from_slice(&policy_runtime.dispatch_logical_as(
         &wrong_identity,
-        &logical_request("identity-denied", "settings"),
+        &logical_kv_get_request("identity-denied", "settings")?,
     ))?;
     let binding_denied: Value = serde_json::from_slice(
-        &policy_runtime.dispatch_logical(&logical_request("binding-denied", "unknown")),
+        &policy_runtime.dispatch_logical(&logical_kv_get_request("binding-denied", "unknown")?),
     )?;
     policy_runtime.reset_for_fresh_vm()?;
-    let first = policy_runtime.dispatch_logical(&logical_request("quota-1", "settings"));
-    let second = policy_runtime.dispatch_logical(&logical_request("quota-2", "settings"));
+    let first = policy_runtime.dispatch_logical(&logical_kv_get_request("quota-1", "settings")?);
+    let second = policy_runtime.dispatch_logical(&logical_kv_get_request("quota-2", "settings")?);
     let quota_denied: Value = serde_json::from_slice(
-        &policy_runtime.dispatch_logical(&logical_request("quota-3", "settings")),
+        &policy_runtime.dispatch_logical(&logical_kv_get_request("quota-3", "settings")?),
     )?;
 
     let evidence = ProofEvidence {
@@ -666,4 +676,17 @@ export default {
     };
     println!("{}", serde_json::to_string_pretty(&evidence)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::logical_kv_get_request;
+
+    #[test]
+    fn policy_probe_uses_canonical_logical_wire_order() {
+        assert_eq!(
+            logical_kv_get_request("policy-1", "settings").unwrap(),
+            br#"{"version":2,"request_id":"policy-1","binding":"settings","operation":{"kind":"kv_get","key":"theme"}}"#
+        );
+    }
 }
