@@ -666,21 +666,49 @@ fn cmd_workerd_host(args: WorkerdHostArgs) -> CliResult<()> {
     const CONNECTION_IO_TIMEOUT: Duration = Duration::from_secs(5);
     const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+    /// Keeps a connection's `in_flight` accounting raised for the full
+    /// request lifecycle — pool execution *and* writing the response back
+    /// to the client — by decrementing on `Drop` instead of right after
+    /// `execute_request` returns. Bracketing only the pool-execution call
+    /// (the prior behavior) let the drain loop observe `in_flight == 0`
+    /// and exit the process while connection threads were still blocked
+    /// writing already-computed responses: under a burst of simultaneously
+    /// admitted requests, every pool completion (and thus every
+    /// `fetch_sub`) could land within the same `POLL_INTERVAL` tick, so
+    /// `drop(state)` ran — tearing down the listener and every in-process
+    /// resource — before those threads finished `stream.write_all`,
+    /// producing a client-visible `EOF` instead of the `200` the request
+    /// had already legitimately earned. Holding the counter up until the
+    /// write completes (success or failure) closes that race.
+    struct InFlightGuard<'a>(&'a Arc<AtomicUsize>);
+
+    impl<'a> InFlightGuard<'a> {
+        fn new(in_flight: &'a Arc<AtomicUsize>) -> Self {
+            in_flight.fetch_add(1, Ordering::AcqRel);
+            Self(in_flight)
+        }
+    }
+
+    impl Drop for InFlightGuard<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
     /// Runs one request against `handle`'s pool and blocks until the result
-    /// is known, bracketing `in_flight` the same way the (now removed)
-    /// per-request completion closure used to. When `reserved` holds a
-    /// connection-affine [`ResidentHandle`] (boundary 5 sticky affinity)
-    /// the request bypasses the shared pool entirely and runs on that
-    /// handle's dedicated resident VM instead.
+    /// is known. When `reserved` holds a connection-affine
+    /// [`ResidentHandle`] (boundary 5 sticky affinity) the request bypasses
+    /// the shared pool entirely and runs on that handle's dedicated
+    /// resident VM instead. Callers are responsible for keeping `in_flight`
+    /// raised (via [`InFlightGuard`]) for as long as the eventual response
+    /// write takes too — this function itself no longer touches it.
     fn execute_request(
         handle: &AppHandle,
         reserved: Option<&ResidentHandle>,
         envelope: hyperlight_unikraft::workerd::RequestEnvelope,
         timeout: Duration,
-        in_flight: &Arc<AtomicUsize>,
     ) -> RequestExecution {
-        in_flight.fetch_add(1, Ordering::AcqRel);
-        let execution = if let Some(resident) = reserved {
+        if let Some(resident) = reserved {
             resident.execute(envelope, timeout)
         } else {
             let request_id = envelope.request_id.clone();
@@ -700,9 +728,7 @@ fn cmd_workerd_host(args: WorkerdHostArgs) -> CliResult<()> {
                 profile: Default::default(),
                 submit_error: Some(hyperlight_unikraft::workerd::PoolSubmitError::ShuttingDown),
             })
-        };
-        in_flight.fetch_sub(1, Ordering::AcqRel);
-        execution
+        }
     }
 
     /// Writes `execution`'s outcome as an HTTP response with `connection`'s
@@ -915,12 +941,17 @@ fn cmd_workerd_host(args: WorkerdHostArgs) -> CliResult<()> {
                     reserved = Some((handle.app_id().to_string(), resident));
                 }
             }
+            // Raised before `execute_request` runs and held until this
+            // iteration's scope ends (after the response write below,
+            // including on early `return`/`continue` paths) — see
+            // `InFlightGuard`'s doc comment for why this must cover the
+            // write too, not just pool execution.
+            let _in_flight_guard = InFlightGuard::new(in_flight);
             let execution = execute_request(
                 handle,
                 reserved.as_ref().map(|(_, resident)| resident),
                 parsed.envelope,
                 DEFAULT_REQUEST_TIMEOUT,
-                in_flight,
             );
             drop(guard);
             if let Err(error) = write_execution_response(&mut stream, execution, connection_mode) {

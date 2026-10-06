@@ -379,64 +379,106 @@ impl AppRegistry {
     /// ambiguous overlaps), then load and initialize every app's bundle and
     /// pool. No process/pool is started for *any* app if validation or any
     /// single app's load/init fails: a bad config fails closed as a whole.
+    ///
+    /// Every app's bundle load + worker init + pool init is independent (no
+    /// shared mutable state between apps), and Hyperlight sandbox creation
+    /// can take low-single-digit seconds per app under nested
+    /// virtualization. Initializing apps one at a time made startup time
+    /// scale linearly with app count -- confirmed in practice: 32+ apps
+    /// routinely exceeded `workerd-host`'s external 60s readiness wait and
+    /// got killed before ever becoming ready. Apps are therefore
+    /// initialized concurrently, one OS thread per app via
+    /// `std::thread::scope` (no extra thread-pool dependency), so total
+    /// init time tracks the slowest single app rather than the sum of all
+    /// of them. Host configs are operator-authored, not attacker/request
+    /// controlled, so no additional concurrency cap is applied here beyond
+    /// `config.apps.len()`.
     pub fn from_host_config(config: HostConfig) -> std::result::Result<Self, AppRegistryError> {
         Self::validate(&config)?;
 
-        let mut entries = Vec::with_capacity(config.apps.len());
-        for app in config.apps {
-            let app_id = app.route.app_id.clone();
-            let bundle = WorkerBundle::from_path(&app.bundle_path).map_err(|source| {
-                AppRegistryError::BundleLoad {
-                    app_id: app_id.clone(),
-                    source,
-                }
-            })?;
-            let policy = app.capability_policy.build();
-            let worker = WorkerVersionSandbox::initialize_with_policy(
-                bundle,
-                &config.rootfs_path,
-                &config.executor_path,
-                app.scratch_memory_mb,
-                Duration::from_secs(app.execute_timeout_secs),
-                policy,
-            )
-            .map_err(|source| AppRegistryError::WorkerInit {
-                app_id: app_id.clone(),
-                source,
-            })?;
-            let handle = match app.pool {
-                AppPoolConfig::Disposable(pool_config) => {
-                    let pool = WorkerRequestPool::with_restore_mode(
-                        worker,
-                        pool_config.max_concurrent_sandboxes,
-                        pool_config.queue_capacity,
-                        WorkerPoolRestoreMode::OnDemand,
-                    )
-                    .map_err(|source| AppRegistryError::PoolInit {
-                        app_id: app_id.clone(),
-                        source,
-                    })?;
-                    AppHandle::Disposable { app_id, pool }
-                }
-                AppPoolConfig::Resident(pool_config) => {
-                    let pool =
-                        ResidentWorkerPool::new(worker, pool_config.into()).map_err(|source| {
-                            AppRegistryError::PoolInit {
-                                app_id: app_id.clone(),
-                                source,
-                            }
-                        })?;
-                    AppHandle::Resident {
-                        app_id,
-                        pool,
-                        affinity: app.connection_affinity,
-                    }
-                }
-            };
-            entries.push(RouteEntry {
-                route: app.route,
-                handle,
+        let rootfs_path = &config.rootfs_path;
+        let executor_path = &config.executor_path;
+
+        let results: Vec<std::result::Result<RouteEntry, AppRegistryError>> =
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = config
+                    .apps
+                    .into_iter()
+                    .map(|app| {
+                        scope.spawn(move || {
+                            let app_id = app.route.app_id.clone();
+                            let bundle =
+                                WorkerBundle::from_path(&app.bundle_path).map_err(|source| {
+                                    AppRegistryError::BundleLoad {
+                                        app_id: app_id.clone(),
+                                        source,
+                                    }
+                                })?;
+                            let policy = app.capability_policy.build();
+                            let worker = WorkerVersionSandbox::initialize_with_policy(
+                                bundle,
+                                rootfs_path,
+                                executor_path,
+                                app.scratch_memory_mb,
+                                Duration::from_secs(app.execute_timeout_secs),
+                                policy,
+                            )
+                            .map_err(|source| {
+                                AppRegistryError::WorkerInit {
+                                    app_id: app_id.clone(),
+                                    source,
+                                }
+                            })?;
+                            let handle = match app.pool {
+                                AppPoolConfig::Disposable(pool_config) => {
+                                    let pool = WorkerRequestPool::with_restore_mode(
+                                        worker,
+                                        pool_config.max_concurrent_sandboxes,
+                                        pool_config.queue_capacity,
+                                        WorkerPoolRestoreMode::OnDemand,
+                                    )
+                                    .map_err(|source| AppRegistryError::PoolInit {
+                                        app_id: app_id.clone(),
+                                        source,
+                                    })?;
+                                    AppHandle::Disposable { app_id, pool }
+                                }
+                                AppPoolConfig::Resident(pool_config) => {
+                                    let pool = ResidentWorkerPool::new(worker, pool_config.into())
+                                        .map_err(|source| AppRegistryError::PoolInit {
+                                            app_id: app_id.clone(),
+                                            source,
+                                        })?;
+                                    AppHandle::Resident {
+                                        app_id,
+                                        pool,
+                                        affinity: app.connection_affinity,
+                                    }
+                                }
+                            };
+                            Ok(RouteEntry {
+                                route: app.route,
+                                handle,
+                            })
+                        })
+                    })
+                    .collect();
+                // Join in the same order apps were declared so `entries`
+                // (and therefore route-matching precedence) stays
+                // deterministic regardless of which thread finished first.
+                handles
+                    .into_iter()
+                    .map(|handle| {
+                        handle
+                            .join()
+                            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                    })
+                    .collect()
             });
+
+        let mut entries = Vec::with_capacity(results.len());
+        for result in results {
+            entries.push(result?);
         }
         Ok(Self { entries })
     }

@@ -91,7 +91,54 @@ benchmark_load_requests_explicit=false
 # launch_hey_jobs's previous hardcoded local) so benchmark-resident and
 # benchmark-multi-app can report it alongside their timing/throughput
 # numbers (see write_benchmark_summary) instead of leaving it undocumented.
-hey_max_parallel_jobs=16
+#
+# Left unset here (HYPERLIGHT_BENCHMARK_HEY_PARALLEL/--benchmark-hey-parallel
+# not given): once --benchmark-apps finishes parsing, this defaults to
+# --benchmark-apps itself -- i.e. every app's hey process is launched in a
+# *single* synchronized wave, not split into sequential wave_1-completes-
+# then-wave_2-starts batches of 16. Sequential wave-splitting was the
+# original (now removed) default: it under-counted "concurrent" load at
+# high --benchmark-apps (later waves only started once every job in the
+# previous wave had *finished*, serializing what should be one benchmark
+# run into several back-to-back ones) and is why the single-wave default
+# is paired with a nonzero hey_ramp_ms below, to avoid every process
+# hitting the CPU in the same instant instead. Still override with
+# --benchmark-hey-parallel/HYPERLIGHT_BENCHMARK_HEY_PARALLEL to cap it
+# below --benchmark-apps and restore (bounded) wave-splitting.
+hey_max_parallel_jobs="${HYPERLIGHT_BENCHMARK_HEY_PARALLEL:-}"
+hey_max_parallel_jobs_explicit=false
+[[ -n "$hey_max_parallel_jobs" ]] && hey_max_parallel_jobs_explicit=true
+# Per-job release stagger (milliseconds), applied within launch_hey_jobs's
+# pre-spawn-paused/release-together wave model: every hey job in a wave is
+# forked first (paused behind a gate, not yet sending requests), then
+# released as a batch; with hey_ramp_ms > 0 each job's release is
+# additionally delayed by its position in the batch times this value, so
+# a large wave does not have every hey process start sending requests in
+# the same instant (a CPU "blast" at wave release).
+#
+# Left unset here (HYPERLIGHT_BENCHMARK_HEY_RAMP_MS/--benchmark-hey-ramp-ms
+# not given): defaults to 10ms per job once parsing finishes -- paired
+# with the hey_max_parallel_jobs change above, this is what turns "launch
+# every app's hey process in one wave" from a simultaneous CPU spike into
+# a deliberate ramp-up: requests start arriving within milliseconds of
+# each other in app order rather than all at the exact same instant, while
+# the whole benchmark is still one synchronized run rather than several
+# sequential waves. Set to 0 (via either override) to release every job
+# in a wave at the same moment with no deliberate delay, matching the
+# original behavior.
+hey_ramp_ms="${HYPERLIGHT_BENCHMARK_HEY_RAMP_MS:-}"
+hey_ramp_ms_explicit=false
+[[ -n "$hey_ramp_ms" ]] && hey_ramp_ms_explicit=true
+# Above this many apps, the benchmark-resident/benchmark-multi-app presenter
+# switches its inline "RAW HEY OUTPUT" section from dumping every app's full
+# raw hey report (histogram, details, status code distribution -- ~30-40
+# lines each) to a condensed per-app block (Summary/Requests-per-sec/Latency
+# distribution/Status code distribution only, no histogram/details), since
+# at high app counts (e.g. 128) the full dump is thousands of lines and
+# unreadable. The full, uncondensed per-app raw hey output is always still
+# written to disk (dir/hey.txt and each app's own hey.txt file) regardless
+# of this threshold -- only the terminal/log presentation is condensed.
+raw_hey_inline_threshold="${HYPERLIGHT_BENCHMARK_RAW_HEY_INLINE_THRESHOLD:-16}"
 go_bin="${GOBIN:-}"
 if [[ -z "$go_bin" ]] && command -v go >/dev/null; then
     go_bin="$(go env GOBIN 2>/dev/null || true)"
@@ -181,6 +228,26 @@ Options:
                     Aggregate requests for those same three benchmarks,
                     distributed evenly across --benchmark-apps apps
                     (default: --benchmark-apps x 1000)
+  --benchmark-hey-parallel N
+                    Max concurrent hey client processes for benchmark-resident/
+                    benchmark-multi-app/benchmark-orchestrator-contract
+                    (default: --benchmark-apps -- every app's hey process
+                    launches in a single synchronized wave, not split into
+                    sequential wave_1-finishes-then-wave_2-starts batches).
+                    Lower it to cap concurrent OS processes competing for
+                    CPU/loopback sockets and restore (bounded) wave-splitting
+  --benchmark-hey-ramp-ms N
+                    Every hey process is forked paused and released together
+                    as a batch; this adds a per-job delay (milliseconds)
+                    before each one actually starts sending requests, timed
+                    from its position in the batch (default: 10, so the
+                    default single-wave launch above ramps up rather than
+                    hitting the CPU in the same instant; set to 0 for every
+                    job to release at once). Applies to every hey launch
+                    site (the three load benchmarks above, benchmark-on-
+                    demand/benchmark-prewarmed, and the orchestrator-contract
+                    drain test); costs roughly (batch_size - 1) x N ms of
+                    extra wall-clock per wave
   --verbose         Stream raw command output as well as saving it
   -h, --help        Show this help
 EOF
@@ -813,7 +880,18 @@ print_demo_evidence() {
             printf '\n%bSUMMARY JSON%b\n\n' "$c_bold$c_green" "$c_reset"
             jq '.' "$dir/summary.json" | sed 's/^/  /'
             printf '\n%bRAW HEY OUTPUT%b\n\n' "$c_bold$c_green" "$c_reset"
-            sed 's/^/  /' "$dir/hey.txt"
+            if ((benchmark_apps > raw_hey_inline_threshold)); then
+                printf '  (condensed: %d apps > %d-app inline threshold; full raw per-app' \
+                    "$benchmark_apps" "$raw_hey_inline_threshold"
+                printf ' output remains in %s and each app-N/hey.txt)\n' "$dir/hey.txt"
+                local i
+                for ((i = 0; i < benchmark_apps; i++)); do
+                    printf '\n  ---- app bench-%d ----\n\n' "$i"
+                    condensed_hey_block "$dir/app-$i/hey.txt" | sed 's/^/  /'
+                done
+            else
+                sed 's/^/  /' "$dir/hey.txt"
+            fi
             ;;
         benchmark-multi-app)
             local dir="$output_dir/benchmark-multi-app"
@@ -832,7 +910,18 @@ print_demo_evidence() {
             printf '\n%bSUMMARY JSON%b\n\n' "$c_bold$c_green" "$c_reset"
             jq '.' "$dir/summary.json" | sed 's/^/  /'
             printf '\n%bRAW HEY OUTPUT%b\n\n' "$c_bold$c_green" "$c_reset"
-            sed 's/^/  /' "$dir/hey.txt"
+            if ((benchmark_apps > raw_hey_inline_threshold)); then
+                printf '  (condensed: %d apps > %d-app inline threshold; full raw per-app' \
+                    "$benchmark_apps" "$raw_hey_inline_threshold"
+                printf ' output remains in %s and each app-N-hey.txt)\n' "$dir/hey.txt"
+                local i
+                for ((i = 0; i < benchmark_apps; i++)); do
+                    printf '\n  ---- app app-%d ----\n\n' "$i"
+                    condensed_hey_block "$dir/app-$i-hey.txt" | sed 's/^/  /'
+                done
+            else
+                sed 's/^/  /' "$dir/hey.txt"
+            fi
             ;;
         benchmark-orchestrator-contract)
             local dir="$output_dir/benchmark-orchestrator-contract"
@@ -1360,6 +1449,32 @@ self_test() {
     return 1
 }
 
+# spawn_hey_paused OUTFILE GATE_FILE RELEASE_SLEEP -- HEY_ARGS...
+#
+# Forks a single `hey` invocation as a background subshell that blocks
+# until GATE_FILE exists before it execs `hey HEY_ARGS...`, writing
+# combined stdout/stderr to OUTFILE; sets no state of its own, the caller
+# reads $! for the subshell's pid (status/wait handling is the caller's
+# job). This is the one place that actually forks `hey`, used by every
+# hey launch site in this script (legacy benchmark-on-demand/
+# benchmark-prewarmed, launch_hey_jobs's per-wave batches, and the
+# orchestrator-contract drain test's phase B) so a `hey` process is
+# always pre-spawned *paused* and only starts sending requests once its
+# gate file is created by the caller, rather than requests starting as a
+# side effect of whatever order/speed forking happened to occur in. When
+# RELEASE_SLEEP is non-zero (a fractional-seconds string, e.g. "0.050"),
+# it is slept after the gate opens and before `hey` starts, letting a
+# caller stagger several jobs that share one gate file.
+spawn_hey_paused() {
+    local outfile="$1" gate_file="$2" release_sleep="$3"
+    shift 3
+    (
+        while [[ ! -e "$gate_file" ]]; do sleep 0.005; done
+        [[ "$release_sleep" != 0 ]] && sleep "$release_sleep"
+        exec hey "$@"
+    ) >"$outfile" 2>&1 &
+}
+
 # launch_hey_jobs REQS_ARR CONC_ARR URL_ARR HOST_ARR TIMEOUT_ARR OUTFILE_ARR STATUS_ARRNAME [LOG_FILE]
 #
 # Runs one `hey` invocation per index across the given parallel arrays, at
@@ -1374,9 +1489,24 @@ self_test() {
 # app's own hey-reported requests/sec reflects only its own wave, so
 # summing every app's rate does not equal the true wall-clock aggregate
 # throughput once more than one wave runs (see write_benchmark_summary's
-# end_to_end_requests_per_sec for that number). When LOG_FILE is given,
-# appends timestamped wave start/finish and per-app hey start/finish
-# (command, exit code, output path) entries to it.
+# end_to_end_requests_per_sec for that number).
+#
+# Within one wave, every job is pre-spawned *paused*: each is forked as a
+# subshell that blocks on a per-wave gate file before it execs `hey`, so
+# the whole batch is already forked and ready before any of them starts
+# sending requests. Once every job in the batch is forked, the gate file
+# is created, releasing all of them together, rather than requests
+# starting as a side effect of however long forking itself took. When
+# $hey_ramp_ms is greater than 0, each job's release is additionally
+# delayed by its position in the batch times that many milliseconds (job
+# 0 starts immediately on release, job 1 after one ramp step, and so on),
+# staggering actual request start without staggering (and thereby
+# delaying) the forking itself; this adds roughly
+# (batch_size - 1) * hey_ramp_ms to each wave's wall-clock time, which is
+# folded into the reported phase timing like any other wave cost. When
+# LOG_FILE is given, appends timestamped wave queue/release/finish and
+# per-app hey start/finish (command, exit code, output path) entries to
+# it.
 launch_hey_jobs() {
     # Namerefs use a `_lhj_` prefix so they can never alias a caller-side
     # array of the same base name (bash namerefs otherwise self-reference
@@ -1397,8 +1527,12 @@ launch_hey_jobs() {
         local -a batch_pids=() batch_indexes=()
         local batch_end=$((i + max_parallel))
         ((batch_end <= n)) || batch_end="$n"
+        local gate_file
+        gate_file="$(mktemp -u "${TMPDIR:-/tmp}/hyperlight-demo-hey-gate.XXXXXX")"
+        rm -f "$gate_file" 2>/dev/null
         [[ -n "$_lhj_logfile" ]] && log_line "$_lhj_logfile" \
-            "hey wave $wave start: apps $i-$((batch_end - 1)) of $n"
+            "hey wave $wave queue: apps $i-$((batch_end - 1)) of $n" \
+            "${hey_ramp_ms:+ramp=${hey_ramp_ms}ms per job on release}"
         local wave_t0 wave_t1
         wave_t0="$(now_seconds)"
         local j
@@ -1410,13 +1544,23 @@ launch_hey_jobs() {
             fi
             local -a host_args=()
             [[ -n "${_lhj_hosts[j]}" ]] && host_args=(-host "${_lhj_hosts[j]}")
+            local release_sleep="0"
+            if ((hey_ramp_ms > 0)); then
+                local offset_ms=$(((j - i) * hey_ramp_ms))
+                release_sleep="$(printf '%d.%03d' \
+                    $((offset_ms / 1000)) $((offset_ms % 1000)))"
+            fi
             [[ -n "$_lhj_logfile" ]] && log_line "$_lhj_logfile" \
-                "hey app #$j start: hey -n ${_lhj_reqs[j]} -c ${_lhj_concs[j]} -t ${_lhj_timeouts[j]} ${_lhj_hosts[j]:+-host ${_lhj_hosts[j]}} ${_lhj_urls[j]}"
-            hey -n "${_lhj_reqs[j]}" -c "${_lhj_concs[j]}" -t "${_lhj_timeouts[j]}" \
-                "${host_args[@]}" "${_lhj_urls[j]}" >"${_lhj_outfiles[j]}" 2>&1 &
+                "hey app #$j queued (paused): hey -n ${_lhj_reqs[j]} -c ${_lhj_concs[j]} -t ${_lhj_timeouts[j]} ${_lhj_hosts[j]:+-host ${_lhj_hosts[j]}} ${_lhj_urls[j]} ramp_offset=${release_sleep}s"
+            spawn_hey_paused "${_lhj_outfiles[j]}" "$gate_file" "$release_sleep" \
+                -n "${_lhj_reqs[j]}" -c "${_lhj_concs[j]}" -t "${_lhj_timeouts[j]}" \
+                "${host_args[@]}" "${_lhj_urls[j]}"
             batch_pids+=("$!")
             batch_indexes+=("$j")
         done
+        [[ -n "$_lhj_logfile" ]] && log_line "$_lhj_logfile" \
+            "hey wave $wave release: ${#batch_pids[@]} jobs"
+        : >"$gate_file"
         local k
         for ((k = 0; k < ${#batch_pids[@]}; k++)); do
             local pid="${batch_pids[k]}" idx="${batch_indexes[k]}"
@@ -1426,6 +1570,7 @@ launch_hey_jobs() {
             [[ -n "$_lhj_logfile" ]] && log_line "$_lhj_logfile" \
                 "hey app #$idx finished: exit=$status output=${_lhj_outfiles[idx]}"
         done
+        rm -f "$gate_file" 2>/dev/null
         wave_t1="$(now_seconds)"
         [[ -n "$_lhj_logfile" ]] && log_line "$_lhj_logfile" \
             "hey wave $wave finish: elapsed=$(seconds_between "$wave_t0" "$wave_t1")s"
@@ -1461,6 +1606,27 @@ write_collected_hey_report() {
             cat "${_wchr_files[i]}"
         done
     } >"$output"
+}
+
+# condensed_hey_block HEY_OUTPUT_FILE
+#
+# Prints a condensed view of one app's raw `hey` report: the Summary
+# block (includes Requests/sec), the Latency distribution block, and the
+# Status code distribution block -- but skips the verbose Response time
+# histogram and per-phase Details blocks. Used by the benchmark-resident
+# and benchmark-multi-app presenters for the inline "RAW HEY OUTPUT"
+# section once --benchmark-apps exceeds $raw_hey_inline_threshold, so a
+# 128-app run doesn't dump thousands of lines of histogram bars to the
+# terminal/log. The full, uncondensed report is unaffected by this and
+# remains on disk (see write_collected_hey_report and each app's own
+# hey-output file).
+condensed_hey_block() {
+    local file="$1"
+    sed -n '/^Summary:/,/^Response time histogram:/p' "$file" | sed '$d'
+    echo
+    sed -n '/^Latency distribution:/,/^Details (/p' "$file" | sed '$d'
+    echo
+    sed -n '/^Status code distribution:/,$p' "$file"
 }
 
 # build_app_summary APP_ID REQUESTS CONCURRENCY HEY_OUTPUT_FILE
@@ -2148,8 +2314,26 @@ run_benchmark() {
     LC_ALL=C lscpu |
         grep -E '^(CPU\(s\)|Socket|Core|Thread)' >"$dir/lscpu.txt"
     start_server "$dir/server.log" "${args[@]}"
-    hey -n "$benchmark_requests" -c "$benchmark_concurrency" \
-        http://127.0.0.1:8787/sync | tee "$dir/hey.txt"
+    # Routed through the same spawn_hey_paused pause/release primitive as
+    # every other hey launch site (see launch_hey_jobs), even though a
+    # single job has nothing to stagger against itself: this keeps the
+    # mechanism identical everywhere rather than special-casing the
+    # legacy single-process benchmarks. Output is dumped to the console
+    # after it completes (see print_demo_evidence's HEY OUTPUT section
+    # too) rather than streamed live, matching how benchmark-resident/
+    # benchmark-multi-app/benchmark-orchestrator-contract already present
+    # their hey output.
+    local legacy_hey_gate
+    legacy_hey_gate="$(mktemp -u "${TMPDIR:-/tmp}/hyperlight-demo-hey-gate.XXXXXX")"
+    rm -f "$legacy_hey_gate" 2>/dev/null
+    spawn_hey_paused "$dir/hey.txt" "$legacy_hey_gate" 0 \
+        -n "$benchmark_requests" -c "$benchmark_concurrency" \
+        http://127.0.0.1:8787/sync
+    local legacy_hey_pid=$!
+    : >"$legacy_hey_gate"
+    wait "$legacy_hey_pid"
+    rm -f "$legacy_hey_gate" 2>/dev/null
+    cat "$dir/hey.txt"
     grep -Eq "\\[200\\][[:space:]]+${benchmark_requests} responses" "$dir/hey.txt"
     wait_for_pool_quiescence "$mode" "$dir/pool-status.json"
     jq '{
@@ -2189,7 +2373,7 @@ run_benchmark_resident() {
     : >"$run_log"
     log_line "$run_log" "benchmark-resident start: apps=$benchmark_apps" \
         "load_requests=$benchmark_load_requests concurrency=$benchmark_concurrency" \
-        "hey_max_parallel_jobs=$hey_max_parallel_jobs max_requests_per_vm=unset(unbounded)" \
+        "hey_max_parallel_jobs=$hey_max_parallel_jobs hey_ramp_ms=$hey_ramp_ms max_requests_per_vm=unset(unbounded)" \
         "max_lifetime_secs=unset(unbounded)"
 
     local -a req_alloc conc_alloc
@@ -2299,7 +2483,7 @@ run_benchmark_multi_app() {
     : >"$run_log"
     log_line "$run_log" "benchmark-multi-app start: apps=$benchmark_apps" \
         "load_requests=$benchmark_load_requests concurrency=$benchmark_concurrency" \
-        "hey_max_parallel_jobs=$hey_max_parallel_jobs" \
+        "hey_max_parallel_jobs=$hey_max_parallel_jobs hey_ramp_ms=$hey_ramp_ms" \
         "resident(even)=max_requests_per_vm=unset max_lifetime_secs=unset" \
         "disposable(odd)=one sandbox per request, no pool lifecycle limits"
 
@@ -2438,11 +2622,20 @@ run_benchmark_orchestrator_contract() {
     allocate_evenly "$benchmark_concurrency" "$benchmark_apps" conc_alloc
 
     # Phase A: foreground, run to completion as the pre-drain reference.
+    #
+    # hey truncates its own request count to a multiple of -c when -n isn't
+    # evenly divisible by -c (observed: `hey -n 75 -c 4` sends only 72, not
+    # 75), so the allocated request count is snapped down to the nearest
+    # multiple of its concurrency here, before launching hey or asserting on
+    # its output, rather than asserting on the originally allocated count
+    # and then failing against hey's own silent truncation.
     local -a a_reqs a_concs a_urls a_hosts a_timeouts a_outfiles a_statuses
     for ((i = 0; i < benchmark_apps; i++)); do
         local conc=$((conc_alloc[i] < phase_a_alloc[i] ? conc_alloc[i] : phase_a_alloc[i]))
         ((conc > 0)) || conc=1
-        a_reqs[i]="${phase_a_alloc[i]}"
+        local reqs=$(((phase_a_alloc[i] / conc) * conc))
+        ((reqs > 0)) || reqs="$conc"
+        a_reqs[i]="$reqs"
         a_concs[i]="$conc"
         a_urls[i]="http://$bind/sync"
         a_hosts[i]="drain-$i.bench"
@@ -2490,23 +2683,53 @@ run_benchmark_orchestrator_contract() {
     # (active+queued) and only signal once every app shows at least one
     # in-flight request, bounded by a generous timeout; a timeout here
     # means a real failure to admit, which the grep assertions below will
-    # then correctly surface as a demo FAIL rather than mask. M is bounded
-    # by --benchmark-apps and documented to stay small, so this
-    # intentionally does not route through the 16-way launch_hey_jobs
-    # batching.
+    # then correctly surface as a demo FAIL rather than mask. Every app's
+    # hey is still spawned paused and released together via
+    # spawn_hey_paused (plus the usual hey_ramp_ms stagger when set), but
+    # M is bounded by --benchmark-apps and documented to stay small, and
+    # this phase must return control immediately to poll admission state
+    # rather than block until hey exits, so it intentionally does not
+    # route through launch_hey_jobs itself (which always waits out a full
+    # wave before returning, and would wave-split for M > hey_max_parallel_jobs).
     local -a b_pids b_reqs b_concs b_outfiles
+    local b_gate
+    b_gate="$(mktemp -u "${TMPDIR:-/tmp}/hyperlight-demo-hey-gate.XXXXXX")"
+    rm -f "$b_gate" 2>/dev/null
     for ((i = 0; i < benchmark_apps; i++)); do
         local conc=$((conc_alloc[i] < phase_b_alloc[i] ? conc_alloc[i] : phase_b_alloc[i]))
         ((conc > 0)) || conc=1
-        b_reqs[i]="${phase_b_alloc[i]}"
+        # Same floor(n/c)*c snapping as phase A above: keep the asserted
+        # count honest with what hey will actually send.
+        local reqs=$(((phase_b_alloc[i] / conc) * conc))
+        ((reqs > 0)) || reqs="$conc"
+        b_reqs[i]="$reqs"
         b_concs[i]="$conc"
         b_outfiles[i]="$dir/app-$i-phase-b.txt"
-        hey -n "${phase_b_alloc[i]}" -c "$conc" -t 30 \
-            -host "drain-$i.bench" "http://$bind/drain" \
-            >"${b_outfiles[i]}" 2>&1 &
+        local b_release_sleep="0"
+        if ((hey_ramp_ms > 0)); then
+            local b_offset_ms=$((i * hey_ramp_ms))
+            b_release_sleep="$(printf '%d.%03d' \
+                $((b_offset_ms / 1000)) $((b_offset_ms % 1000)))"
+        fi
+        spawn_hey_paused "${b_outfiles[i]}" "$b_gate" "$b_release_sleep" \
+            -n "${b_reqs[i]}" -c "$conc" -t 30 \
+            -host "drain-$i.bench" "http://$bind/drain"
         b_pids[i]=$!
     done
+    : >"$b_gate"
 
+    # workerd-host's accept loop admits at most one new TCP connection per
+    # listener per polling tick (not a backlog-draining loop), so a burst of
+    # b_concs[i] concurrent connections per app is admitted gradually, not
+    # all at once. Waiting for just one admitted request per app (as before)
+    # lets SIGTERM race the rest of that same burst while they are still
+    # sitting unaccepted in the OS backlog: the accept loop exits on the
+    # very next tick once shutting_down is observed and never accepts them,
+    # so they get reset when the listener is dropped at process exit,
+    # instead of draining as admitted in-flight work. Waiting for the full
+    # per-app concurrency to be admitted (not merely >= 1) ensures the whole
+    # intended "in flight at signal time" batch has actually been accepted
+    # before SIGTERM fires, matching what this phase documents proving.
     local admit_deadline=$((SECONDS + 10))
     while true; do
         local admitted_status all_admitted=1
@@ -2517,7 +2740,7 @@ run_benchmark_orchestrator_contract() {
             in_flight="$(jq -r --arg id "drain-$i" \
                 '[.[] | select(.app_id == $id) | (.active + .queued)] | add // 0' \
                 <<<"$admitted_status" 2>/dev/null || echo 0)"
-            ((in_flight >= 1)) || all_admitted=0
+            ((in_flight >= b_concs[i])) || all_admitted=0
         done
         ((all_admitted == 1)) && break
         ((SECONDS < admit_deadline)) || break
@@ -2543,6 +2766,7 @@ run_benchmark_orchestrator_contract() {
         wait "${b_pids[i]}" || status=$?
         b_statuses[i]="$status"
     done
+    rm -f "$b_gate" 2>/dev/null
 
     local during_apps="[]"
     for ((i = 0; i < benchmark_apps; i++)); do
@@ -2779,6 +3003,24 @@ while (($#)); do
             benchmark_load_requests_explicit=true
             shift 2
             ;;
+        --benchmark-hey-parallel)
+            (($# >= 2)) || {
+                echo "--benchmark-hey-parallel requires a value" >&2
+                exit 2
+            }
+            hey_max_parallel_jobs="$2"
+            hey_max_parallel_jobs_explicit=true
+            shift 2
+            ;;
+        --benchmark-hey-ramp-ms)
+            (($# >= 2)) || {
+                echo "--benchmark-hey-ramp-ms requires a value" >&2
+                exit 2
+            }
+            hey_ramp_ms="$2"
+            hey_ramp_ms_explicit=true
+            shift 2
+            ;;
         --verbose)
             verbose=true
             shift
@@ -2798,6 +3040,18 @@ done
 if [[ "$benchmark_load_requests_explicit" != true ]]; then
     benchmark_load_requests=$((benchmark_apps * 1000))
 fi
+# Deferred defaults, same reasoning as benchmark_load_requests above:
+# --benchmark-apps may change after these variables' initial (unset)
+# values were set, so the real defaults are resolved here, once parsing
+# is done. Synchronized-single-wave-with-ramp is the default for every
+# benchmark demo (legacy benchmark-on-demand/benchmark-prewarmed only
+# ever launch one hey job each, so this has no effect there).
+if [[ "$hey_max_parallel_jobs_explicit" != true ]]; then
+    hey_max_parallel_jobs="$benchmark_apps"
+fi
+if [[ "$hey_ramp_ms_explicit" != true ]]; then
+    hey_ramp_ms=10
+fi
 
 for benchmark_value in \
     benchmark_requests \
@@ -2805,13 +3059,22 @@ for benchmark_value in \
     benchmark_vms \
     benchmark_pool_vms \
     benchmark_apps \
-    benchmark_load_requests; do
+    benchmark_load_requests \
+    hey_max_parallel_jobs; do
     if [[ ! "${!benchmark_value}" =~ ^[1-9][0-9]*$ ]]; then
         printf '%s must be a positive integer, got %q\n' \
             "$benchmark_value" "${!benchmark_value}" >&2
         exit 2
     fi
 done
+# hey_ramp_ms's valid default is 0 (no ramp), so it is checked separately
+# as a non-negative integer rather than joining the positive-integer loop
+# above.
+if [[ ! "$hey_ramp_ms" =~ ^[0-9]+$ ]]; then
+    printf 'hey_ramp_ms must be a non-negative integer, got %q\n' \
+        "$hey_ramp_ms" >&2
+    exit 2
+fi
 # --benchmark-requests/--benchmark-vms/--benchmark-pool-vms only apply to
 # the legacy benchmark-on-demand/benchmark-prewarmed demos; --benchmark-
 # apps/--benchmark-load-requests only apply to the three M-based load

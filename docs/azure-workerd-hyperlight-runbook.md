@@ -426,10 +426,35 @@ benchmarks; both still accept the same `--benchmark-concurrency`,
 When requests or concurrency do not divide evenly across apps, the
 presenter allocates the remainder deterministically (earlier apps receive
 one extra unit each) so the same inputs always produce the same
-per-app split. Each `hey` process runs as a separate OS process bounded to
-at most 16 concurrently launched workers at a time, so a large
-`--benchmark-apps` value still launches `hey` in bounded batches rather
-than all at once.
+per-app split. Each `hey` process runs as a separate OS process; by
+default (`--benchmark-hey-parallel N` / `HYPERLIGHT_BENCHMARK_HEY_PARALLEL`
+not given) every app's `hey` process launches in a single synchronized
+wave (`--benchmark-hey-parallel` defaults to `--benchmark-apps` itself),
+not split into sequential wave_1-finishes-then-wave_2-starts batches —
+lowering the cap below `--benchmark-apps` restores (bounded) wave-
+splitting, at the cost of serializing later apps' load behind earlier
+ones finishing. Within one wave, every `hey` job is pre-spawned *paused*
+behind a shared gate file and released together as a batch, rather than
+requests starting as a side effect of whatever order forking happened to
+occur in; `--benchmark-hey-ramp-ms N` / `HYPERLIGHT_BENCHMARK_HEY_RAMP_MS`
+(default 10ms, not 0) additionally delays each paused job's release by
+its position in the batch times that many milliseconds, so the default
+single-wave launch above ramps up instead of every `hey` process starting
+to send requests in the same instant (a CPU "blast" at wave release); set
+it to 0 to release every job in a wave at once. This adds roughly
+`(batch_size - 1) * ramp_ms` to each wave's wall-clock time, folded into
+the reported phase timing like any other wave cost. Both flags apply to
+every `hey` launch site in this script, not only the three load
+benchmarks here: the legacy `benchmark-on-demand`/`benchmark-prewarmed`
+single-process benchmarks use the same pause/release mechanism (trivially,
+since there is only one job to release, so these two flags' defaults have
+no observable effect on them), and `benchmark-orchestrator-contract`'s
+drain-test phase B also pre-spawns its apps paused and releases/ramps them
+together, though it always does so in one ungated batch regardless of
+`--benchmark-hey-parallel` (that phase polls real admission state
+immediately after launch rather than waiting out a full wave, so it
+cannot route through the same wave-capped helper the three load
+benchmarks use).
 
 Each demo prints per-app and aggregate `hey` results, along with the
 specific evidence for its contract: resident-status and retirement
@@ -506,6 +531,28 @@ derived instead from the per-app allocated concurrency (see
 `--benchmark-concurrency` above), not from `--benchmark-vms`/
 `--benchmark-pool-vms`.
 
+### `--benchmark-hey-parallel` and `--benchmark-hey-ramp-ms` scope
+
+Both apply to **every** `hey` launch site in this script, not just one
+demo family: the three load benchmarks (`benchmark-resident`,
+`benchmark-multi-app`, `benchmark-orchestrator-contract`'s phase A), the
+legacy `benchmark-on-demand`/`benchmark-prewarmed` single-process
+benchmarks, and `benchmark-orchestrator-contract`'s phase B drain test.
+`--benchmark-hey-parallel N` (or `HYPERLIGHT_BENCHMARK_HEY_PARALLEL`,
+default `--benchmark-apps`) bounds how many `hey` processes run
+concurrently in one wave for the three load benchmarks; by default this
+equals `--benchmark-apps`, so every app's `hey` process launches in a
+single synchronized wave rather than sequential bounded batches — lower
+it explicitly to restore bounded wave-splitting. It has no visible effect
+on the legacy demos (always exactly one `hey` process) and does not
+change phase B's batch size (phase B always launches every app's `hey` in
+one ungated batch, uncapped, for reasons explained above).
+`--benchmark-hey-ramp-ms N` (or `HYPERLIGHT_BENCHMARK_HEY_RAMP_MS`,
+default 10) delays each paused job's release within its batch by its
+position times this value, regardless of which demo launched it, so the
+default single-wave launch above ramps up instead of releasing every job
+at the same instant; set it to 0 for the old all-at-once release.
+
 ### Raw `hey` output, logs, timing, and throughput metrics
 
 Each of the three load benchmarks saves and displays the complete raw
@@ -514,25 +561,37 @@ hey.txt` for `benchmark-resident`, `demo-output/<demo>/app-N-hey.txt` for
 `benchmark-multi-app`) plus a single collected top-level `demo-output/
 <demo>/hey.txt` concatenating all per-app reports with `==== app: NAME
 ====` separators. The presenter prints this entire collected file inline
-under a `RAW HEY OUTPUT` heading as part of its evidence, so the full
-`Summary:`/`Requests/sec:`/`Latency distribution:` block for every app is
-visible in the terminal, not only on disk. A deliberately-concatenated
-multi-app raw-hey report is a presentation of independent per-app `hey`
-runs placed one after another, not a single merged statistical
-distribution — `hey` reports cannot be averaged or combined after the
-fact into one true aggregate latency/percentile distribution, which is
-why the two numeric aggregate metrics below are computed independently
-rather than parsed out of the concatenated text.
+under a `RAW HEY OUTPUT` heading as part of its evidence (condensed to a
+per-app Summary/Requests-per-sec/Latency-distribution/Status-code-
+distribution block, skipping the histogram/details, once `--benchmark-
+apps` exceeds `HYPERLIGHT_BENCHMARK_RAW_HEY_INLINE_THRESHOLD`/16 — the
+uncondensed per-app and collected files on disk are unaffected), so the
+full `Summary:`/`Requests/sec:`/`Latency distribution:` block for every
+app is visible in the terminal, not only on disk, at any app count. A
+deliberately-concatenated multi-app raw-hey report is a presentation of
+independent per-app `hey` runs placed one after another, not a single
+merged statistical distribution — `hey` reports cannot be averaged or
+combined after the fact into one true aggregate latency/percentile
+distribution, which is why the two numeric aggregate metrics below are
+computed independently rather than parsed out of the concatenated text.
 
 Each demo also writes a `run.log` recording start/stage/failure lines
-(including the lifecycle-limit values noted above) and a `timing.json`-
+(including the lifecycle-limit values noted above, plus the effective
+`hey_max_parallel_jobs`/`hey_ramp_ms` for the run) and a `timing.json`-
 shaped `timing` object inside `summary.json`, with `setup_seconds`,
 `load_seconds`, `teardown_seconds`, and `total_seconds` phase durations.
-`hey` itself is always launched as a separate OS process per app, bounded
-to at most 16 concurrently running `hey` processes at a time
-(`hey_max_parallel_jobs`); once the app count exceeds that cap, later
-apps' `hey` runs happen in a later sequential wave rather than fully
-overlapping the first wave.
+`hey` itself is always launched as a separate OS process per app; by
+default every app's `hey` process launches in one synchronized wave
+(`hey_max_parallel_jobs` defaults to `--benchmark-apps`, overridable with
+`--benchmark-hey-parallel`/`HYPERLIGHT_BENCHMARK_HEY_PARALLEL` — see
+above); lowering that cap below the app count makes later apps' `hey`
+runs happen in a later sequential wave rather than fully overlapping the
+first wave. Within a wave, every job is pre-spawned paused and released
+together, staggered by default (`hey_ramp_ms` defaults to 10,
+overridable with `--benchmark-hey-ramp-ms`/`HYPERLIGHT_BENCHMARK_HEY_RAMP_MS`
+— see above, set to 0 to release every job in a wave at once); `run.log`
+records each job's queue/release and each wave's queue/release/finish
+lines.
 
 `summary.json`'s `aggregate` object reports two different throughput
 numbers because of that wave behavior:
@@ -540,10 +599,11 @@ numbers because of that wave behavior:
 - `sum_of_app_requests_per_sec` adds up each app's own independently
   measured `hey` requests/sec. This is only a reasonable approximation of
   true aggregate throughput while every app's `hey` process actually ran
-  concurrently (app count <= 16); once later apps run in a later wave,
-  this sum keeps adding rates from waves that did not overlap in
-  wall-clock time, and so overstates true throughput by roughly the wave
-  count.
+  concurrently — true by default now that every app launches in one
+  wave, unless `--benchmark-hey-parallel` is explicitly lowered below the
+  app count, in which case apps beyond that cap run in later waves whose
+  rates this sum keeps adding even though they did not overlap in
+  wall-clock time, overstating true throughput by roughly the wave count.
 - `end_to_end_requests_per_sec` instead divides the total request count
   by the load phase's measured wall-clock duration
   (`timing.load_seconds`). This is the number that matches what an
