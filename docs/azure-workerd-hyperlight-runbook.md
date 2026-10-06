@@ -8,7 +8,7 @@ presents every feature as an interactive, individually runnable demo.
 
 ```bash
 git clone \
-  --branch simongdavies-adaptive-prewarm-profiling \
+  --branch workerd-on-hyperlight \
   https://github.com/simongdavies/hyperlight-unikraft.git
 cd hyperlight-unikraft
 test -c /dev/kvm && test -r /dev/kvm && test -w /dev/kvm
@@ -62,6 +62,8 @@ tools/setup-workerd-demo.sh --install-deps
 
 This checks out the matching Workerd fork, builds both projects, and prepares
 the demos. Omit `--install-deps` when the build tools are already installed.
+`just setup-workerd-demo` runs the same script from a checkout with `just`
+installed.
 
 ## 3. Choose a demo
 
@@ -111,6 +113,9 @@ tools/hyperlight-demo --demo kv
 tools/hyperlight-demo --demo benchmark-prewarmed
 ```
 
+`just workerd-demos --demo resident` runs the same presenter through the
+justfile.
+
 Clear all generated output for this checkout before a presentation:
 
 ```bash
@@ -148,8 +153,14 @@ failing stage, artifact location, and final 30 log lines.
 | `websocket` | Controlled WebSocket broker boundary | Real local WebSocket exchanges enforce endpoint, message-size, lifetime, reset, and denial rules |
 | `web-apis` | WinterTC and Web APIs | Timers, streams, handlers, MessagePort, and state reset pass |
 | `fetch` | Constrained outbound fetch | One declared loopback service works; other routes and redirects stay bounded |
+| `resident` | Reusable resident VM | A resident VM serves several sequential requests without teardown, then is explicitly retired once it crosses its configured request limit |
+| `multi-app` | Multi-app routing in one host process | One `workerd-host` process serves two independently configured apps, routed by hostname, from a single listening port |
+| `orchestrator-contract` | Orchestrator-ready process contract | `/healthz`, `/readyz`, and `/status` report correctly while running, and `SIGTERM` drains in-flight work and exits cleanly |
 | `benchmark-on-demand` | Create VMs as requests arrive | Sends the configured load through a bounded number of concurrent request VMs and confirms every request succeeds and cleanup finishes |
 | `benchmark-prewarmed` | Reuse a pool of ready VMs | Sends the same configured load and shows how many ready VMs remain and whether replacements are being prepared |
+| `benchmark-resident` | Resident-host throughput across independent apps | Real `hey` load against several independently running resident `workerd-host` processes, each on its own loopback port, with per-app and aggregate throughput |
+| `benchmark-multi-app` | Multi-app routing throughput and fairness | Real `hey` load against several hostname-routed apps behind one `workerd-host` process, with per-app and aggregate throughput plus routing/queue counters |
+| `benchmark-orchestrator-contract` | Orchestrator contract under load and drain | Real `hey` load against several apps, then `SIGTERM` mid-flight proves readiness goes false, new traffic is not admitted, admitted requests still drain, and exit happens within the configured drain timeout |
 
 The presenter reuses the repository's existing VFS, named-storage, WinterTC,
 and fetch scripts and their checked-in Worker bundles. Use their `--list`
@@ -236,7 +247,9 @@ external interfaces they use.
 | Feature | What Workerd already does | What this project adds |
 |---|---|---|
 | Temporary VM for each request | Runs JavaScript requests and events in isolated runtimes | Runs each request or event in a small temporary VM and destroys it afterward; a timeout does not poison the next request |
-| Fast VM startup | Starts and manages its normal runtime processes | Saves a ready VM image, restores it on demand, or keeps an adaptive pool ready |
+| Fast VM startup | Starts and manages its normal runtime processes | Saves a ready VM image, restores it on demand, or keeps an adaptive pool ready. An app can instead choose a bounded pool of resident VMs that each serve several requests before being recycled, alongside the unchanged disposable behavior |
+| Multi-app hosting | Serves one application per process | `workerd-host` serves multiple independently configured apps from one process, routed by hostname and optional path prefix |
+| Orchestration contract | Managed by its own process supervisor | `workerd-host` exposes `/__hyperlight/{healthz,readyz,status}` and drains in-flight requests to a deterministic exit code on `SIGTERM`/`SIGINT`, so an external orchestrator (not part of this project) can supervise it |
 | Worker permissions and limits | Uses configuration, bindings, and runtime limits | Before a VM starts, the host selects the Worker bundle and registers its allowed network, timer, and file services. Each external operation is sent to the host, which checks the policy, performs or denies the operation, and counts usage. A replacement VM gets fresh per-request counters, while Worker code cannot read or change the host policy. |
 | Scheduled events and message batches | Runs scheduled and queue handlers for supplied events | Passes a scheduled event or logical queue name plus message batch into the VM and returns completion, acknowledge, retry, batch-retry, or no-retry decisions |
 | KV, Cache, SQL, and Durable Objects | Provides these APIs and configured local or remote data services | Connects them to host-kept data that survives destruction of the temporary VM |
@@ -328,6 +341,114 @@ derive the defaults. Run both demos on the same machine for a meaningful
 comparison. Raw results, including `lscpu.txt` and the complete `hey` report,
 are saved under `demo-output/benchmark-on-demand/` and
 `demo-output/benchmark-prewarmed/`.
+
+## Resident, disposable, and prewarmed-disposable VMs
+
+These terms describe three distinct VM lifecycles available today; none of
+the existing disposable behavior described above changes:
+
+- **Disposable** (`benchmark-on-demand`, and every demo above except those
+  listed below): one VM per request. A fresh VM is restored for each
+  request or event and destroyed immediately afterward. No guest-visible
+  state can ever carry over between requests.
+- **Prewarmed disposable** (`benchmark-prewarmed`): still one VM per
+  request — a request's VM is still destroyed after it completes — but an
+  adaptive pool of already-restored VMs is kept ready ahead of demand, so a
+  request need not wait for a fresh restore. This is purely a latency
+  optimization; it does not let guest state persist across requests.
+- **Resident** (`resident`, `multi-app`, `orchestrator-contract`, via
+  `hluk workerd-host`): a bounded pool of VMs that each serve many
+  requests — not one — before being explicitly recycled, either because
+  they cross a configured `max_requests_per_vm`/`max_lifetime_secs` limit
+  or because they error. Guest-visible state (anything the Worker script
+  itself keeps in memory between requests) persists across requests on the
+  same resident VM until it is recycled. `connection_affinity: sticky`
+  additionally pins one keep-alive HTTP connection to the same resident VM
+  for its whole lifetime. See
+  [`examples/workerd-host/README.md`](../examples/workerd-host/README.md)
+  for the full configuration schema and orchestrator contract.
+
+## Resident-host throughput, routing, and drain under real load
+
+`benchmark-resident`, `benchmark-multi-app`, and `benchmark-orchestrator-contract`
+drive real `hey` load against the resident `workerd-host` process instead of
+only functional checks, to back the `resident`, `multi-app`, and
+`orchestrator-contract` claims above with throughput evidence:
+
+- **`benchmark-resident`** starts several independent resident
+  `workerd-host` processes, each bound to its own loopback port, and
+  distributes the configured total requests across all of them at the
+  configured aggregate concurrency.
+- **`benchmark-multi-app`** starts one `workerd-host` process configured
+  with several routed apps and distributes load across each app's
+  hostname/routing contract, so one process and port serve all of it.
+- **`benchmark-orchestrator-contract`** starts one `workerd-host` process
+  with several apps, verifies `/healthz`/`/readyz`/`/status` under a
+  reference load, then sends `SIGTERM` while a further share of requests is
+  still in flight. It proves readiness goes false, new connections receive
+  no response, already-admitted requests still drain successfully, and the
+  process exits within its configured drain timeout.
+
+```bash
+tools/hyperlight-demo \
+  --benchmark-apps 4 \
+  --benchmark-load-requests 1000 \
+  --benchmark-concurrency 64 \
+  --demo benchmark-resident
+
+tools/hyperlight-demo \
+  --benchmark-apps 4 \
+  --benchmark-load-requests 1000 \
+  --benchmark-concurrency 64 \
+  --demo benchmark-multi-app
+
+tools/hyperlight-demo \
+  --benchmark-apps 4 \
+  --benchmark-load-requests 1000 \
+  --benchmark-concurrency 64 \
+  --demo benchmark-orchestrator-contract
+```
+
+`--benchmark-apps` (or `HYPERLIGHT_BENCHMARK_APPS`) controls how many
+independent or routed apps the load is spread across; it defaults to the
+same derived physical-core count as the other `benchmark-*` defaults. That
+default is intentionally left uncapped rather than silently reduced, so a
+large machine keeps a correspondingly large default; pass a smaller
+explicit value on a machine where that many loopback ports or resident
+processes would be wasteful. `--benchmark-load-requests` (or
+`HYPERLIGHT_BENCHMARK_LOAD_REQUESTS`) defaults to `--benchmark-apps x
+1000` and `--benchmark-concurrency` reuses the same default as the other
+benchmarks; both still accept the same `--benchmark-concurrency`,
+`--benchmark-vms`, and `--benchmark-pool-vms` flags used above.
+`--benchmark-concurrency` must be at least `--benchmark-apps`, and
+`--benchmark-apps` cannot exceed `--benchmark-load-requests`.
+
+When requests or concurrency do not divide evenly across apps, the
+presenter allocates the remainder deterministically (earlier apps receive
+one extra unit each) so the same inputs always produce the same
+per-app split. Each `hey` process runs as a separate OS process bounded to
+at most 16 concurrently launched workers at a time, so a large
+`--benchmark-apps` value still launches `hey` in bounded batches rather
+than all at once.
+
+Each demo prints per-app and aggregate `hey` results, along with the
+specific evidence for its contract: resident-status and retirement
+counters for `benchmark-resident`; `/status` routing/queue counters and
+cross-app fairness for `benchmark-multi-app`; and pre-drain/during-drain
+throughput, latency, and shutdown duration for
+`benchmark-orchestrator-contract`. Raw `hey` output, `lscpu.txt`,
+`/status` snapshots, and a machine-readable `summary.json` per demo are
+saved to the usual demo output files under
+`demo-output/benchmark-resident/`, `demo-output/benchmark-multi-app/`,
+and `demo-output/benchmark-orchestrator-contract/`.
+
+These three demos differ from `benchmark-on-demand` and
+`benchmark-prewarmed` above: those two compare disposable VM creation
+strategies for a single app under one server, while these three measure
+the resident `workerd-host` binary itself — independent resident
+processes, one process routing several apps, and that process's
+orchestrator shutdown contract — each under real concurrent `hey` load
+rather than only functional request/response checks.
 
 ## Stop and clean up
 
