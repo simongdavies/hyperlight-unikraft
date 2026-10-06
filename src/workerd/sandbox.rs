@@ -954,6 +954,20 @@ impl WorkerVersionSandbox {
         (result, execution_profile)
     }
 
+    /// Restore one VM from the snapshot and hand it back as a
+    /// [`super::resident::ResidentWorkerSandbox`] the caller can execute
+    /// more than once against, instead of the disposable, single-call
+    /// restored sandbox `restore()` returns. This does not change `restore()`
+    /// or any disposable call path.
+    pub fn restore_resident(&self) -> Result<super::resident::ResidentWorkerSandbox> {
+        let (restored, restore_ms) = self.restore()?;
+        Ok(super::resident::ResidentWorkerSandbox::new(
+            restored,
+            self.worker_version().clone(),
+            restore_ms,
+        ))
+    }
+
     pub(super) fn restore(&self) -> Result<(RestoredWorkerVersionSandbox, f64)> {
         if self.image.binding().capability_policy_sha256() != self.capability_policy_sha256 {
             return Err(Error::Snapshot(
@@ -1164,6 +1178,67 @@ impl RestoredWorkerVersionSandbox {
         let result = match result {
             Ok(()) => responses.finish_fetch(),
             Err(error) => match responses.clear() {
+                Ok(()) => Err(error),
+                Err(clear_error) => Err(clear_error),
+            },
+        };
+        profile.response_finish_ms = WorkerVersionSandbox::elapsed_ms(finish_started);
+        profile.total_ms = WorkerVersionSandbox::elapsed_ms(total_started);
+        (result, profile)
+    }
+
+    /// Resident counterpart of [`Self::execute_profiled_with_teardown_observer`]:
+    /// drives exactly one `fetch` call on this VM **without** tearing it down
+    /// afterward, so the caller (`resident::ResidentWorkerSandbox`) can issue
+    /// further requests against the same running VM. The VM is left running
+    /// only when `result` is `Ok`; any error (including a watchdog-induced
+    /// timeout kill or a guest exit) leaves the VM unusable and the caller
+    /// must retire it rather than call this again.
+    pub(super) fn execute_resident(
+        &mut self,
+        request: RequestEnvelope,
+        timeout: Duration,
+        total_started: Instant,
+    ) -> (Result<ResponseEnvelope>, ExecutionProfile) {
+        let mut profile = ExecutionProfile::default();
+        macro_rules! fail {
+            ($error:expr) => {{
+                profile.total_ms = WorkerVersionSandbox::elapsed_ms(total_started);
+                return (Err($error), profile);
+            }};
+        }
+        let setup_started = Instant::now();
+        let encoded = match request.to_json() {
+            Ok(encoded) => encoded,
+            Err(error) => fail!(error),
+        };
+        if timeout.is_zero() {
+            fail!(Error::Timeout);
+        }
+        let deadline = match Instant::now().checked_add(timeout) {
+            Some(deadline) => deadline,
+            None => fail!(Error::State("timeout too large".into())),
+        };
+        self.fetch_session.set_deadline(deadline);
+        if let Err(error) = self.responses.begin(&request.request_id) {
+            fail!(error);
+        }
+        profile.request_setup_ms = WorkerVersionSandbox::elapsed_ms(setup_started);
+
+        let execution_started = Instant::now();
+        let result = timed_request(
+            &mut self.app,
+            encoded,
+            deadline,
+            self.fetch_session.clone(),
+            self.timer_session.clone(),
+        );
+        profile.guest_execution_ms = WorkerVersionSandbox::elapsed_ms(execution_started);
+
+        let finish_started = Instant::now();
+        let result = match result {
+            Ok(()) => self.responses.finish_fetch(),
+            Err(error) => match self.responses.clear() {
                 Ok(()) => Err(error),
                 Err(clear_error) => Err(clear_error),
             },

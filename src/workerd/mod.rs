@@ -15,6 +15,7 @@
 mod app_registry;
 mod extensions;
 mod fetch;
+mod http;
 mod pool;
 mod protocol;
 mod resident;
@@ -32,6 +33,10 @@ pub use extensions::*;
 pub use fetch::{
     FetchBroker, FetchBrokerConfig, FetchErrorCode, FetchLimits, FetchPolicy, FetchRequest,
     FetchResponse,
+};
+pub use http::{
+    ConnectionMode, ParsedHttpRequest, http_reason, read_http_request, request_path,
+    wants_keep_alive, write_http_error, write_http_response,
 };
 pub use pool::{
     PoolSubmitError, PrewarmPolicy, RequestExecution, WorkerPoolRestoreMode, WorkerPoolStatus,
