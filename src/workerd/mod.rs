@@ -12,6 +12,7 @@
 //! `examples/workerd-executor/README.md` for the ABI and trust assumptions;
 //! this is not stock-workerd or production support.
 
+mod app_registry;
 mod extensions;
 mod fetch;
 mod pool;
@@ -22,6 +23,11 @@ mod sandbox;
 mod snapshot;
 mod timer;
 
+pub use app_registry::{
+    AppConfig, AppHandle, AppPoolConfig, AppRegistry, AppRegistryError, AppRoute,
+    ConnectionAffinity, DisposablePoolConfig, HostConfig, ResidentPoolConfigJson,
+    WorkerCapabilityPolicyConfig,
+};
 pub use extensions::*;
 pub use fetch::{
     FetchBroker, FetchBrokerConfig, FetchErrorCode, FetchLimits, FetchPolicy, FetchRequest,
