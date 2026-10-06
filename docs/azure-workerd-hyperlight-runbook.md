@@ -450,6 +450,109 @@ processes, one process routing several apps, and that process's
 orchestrator shutdown contract — each under real concurrent `hey` load
 rather than only functional request/response checks.
 
+### Resident-pool lifecycle limits during load, by demo
+
+`max_requests_per_vm`/`max_lifetime_secs` (the resident pool's per-VM
+recycling limits, introduced above) are deliberately left `null`
+(unbounded) for the duration of every load benchmark below, so that VM
+recycling never interferes with the throughput measurement itself. This
+is different from the functional `resident` demo, which intentionally
+sets a small `max_requests_per_vm` to demonstrate retirement:
+
+- **Functional `resident` demo**: `{"max_requests_per_vm": 5,
+  "max_lifetime_secs": null}` — chosen specifically so the sixth of six
+  sequential requests crosses the limit and triggers one observable
+  retirement.
+- **`benchmark-resident`**: every per-app pool is configured as
+  `{"max_requests_per_vm": null, "max_lifetime_secs": null}` — unbounded,
+  so the configured resident VM(s) keep serving the entire load without
+  a mid-benchmark recycle.
+- **`benchmark-multi-app`**: even-indexed apps use a resident pool with
+  the same `{"max_requests_per_vm": null, "max_lifetime_secs": null}`;
+  odd-indexed apps use a `disposable` pool instead (one sandbox per
+  request, which has no per-VM lifecycle limits to begin with).
+- **`benchmark-orchestrator-contract`**: every app uses a `disposable`
+  pool only; this benchmark exercises the orchestrator drain contract
+  (`/healthz`, `/readyz`, `/status`, `SIGTERM`), not resident-VM
+  recycling, so `max_requests_per_vm`/`max_lifetime_secs` do not apply to
+  it at all.
+
+### `--benchmark-apps`, `--benchmark-load-requests`, and `--benchmark-concurrency` scope
+
+`--benchmark-apps` controls how many independent or routed apps the load
+is spread across for `benchmark-resident`, `benchmark-multi-app`, and
+`benchmark-orchestrator-contract` only; it has no effect on
+`benchmark-on-demand`/`benchmark-prewarmed`, which always run a single
+app. `--benchmark-load-requests` controls the aggregate request count
+distributed evenly across those `--benchmark-apps` apps for the same
+three benchmarks. `--benchmark-concurrency` is always an aggregate figure
+for every `benchmark-*` demo; for the three load benchmarks it must not
+exceed the effective request total for that demo
+(`--benchmark-load-requests`), while for `benchmark-on-demand`/
+`benchmark-prewarmed` it must not exceed `--benchmark-requests` instead.
+
+### `--benchmark-vms` and `--benchmark-pool-vms` scope
+
+`--benchmark-vms` (default: physical cores) bounds concurrent
+request-execution VMs, and `--benchmark-pool-vms` (default: physical
+cores + 1, must be at least 2) sets the prewarmed ready inventory — both
+apply **only** to the legacy `benchmark-on-demand`/`benchmark-prewarmed`
+demos (`--benchmark-pool-vms` further only affects `benchmark-prewarmed`;
+it is ignored by the on-demand server). Neither flag is read anywhere by
+`benchmark-resident`, `benchmark-multi-app`, or
+`benchmark-orchestrator-contract` — passing them alongside those three
+demos has no effect, because resident-pool sizing for those benchmarks is
+derived instead from the per-app allocated concurrency (see
+`--benchmark-concurrency` above), not from `--benchmark-vms`/
+`--benchmark-pool-vms`.
+
+### Raw `hey` output, logs, timing, and throughput metrics
+
+Each of the three load benchmarks saves and displays the complete raw
+`hey` report for every app: a per-app file (`demo-output/<demo>/app-N/
+hey.txt` for `benchmark-resident`, `demo-output/<demo>/app-N-hey.txt` for
+`benchmark-multi-app`) plus a single collected top-level `demo-output/
+<demo>/hey.txt` concatenating all per-app reports with `==== app: NAME
+====` separators. The presenter prints this entire collected file inline
+under a `RAW HEY OUTPUT` heading as part of its evidence, so the full
+`Summary:`/`Requests/sec:`/`Latency distribution:` block for every app is
+visible in the terminal, not only on disk. A deliberately-concatenated
+multi-app raw-hey report is a presentation of independent per-app `hey`
+runs placed one after another, not a single merged statistical
+distribution — `hey` reports cannot be averaged or combined after the
+fact into one true aggregate latency/percentile distribution, which is
+why the two numeric aggregate metrics below are computed independently
+rather than parsed out of the concatenated text.
+
+Each demo also writes a `run.log` recording start/stage/failure lines
+(including the lifecycle-limit values noted above) and a `timing.json`-
+shaped `timing` object inside `summary.json`, with `setup_seconds`,
+`load_seconds`, `teardown_seconds`, and `total_seconds` phase durations.
+`hey` itself is always launched as a separate OS process per app, bounded
+to at most 16 concurrently running `hey` processes at a time
+(`hey_max_parallel_jobs`); once the app count exceeds that cap, later
+apps' `hey` runs happen in a later sequential wave rather than fully
+overlapping the first wave.
+
+`summary.json`'s `aggregate` object reports two different throughput
+numbers because of that wave behavior:
+
+- `sum_of_app_requests_per_sec` adds up each app's own independently
+  measured `hey` requests/sec. This is only a reasonable approximation of
+  true aggregate throughput while every app's `hey` process actually ran
+  concurrently (app count <= 16); once later apps run in a later wave,
+  this sum keeps adding rates from waves that did not overlap in
+  wall-clock time, and so overstates true throughput by roughly the wave
+  count.
+- `end_to_end_requests_per_sec` instead divides the total request count
+  by the load phase's measured wall-clock duration
+  (`timing.load_seconds`). This is the number that matches what an
+  external observer actually saw across however many waves the load took,
+  and is the one to trust for true aggregate throughput. It is `null`
+  when timing/wave data is unavailable for a phase (e.g.
+  `benchmark-orchestrator-contract`'s phase summaries do not currently
+  measure it).
+
 ## Stop and clean up
 
 The presenter stops its Worker and loopback helper on success, failure,

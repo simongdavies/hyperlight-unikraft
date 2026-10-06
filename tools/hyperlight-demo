@@ -86,6 +86,12 @@ benchmark_apps="${HYPERLIGHT_BENCHMARK_APPS:-$physical_cores}"
 benchmark_load_requests="${HYPERLIGHT_BENCHMARK_LOAD_REQUESTS:-}"
 benchmark_load_requests_explicit=false
 [[ -n "$benchmark_load_requests" ]] && benchmark_load_requests_explicit=true
+# launch_hey_jobs runs at most this many hey client processes at once
+# regardless of app count; kept as a named constant (rather than
+# launch_hey_jobs's previous hardcoded local) so benchmark-resident and
+# benchmark-multi-app can report it alongside their timing/throughput
+# numbers (see write_benchmark_summary) instead of leaving it undocumented.
+hey_max_parallel_jobs=16
 go_bin="${GOBIN:-}"
 if [[ -z "$go_bin" ]] && command -v go >/dev/null; then
     go_bin="$(go env GOBIN 2>/dev/null || true)"
@@ -151,18 +157,28 @@ Options:
   --clear           Remove this checkout's generated demo output and exit
   --output-dir DIR  Override the output directory
   --benchmark-requests N
-                    Total requests (default: 100 x physical cores)
+                    Total requests for benchmark-on-demand/benchmark-prewarmed
+                    only (default: 100 x physical cores)
   --benchmark-concurrency N
-                    Concurrent hey requests (default: physical cores)
-  --benchmark-vms N Concurrent request VMs (default: physical cores)
+                    Concurrent hey requests for every benchmark-* demo
+                    (default: physical cores). For benchmark-resident,
+                    benchmark-multi-app, and benchmark-orchestrator-contract
+                    this is an aggregate across all --benchmark-apps apps and
+                    must not exceed --benchmark-load-requests
+  --benchmark-vms N Concurrent request-execution VMs, benchmark-on-demand/
+                    benchmark-prewarmed only; ignored by benchmark-resident/
+                    benchmark-multi-app/benchmark-orchestrator-contract
+                    (default: physical cores)
   --benchmark-pool-vms N
-                    Prewarmed inventory (default: physical cores + 1)
+                    Prewarmed ready inventory, benchmark-prewarmed only;
+                    ignored by every other benchmark-* demo (default:
+                    physical cores + 1; must be at least 2)
   --benchmark-apps N
                     Independent/routed apps for benchmark-resident,
                     benchmark-multi-app, and benchmark-orchestrator-contract
                     (default: physical cores)
   --benchmark-load-requests N
-                    Total requests for those same three benchmarks,
+                    Aggregate requests for those same three benchmarks,
                     distributed evenly across --benchmark-apps apps
                     (default: --benchmark-apps x 1000)
   --verbose         Stream raw command output as well as saving it
@@ -784,25 +800,39 @@ print_demo_evidence() {
             local dir="$output_dir/benchmark-resident"
             evidence_row "Apps" "$benchmark_apps independent resident processes"
             evidence_row "Total requests" "$benchmark_load_requests / aggregate concurrency $benchmark_concurrency"
-            evidence_row "Aggregate throughput" "$(jq -r '.aggregate.aggregate_requests_per_sec' "$dir/summary.json") req/s"
+            evidence_row "Sum-of-rates throughput" "$(jq -r '.aggregate.sum_of_app_requests_per_sec' "$dir/summary.json") req/s (sum of each app's own hey rate; overstates true throughput once hey_waves > 1)"
+            evidence_row "End-to-end throughput" "$(jq -r '.aggregate.end_to_end_requests_per_sec' "$dir/summary.json") req/s (total_requests / measured load wall-clock seconds)"
+            evidence_row "Hey waves" "$(jq -r '.aggregate.hey_waves' "$dir/summary.json") (apps=$benchmark_apps, max $(jq -r '.aggregate.max_parallel_hey_jobs' "$dir/summary.json") concurrent hey processes)"
+            evidence_row "Phase timing" "$(jq -c '.timing' "$dir/summary.json")"
             evidence_row "Weighted mean latency" "$(jq -r '.aggregate.weighted_mean_latency_ms' "$dir/summary.json") ms"
             evidence_row "Per-app" "$(jq -c '[.apps[] | {app_id, requests, requests_per_sec}]' "$dir/summary.json")"
+            evidence_row "Raw hey output" "$dir/hey.txt (collected per-app reports; each app also keeps its own app-N/hey.txt)"
+            evidence_row "Log" "$dir/run.log (orchestration: config, launch/ready, hey waves, status, shutdown, phase totals)"
             printf '\n%bLSCPU OUTPUT%b\n\n' "$c_bold$c_green" "$c_reset"
             sed 's/^/  /' "$dir/lscpu.txt"
             printf '\n%bSUMMARY JSON%b\n\n' "$c_bold$c_green" "$c_reset"
             jq '.' "$dir/summary.json" | sed 's/^/  /'
+            printf '\n%bRAW HEY OUTPUT%b\n\n' "$c_bold$c_green" "$c_reset"
+            sed 's/^/  /' "$dir/hey.txt"
             ;;
         benchmark-multi-app)
             local dir="$output_dir/benchmark-multi-app"
             evidence_row "Apps" "$benchmark_apps routed apps, one process and port"
             evidence_row "Total requests" "$benchmark_load_requests / aggregate concurrency $benchmark_concurrency"
-            evidence_row "Aggregate throughput" "$(jq -r '.aggregate.aggregate_requests_per_sec' "$dir/summary.json") req/s"
+            evidence_row "Sum-of-rates throughput" "$(jq -r '.aggregate.sum_of_app_requests_per_sec' "$dir/summary.json") req/s (sum of each app's own hey rate; overstates true throughput once hey_waves > 1)"
+            evidence_row "End-to-end throughput" "$(jq -r '.aggregate.end_to_end_requests_per_sec' "$dir/summary.json") req/s (total_requests / measured load wall-clock seconds)"
+            evidence_row "Hey waves" "$(jq -r '.aggregate.hey_waves' "$dir/summary.json") (apps=$benchmark_apps, max $(jq -r '.aggregate.max_parallel_hey_jobs' "$dir/summary.json") concurrent hey processes)"
+            evidence_row "Phase timing" "$(jq -c '.timing' "$dir/summary.json")"
             evidence_row "Status" "$(jq -c '[.[] | {app_id, kind}]' "$dir/status.json")"
             evidence_row "Per-app" "$(jq -c '[.apps[] | {app_id, requests, requests_per_sec}]' "$dir/summary.json")"
+            evidence_row "Raw hey output" "$dir/hey.txt (collected per-app reports; each app also keeps its own app-N-hey.txt)"
+            evidence_row "Log" "$dir/run.log (orchestration: config, launch/ready, hey waves, status, shutdown, phase totals)"
             printf '\n%bLSCPU OUTPUT%b\n\n' "$c_bold$c_green" "$c_reset"
             sed 's/^/  /' "$dir/lscpu.txt"
             printf '\n%bSUMMARY JSON%b\n\n' "$c_bold$c_green" "$c_reset"
             jq '.' "$dir/summary.json" | sed 's/^/  /'
+            printf '\n%bRAW HEY OUTPUT%b\n\n' "$c_bold$c_green" "$c_reset"
+            sed 's/^/  /' "$dir/hey.txt"
             ;;
         benchmark-orchestrator-contract)
             local dir="$output_dir/benchmark-orchestrator-contract"
@@ -1134,9 +1164,86 @@ allocate_evenly() {
     done
 }
 
+# compute_benchmark_classes MODE SELECTED
+#
+# Decides which benchmark flag-validation class(es) apply to the demo
+# selection that is about to run/preview/describe, and sets the globals
+# uses_benchmark_apps and uses_legacy_benchmark accordingly. "one"/
+# "describe" narrow to exactly one class based on the selected demo name;
+# every other mode (all/preview/clear/self-test, or an unrecognized name
+# later rejected elsewhere) conservatively enables both classes, since no
+# single demo's scope narrows them. Kept separate from
+# validate_benchmark_flags so self_test can exercise both independently.
+compute_benchmark_classes() {
+    local mode="$1" selected="${2:-}"
+    uses_benchmark_apps=false
+    uses_legacy_benchmark=false
+    case "$mode" in
+        one | describe)
+            case "$selected" in
+                benchmark-resident | benchmark-multi-app | benchmark-orchestrator-contract)
+                    uses_benchmark_apps=true
+                    ;;
+                benchmark-on-demand | benchmark-prewarmed)
+                    uses_legacy_benchmark=true
+                    ;;
+                *) ;;
+            esac
+            ;;
+        *)
+            uses_benchmark_apps=true
+            uses_legacy_benchmark=true
+            ;;
+    esac
+}
+
+# validate_benchmark_flags REQUESTS CONCURRENCY POOL_VMS APPS LOAD_REQUESTS
+#                          USES_APPS USES_LEGACY
+#
+# Pure validation: prints an error to stderr and returns 2 on the first
+# violated constraint, else returns 0. USES_LEGACY gates the
+# benchmark-on-demand/benchmark-prewarmed-only check (--benchmark-requests
+# vs --benchmark-concurrency); USES_APPS gates the three load-benchmark
+# checks (--benchmark-apps vs --benchmark-concurrency/--benchmark-load-
+# requests). Regression guard: --benchmark-concurrency cannot exceed
+# --benchmark-requests used to run unconditionally, so a load-benchmark
+# invocation with a large --benchmark-concurrency intended for
+# --benchmark-load-requests incorrectly tripped the legacy-only
+# --benchmark-requests default. Kept standalone (no arg parsing, no
+# launching) so self_test can exercise exact reported flag combinations
+# deterministically.
+validate_benchmark_flags() {
+    local requests="$1" concurrency="$2" pool_vms="$3"
+    local apps="$4" load_requests="$5" uses_apps="$6" uses_legacy="$7"
+    if ((pool_vms < 2)); then
+        echo "--benchmark-pool-vms must be at least 2" >&2
+        return 2
+    fi
+    if "$uses_legacy" && ((concurrency > requests)); then
+        echo "--benchmark-concurrency cannot exceed --benchmark-requests" >&2
+        return 2
+    fi
+    if "$uses_apps"; then
+        if ((concurrency < apps)); then
+            echo "--benchmark-concurrency must be at least --benchmark-apps" >&2
+            return 2
+        fi
+        if ((apps > load_requests)); then
+            echo "--benchmark-apps cannot exceed --benchmark-load-requests" >&2
+            return 2
+        fi
+        if ((concurrency > load_requests)); then
+            echo "--benchmark-concurrency cannot exceed --benchmark-load-requests" >&2
+            return 2
+        fi
+    fi
+    return 0
+}
+
 # self_test: lightweight, offline (no demo processes, no network) coverage
-# for allocate_evenly's determinism/remainder handling. Run via the hidden
-# `--self-test` flag; exits non-zero on the first failed assertion.
+# for allocate_evenly's determinism/remainder handling, plus targeted
+# regression guards. Run via the hidden `--self-test` flag; exits
+# non-zero on the first failed assertion.
 self_test() {
     local failures=0
 
@@ -1203,23 +1310,73 @@ self_test() {
     fi
     unset -f _self_test_fails
 
+    # Regression guard: `tools/hyperlight-demo --benchmark-apps 32
+    # --benchmark-load-requests 32768 --benchmark-concurrency 2048 --demo
+    # benchmark-resident` used to fail with "--benchmark-concurrency
+    # cannot exceed --benchmark-requests" because that legacy-only check
+    # ran unconditionally. Prove the exact reported values now pass for a
+    # load-benchmark demo, and prove the legacy check still rejects the
+    # equivalent invalid combination for a legacy demo and the apps check
+    # still rejects an invalid load-benchmark combination -- so the fix
+    # narrows the check instead of disabling it universally.
+    assert_benchmark_validation() {
+        local label="$1" mode="$2" selected="$3"
+        local requests="$4" concurrency="$5" pool_vms="$6" apps="$7" load_requests="$8"
+        local expect="$9"
+        compute_benchmark_classes "$mode" "$selected"
+        local msg status=0
+        msg="$(validate_benchmark_flags "$requests" "$concurrency" "$pool_vms" \
+            "$apps" "$load_requests" "$uses_benchmark_apps" "$uses_legacy_benchmark" 2>&1)" ||
+            status=$?
+        if [[ "$expect" == pass ]]; then
+            if ((status != 0)); then
+                printf 'FAIL %s: expected validation to pass, got: %s\n' "$label" "$msg" >&2
+                failures=$((failures + 1))
+            fi
+        else
+            if ((status == 0)); then
+                printf 'FAIL %s: expected validation to reject, but it passed\n' "$label" >&2
+                failures=$((failures + 1))
+            fi
+        fi
+    }
+
+    assert_benchmark_validation \
+        "reported benchmark-resident regression" one benchmark-resident \
+        100 2048 2 32 32768 pass
+    assert_benchmark_validation \
+        "legacy benchmark-on-demand still rejects concurrency > requests" one benchmark-on-demand \
+        100 2048 2 32 32768 fail
+    assert_benchmark_validation \
+        "benchmark-multi-app still rejects concurrency < apps" one benchmark-multi-app \
+        100 10 2 32 32768 fail
+    unset -f assert_benchmark_validation
+
     if ((failures == 0)); then
-        echo "self-test: all allocate_evenly assertions passed"
+        echo "self-test: all allocate_evenly and benchmark-flag-validation assertions passed"
         return 0
     fi
     echo "self-test: $failures assertion(s) failed" >&2
     return 1
 }
 
-# launch_hey_jobs REQS_ARR CONC_ARR URL_ARR HOST_ARR TIMEOUT_ARR OUTFILE_ARR STATUS_ARRNAME
+# launch_hey_jobs REQS_ARR CONC_ARR URL_ARR HOST_ARR TIMEOUT_ARR OUTFILE_ARR STATUS_ARRNAME [LOG_FILE]
 #
 # Runs one `hey` invocation per index across the given parallel arrays, at
-# most 16 concurrently (bounding heavy client processes in flight at any
-# instant regardless of how many apps/indices there are), recording each
-# job's exit status (0 = success) into STATUS_ARRNAME. A zero request
-# count is treated as a trivial success (no `hey` invocation, empty
-# output file): used by the orchestrator-contract benchmark's degenerate
-# small-N per-app phase split.
+# most $hey_max_parallel_jobs concurrently (bounding heavy client
+# processes in flight at any instant regardless of how many apps/indices
+# there are), recording each job's exit status (0 = success) into
+# STATUS_ARRNAME. A zero request count is treated as a trivial success
+# (no `hey` invocation, empty output file): used by the
+# orchestrator-contract benchmark's degenerate small-N per-app phase
+# split. When the index count exceeds $hey_max_parallel_jobs, later
+# indices only start once an earlier batch/wave has fully finished: each
+# app's own hey-reported requests/sec reflects only its own wave, so
+# summing every app's rate does not equal the true wall-clock aggregate
+# throughput once more than one wave runs (see write_benchmark_summary's
+# end_to_end_requests_per_sec for that number). When LOG_FILE is given,
+# appends timestamped wave start/finish and per-app hey start/finish
+# (command, exit code, output path) entries to it.
 launch_hey_jobs() {
     # Namerefs use a `_lhj_` prefix so they can never alias a caller-side
     # array of the same base name (bash namerefs otherwise self-reference
@@ -1229,14 +1386,21 @@ launch_hey_jobs() {
     local -n _lhj_reqs="$1" _lhj_concs="$2" _lhj_urls="$3" _lhj_hosts="$4"
     local -n _lhj_timeouts="$5" _lhj_outfiles="$6"
     local -n _lhj_statuses="$7"
-    local max_parallel=16
+    local _lhj_logfile="${8:-}"
+    local max_parallel="$hey_max_parallel_jobs"
     local n="${#_lhj_reqs[@]}"
     _lhj_statuses=()
     local i=0
+    local wave=0
     while ((i < n)); do
+        wave=$((wave + 1))
         local -a batch_pids=() batch_indexes=()
         local batch_end=$((i + max_parallel))
         ((batch_end <= n)) || batch_end="$n"
+        [[ -n "$_lhj_logfile" ]] && log_line "$_lhj_logfile" \
+            "hey wave $wave start: apps $i-$((batch_end - 1)) of $n"
+        local wave_t0 wave_t1
+        wave_t0="$(now_seconds)"
         local j
         for ((j = i; j < batch_end; j++)); do
             if ((_lhj_reqs[j] <= 0)); then
@@ -1246,6 +1410,8 @@ launch_hey_jobs() {
             fi
             local -a host_args=()
             [[ -n "${_lhj_hosts[j]}" ]] && host_args=(-host "${_lhj_hosts[j]}")
+            [[ -n "$_lhj_logfile" ]] && log_line "$_lhj_logfile" \
+                "hey app #$j start: hey -n ${_lhj_reqs[j]} -c ${_lhj_concs[j]} -t ${_lhj_timeouts[j]} ${_lhj_hosts[j]:+-host ${_lhj_hosts[j]}} ${_lhj_urls[j]}"
             hey -n "${_lhj_reqs[j]}" -c "${_lhj_concs[j]}" -t "${_lhj_timeouts[j]}" \
                 "${host_args[@]}" "${_lhj_urls[j]}" >"${_lhj_outfiles[j]}" 2>&1 &
             batch_pids+=("$!")
@@ -1257,9 +1423,44 @@ launch_hey_jobs() {
             local status=0
             wait "$pid" || status=$?
             _lhj_statuses[idx]="$status"
+            [[ -n "$_lhj_logfile" ]] && log_line "$_lhj_logfile" \
+                "hey app #$idx finished: exit=$status output=${_lhj_outfiles[idx]}"
         done
+        wave_t1="$(now_seconds)"
+        [[ -n "$_lhj_logfile" ]] && log_line "$_lhj_logfile" \
+            "hey wave $wave finish: elapsed=$(seconds_between "$wave_t0" "$wave_t1")s"
         i="$batch_end"
     done
+}
+
+# write_collected_hey_report OUTPUT APP_IDS_ARRNAME ADDR_ARRNAME CMD_ARRNAME
+#                            HEY_FILE_ARRNAME
+#
+# Concatenates each app's independent raw `hey` report into one top-level
+# file for quick human review, with a clear per-app separator naming the
+# app, its address, and the exact `hey` command used. This is a collected
+# raw report, not a combined statistical distribution: parallel
+# independent `hey` runs cannot be merged into one set of
+# percentiles/latency histogram, and this file does not attempt that --
+# see summary.json for the computed aggregate (sum of throughput,
+# weighted mean latency).
+write_collected_hey_report() {
+    local output="$1"
+    local -n _wchr_ids="$2" _wchr_addrs="$3" _wchr_cmds="$4" _wchr_files="$5"
+    {
+        echo "# Collected raw hey reports: one independent hey run per app below."
+        echo "# NOT a combined statistical distribution -- see summary.json for"
+        echo "# the computed aggregate (sum of throughput, weighted mean latency)."
+        local i n="${#_wchr_ids[@]}"
+        for ((i = 0; i < n; i++)); do
+            echo
+            echo "==== app: ${_wchr_ids[i]} ===================================="
+            echo "address: ${_wchr_addrs[i]}"
+            echo "command: ${_wchr_cmds[i]}"
+            echo
+            cat "${_wchr_files[i]}"
+        done
+    } >"$output"
 }
 
 # build_app_summary APP_ID REQUESTS CONCURRENCY HEY_OUTPUT_FILE
@@ -1288,26 +1489,101 @@ build_app_summary() {
         }'
 }
 
-# write_benchmark_summary SCENARIO PER_APP_ARRAY_JSON OUTPUT_PATH
+# now_seconds -> current wall-clock time, sub-second precision.
+now_seconds() { date +%s.%N; }
+
+# seconds_between START END -> (END - START) with 3 decimal places.
+seconds_between() {
+    awk -v start="$1" -v end="$2" 'BEGIN { printf "%.3f", end - start }'
+}
+
+# log_line LOGFILE MESSAGE...
 #
-# Builds the common {scenario, apps, aggregate} shape shared by all three
-# new benchmarks' summary.json: aggregate throughput is the sum of each
-# app's independently-measured requests/sec (a standard approximation for
-# combined client-side load), and aggregate latency is the per-request
-# weighted mean across apps.
+# Appends one timestamped line to LOGFILE (created if missing). This is
+# the orchestration-level log (phases, per-app launch/ready/hey/shutdown
+# events, failures with the referenced per-app server log path) -- not a
+# replacement for each app's own server.log, which keeps the raw workerd-
+# host stdout/stderr untouched. Only written to the file: callers that
+# also want the line on the terminal (e.g. a failure) should echo/printf
+# it themselves in addition to calling this.
+log_line() {
+    local logfile="$1"
+    shift
+    printf '[%s] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" >>"$logfile"
+}
+
+# make_phase_timing SETUP_SECONDS LOAD_SECONDS TEARDOWN_SECONDS TOTAL_SECONDS
+# -> prints the shared {setup_seconds, load_seconds, teardown_seconds,
+#    total_seconds} JSON object used by benchmark-resident/benchmark-
+#    multi-app's summary.json. setup_seconds covers starting the
+#    workerd-host process(es) and writing configs, up to (not including)
+#    the hey load; load_seconds is the wall-clock span of the hey load
+#    phase itself (launch_hey_jobs, which may run in multiple sequential
+#    waves -- see hey_max_parallel_jobs); teardown_seconds covers
+#    post-load status collection and process shutdown; total_seconds is
+#    the full run_benchmark_* function duration (may exceed the sum of
+#    the other three by a small amount spent on bookkeeping between
+#    phases).
+make_phase_timing() {
+    jq -n \
+        --argjson setup_seconds "$1" \
+        --argjson load_seconds "$2" \
+        --argjson teardown_seconds "$3" \
+        --argjson total_seconds "$4" \
+        '{setup_seconds: $setup_seconds, load_seconds: $load_seconds, teardown_seconds: $teardown_seconds, total_seconds: $total_seconds}'
+}
+
+# write_benchmark_summary SCENARIO PER_APP_ARRAY_JSON TIMING_JSON MAX_PARALLEL
+#                         OUTPUT_PATH
+#
+# Builds the common {scenario, apps, timing, aggregate} shape shared by
+# all three new benchmarks' summary.json.
+#
+# aggregate.sum_of_app_requests_per_sec sums each app's independently
+# measured requests/sec from its own hey run: a reasonable approximation
+# ONLY while every app's hey process actually ran concurrently. Once the
+# app count exceeds MAX_PARALLEL, launch_hey_jobs runs later apps in
+# sequential waves (see its docstring), so this sum silently keeps adding
+# up rates from waves that did not overlap in wall-clock time and
+# overstates true throughput by roughly the wave count.
+#
+# aggregate.end_to_end_requests_per_sec instead divides total_requests by
+# the load phase's measured wall-clock duration (timing.load_seconds):
+# this is the number that matches what an external observer actually saw
+# across however many waves the load took, and is the one to trust for
+# true aggregate throughput. It is null when TIMING_JSON/MAX_PARALLEL are
+# not supplied (orchestrator-contract's phase summaries do not currently
+# measure this).
 write_benchmark_summary() {
-    local scenario="$1" per_app_json="$2" output="$3"
-    jq -n --arg scenario "$scenario" --argjson apps "$per_app_json" '
+    local scenario="$1" per_app_json="$2" timing_json="${3:-null}"
+    local max_parallel="${4:-0}" output="$5"
+    jq -n \
+        --arg scenario "$scenario" \
+        --argjson apps "$per_app_json" \
+        --argjson timing "$timing_json" \
+        --argjson max_parallel "$max_parallel" '
+        ($apps | map(.requests) | add) as $total_requests |
         {
             scenario: $scenario,
             apps: $apps,
+            timing: $timing,
             aggregate: {
-                total_requests: ($apps | map(.requests) | add),
-                aggregate_requests_per_sec: ($apps | map(.requests_per_sec) | add),
+                total_requests: $total_requests,
+                sum_of_app_requests_per_sec: ($apps | map(.requests_per_sec) | add),
+                end_to_end_requests_per_sec: (
+                    if ($timing | type) == "object" and (($timing.load_seconds // 0) > 0) then
+                        ($total_requests / $timing.load_seconds)
+                    else null end
+                ),
                 weighted_mean_latency_ms: (
                     ($apps | map(.average_latency_ms * .requests) | add) /
-                    (($apps | map(.requests) | add) as $total |
-                        if $total > 0 then $total else 1 end)
+                    (if $total_requests > 0 then $total_requests else 1 end)
+                ),
+                max_parallel_hey_jobs: (if $max_parallel > 0 then $max_parallel else null end),
+                hey_waves: (
+                    if $max_parallel > 0 then
+                        ((($apps | length) + $max_parallel - 1) / $max_parallel | floor)
+                    else null end
                 )
             }
         }' >"$output"
@@ -1907,6 +2183,14 @@ run_benchmark_resident() {
     local dir="$output_dir/benchmark-resident"
     mkdir -p "$dir"
     LC_ALL=C lscpu | grep -E '^(CPU\(s\)|Socket|Core|Thread)' >"$dir/lscpu.txt"
+    local t_start t_setup_done t_load_done t_end
+    t_start="$(now_seconds)"
+    local run_log="$dir/run.log"
+    : >"$run_log"
+    log_line "$run_log" "benchmark-resident start: apps=$benchmark_apps" \
+        "load_requests=$benchmark_load_requests concurrency=$benchmark_concurrency" \
+        "hey_max_parallel_jobs=$hey_max_parallel_jobs max_requests_per_vm=unset(unbounded)" \
+        "max_lifetime_secs=unset(unbounded)"
 
     local -a req_alloc conc_alloc
     allocate_evenly "$benchmark_load_requests" "$benchmark_apps" req_alloc
@@ -1930,11 +2214,20 @@ run_benchmark_resident() {
         apps_json="$(jq -n --argjson app "$(app_config "bench-$i" bench.resident.test \
             "$root/examples/workerd-bundles/workerd-pool-benchmark.json" "$pool")" '[$app]')"
         write_host_config "$app_dir/config.json" "$apps_json"
+        log_line "$run_log" "app bench-$i config generated: pool=resident capacity=$conc" \
+            "queue_capacity=$queue_capacity bind=$bind requests=${req_alloc[i]}"
+        local app_t0 app_t1
+        app_t0="$(now_seconds)"
         if ((i == 0)); then
             start_workerd_host "$app_dir/server.log" "$app_dir/config.json" "$bind"
         else
             start_workerd_host_extra "$app_dir/server.log" "$app_dir/config.json" "$bind"
         fi
+        app_t1="$(now_seconds)"
+        local app_pid=$((i == 0 ? demo_pid : extra_pids[-1]))
+        log_line "$run_log" "app bench-$i launched: pid=$app_pid bind=$bind" \
+            "server_log=$app_dir/server.log"
+        log_line "$run_log" "app bench-$i ready: elapsed=$(seconds_between "$app_t0" "$app_t1")s"
         reqs[i]="${req_alloc[i]}"
         concs[i]="$conc"
         urls[i]="http://$bind/sync"
@@ -1944,26 +2237,55 @@ run_benchmark_resident() {
         status_files[i]="$app_dir/status.json"
     done
 
-    launch_hey_jobs reqs concs urls hosts timeouts outfiles statuses
+    t_setup_done="$(now_seconds)"
+    log_line "$run_log" "setup phase complete: elapsed=$(seconds_between "$t_start" "$t_setup_done")s"
+    log_line "$run_log" "load phase start: $benchmark_apps apps, $benchmark_load_requests total requests"
+    launch_hey_jobs reqs concs urls hosts timeouts outfiles statuses "$run_log"
+    t_load_done="$(now_seconds)"
+    log_line "$run_log" "load phase complete: elapsed=$(seconds_between "$t_setup_done" "$t_load_done")s"
 
+    local -a app_ids cmds
     local app_summaries="[]"
     for ((i = 0; i < benchmark_apps; i++)); do
+        if [[ "${statuses[i]}" != 0 ]]; then
+            log_line "$run_log" "FAILURE: app bench-$i hey exit=${statuses[i]}" \
+                "see ${outfiles[i]} and $dir/app-$i/server.log"
+        fi
         [[ "${statuses[i]}" == 0 ]]
         if ((reqs[i] > 0)); then
+            if ! grep -Eq "\\[200\\][[:space:]]+${reqs[i]} responses" "${outfiles[i]}"; then
+                log_line "$run_log" "FAILURE: app bench-$i did not report ${reqs[i]} 200 responses" \
+                    "see ${outfiles[i]} and $dir/app-$i/server.log"
+            fi
             grep -Eq "\\[200\\][[:space:]]+${reqs[i]} responses" "${outfiles[i]}"
         fi
         local port=$((8320 + i))
         curl --fail-with-body --silent --show-error \
             "http://127.0.0.1:$port/__hyperlight/status" >"${status_files[i]}"
+        log_line "$run_log" "app bench-$i pool status: $(jq -c . "${status_files[i]}")"
         local one
         one="$(build_app_summary "bench-$i" "${reqs[i]}" "${concs[i]}" "${outfiles[i]}")"
         app_summaries="$(jq -c --argjson one "$one" '. + [$one]' <<<"$app_summaries")"
+        app_ids[i]="bench-$i"
+        cmds[i]="hey -n ${reqs[i]} -c ${concs[i]} -t ${timeouts[i]} -host ${hosts[i]} ${urls[i]}"
     done
 
-    write_benchmark_summary "benchmark-resident" "$app_summaries" "$dir/summary.json"
+    write_collected_hey_report "$dir/hey.txt" app_ids urls cmds outfiles
     jq -s '.' "$dir"/app-*/status.json >"$dir/status.json"
+    log_line "$run_log" "shutdown start"
     stop_processes
-    echo "All $benchmark_load_requests requests across $benchmark_apps independent resident apps succeeded; see $dir/summary.json"
+    t_end="$(now_seconds)"
+    log_line "$run_log" "shutdown complete: elapsed=$(seconds_between "$t_load_done" "$t_end")s"
+    local timing_json
+    timing_json="$(make_phase_timing \
+        "$(seconds_between "$t_start" "$t_setup_done")" \
+        "$(seconds_between "$t_setup_done" "$t_load_done")" \
+        "$(seconds_between "$t_load_done" "$t_end")" \
+        "$(seconds_between "$t_start" "$t_end")")"
+    write_benchmark_summary "benchmark-resident" "$app_summaries" "$timing_json" \
+        "$hey_max_parallel_jobs" "$dir/summary.json"
+    log_line "$run_log" "benchmark-resident complete: total_elapsed=$(seconds_between "$t_start" "$t_end")s"
+    echo "All $benchmark_load_requests requests across $benchmark_apps independent resident apps succeeded; see $dir/summary.json, $dir/hey.txt, and $run_log"
 }
 
 run_benchmark_multi_app() {
@@ -1971,6 +2293,15 @@ run_benchmark_multi_app() {
     mkdir -p "$dir"
     LC_ALL=C lscpu | grep -E '^(CPU\(s\)|Socket|Core|Thread)' >"$dir/lscpu.txt"
     local bind=127.0.0.1:8330
+    local t_start t_setup_done t_load_done t_end
+    t_start="$(now_seconds)"
+    local run_log="$dir/run.log"
+    : >"$run_log"
+    log_line "$run_log" "benchmark-multi-app start: apps=$benchmark_apps" \
+        "load_requests=$benchmark_load_requests concurrency=$benchmark_concurrency" \
+        "hey_max_parallel_jobs=$hey_max_parallel_jobs" \
+        "resident(even)=max_requests_per_vm=unset max_lifetime_secs=unset" \
+        "disposable(odd)=one sandbox per request, no pool lifecycle limits"
 
     local -a req_alloc conc_alloc
     allocate_evenly "$benchmark_load_requests" "$benchmark_apps" req_alloc
@@ -1987,11 +2318,20 @@ run_benchmark_multi_app() {
         fi
         app_json_lines+=("$(app_config "app-$i" "app-$i.bench" \
             "$root/examples/workerd-bundles/workerd-pool-benchmark.json" "$pool")")
+        local pool_kind
+        ((i % 2 == 0)) && pool_kind="resident" || pool_kind="disposable"
+        log_line "$run_log" "app app-$i config generated: pool=$pool_kind"
     done
     local apps_json
     apps_json="$(printf '%s\n' "${app_json_lines[@]}" | jq -s '.')"
     write_host_config "$dir/config.json" "$apps_json"
+    local proc_t0 proc_t1
+    proc_t0="$(now_seconds)"
     start_workerd_host "$dir/server.log" "$dir/config.json" "$bind"
+    proc_t1="$(now_seconds)"
+    log_line "$run_log" "shared process launched: pid=$demo_pid bind=$bind" \
+        "server_log=$dir/server.log apps=$benchmark_apps"
+    log_line "$run_log" "shared process ready: elapsed=$(seconds_between "$proc_t0" "$proc_t1")s"
 
     local -a reqs concs urls hosts timeouts outfiles statuses
     for ((i = 0; i < benchmark_apps; i++)); do
@@ -2004,27 +2344,57 @@ run_benchmark_multi_app() {
         timeouts[i]=30
         outfiles[i]="$dir/app-$i-hey.txt"
     done
-    launch_hey_jobs reqs concs urls hosts timeouts outfiles statuses
+    t_setup_done="$(now_seconds)"
+    log_line "$run_log" "setup phase complete: elapsed=$(seconds_between "$t_start" "$t_setup_done")s"
+    log_line "$run_log" "load phase start: $benchmark_apps apps, $benchmark_load_requests total requests"
+    launch_hey_jobs reqs concs urls hosts timeouts outfiles statuses "$run_log"
+    t_load_done="$(now_seconds)"
+    log_line "$run_log" "load phase complete: elapsed=$(seconds_between "$t_setup_done" "$t_load_done")s"
 
+    local -a app_ids addrs cmds
     local app_summaries="[]"
     for ((i = 0; i < benchmark_apps; i++)); do
+        if [[ "${statuses[i]}" != 0 ]]; then
+            log_line "$run_log" "FAILURE: app app-$i hey exit=${statuses[i]}" \
+                "see ${outfiles[i]} and $dir/server.log"
+        fi
         [[ "${statuses[i]}" == 0 ]]
         if ((reqs[i] > 0)); then
+            if ! grep -Eq "\\[200\\][[:space:]]+${reqs[i]} responses" "${outfiles[i]}"; then
+                log_line "$run_log" "FAILURE: app app-$i did not report ${reqs[i]} 200 responses" \
+                    "see ${outfiles[i]} and $dir/server.log"
+            fi
             grep -Eq "\\[200\\][[:space:]]+${reqs[i]} responses" "${outfiles[i]}"
         fi
         local one
         one="$(build_app_summary "app-$i" "${reqs[i]}" "${concs[i]}" "${outfiles[i]}")"
         app_summaries="$(jq -c --argjson one "$one" '. + [$one]' <<<"$app_summaries")"
+        app_ids[i]="app-$i"
+        addrs[i]="${urls[i]} (Host: ${hosts[i]})"
+        cmds[i]="hey -n ${reqs[i]} -c ${concs[i]} -t ${timeouts[i]} -host ${hosts[i]} ${urls[i]}"
     done
 
     curl --fail-with-body --silent --show-error \
         --header "Host: app-0.bench" \
         "http://$bind/__hyperlight/status" >"$dir/status.json"
     jq -e --argjson expected "$benchmark_apps" 'length == $expected' "$dir/status.json" >/dev/null
+    log_line "$run_log" "pool status ($benchmark_apps apps): $(jq -c . "$dir/status.json")"
 
-    write_benchmark_summary "benchmark-multi-app" "$app_summaries" "$dir/summary.json"
+    write_collected_hey_report "$dir/hey.txt" app_ids addrs cmds outfiles
+    log_line "$run_log" "shutdown start"
     stop_processes
-    echo "All $benchmark_load_requests requests across $benchmark_apps routed apps succeeded, one process and port; see $dir/summary.json"
+    t_end="$(now_seconds)"
+    log_line "$run_log" "shutdown complete: elapsed=$(seconds_between "$t_load_done" "$t_end")s"
+    local timing_json
+    timing_json="$(make_phase_timing \
+        "$(seconds_between "$t_start" "$t_setup_done")" \
+        "$(seconds_between "$t_setup_done" "$t_load_done")" \
+        "$(seconds_between "$t_load_done" "$t_end")" \
+        "$(seconds_between "$t_start" "$t_end")")"
+    write_benchmark_summary "benchmark-multi-app" "$app_summaries" "$timing_json" \
+        "$hey_max_parallel_jobs" "$dir/summary.json"
+    log_line "$run_log" "benchmark-multi-app complete: total_elapsed=$(seconds_between "$t_start" "$t_end")s"
+    echo "All $benchmark_load_requests requests across $benchmark_apps routed apps succeeded, one process and port; see $dir/summary.json, $dir/hey.txt, and $run_log"
 }
 
 run_benchmark_orchestrator_contract() {
@@ -2091,7 +2461,7 @@ run_benchmark_orchestrator_contract() {
         one="$(build_app_summary "drain-$i" "${a_reqs[i]}" "${a_concs[i]}" "${a_outfiles[i]}")"
         pre_apps="$(jq -c --argjson one "$one" '. + [$one]' <<<"$pre_apps")"
     done
-    write_benchmark_summary "pre-drain" "$pre_apps" "$dir/pre-drain-summary.json"
+    write_benchmark_summary "pre-drain" "$pre_apps" null 0 "$dir/pre-drain-summary.json"
 
     curl --fail-with-body --silent --show-error \
         "http://$bind/__hyperlight/healthz" >"$dir/healthz.json"
@@ -2184,7 +2554,7 @@ run_benchmark_orchestrator_contract() {
         one="$(build_app_summary "drain-$i" "${b_reqs[i]}" "${b_concs[i]}" "${b_outfiles[i]}")"
         during_apps="$(jq -c --argjson one "$one" '. + [$one]' <<<"$during_apps")"
     done
-    write_benchmark_summary "during-drain" "$during_apps" "$dir/during-drain-summary.json"
+    write_benchmark_summary "during-drain" "$during_apps" null 0 "$dir/during-drain-summary.json"
 
     # Bounded poll for process exit (drain-timeout-ms 5000 + buffer), not a
     # blind wait: new connections after SIGTERM get no response until the
@@ -2442,46 +2812,17 @@ for benchmark_value in \
         exit 2
     fi
 done
-if ((benchmark_concurrency > benchmark_requests)); then
-    echo "--benchmark-concurrency cannot exceed --benchmark-requests" >&2
-    exit 2
-fi
-if ((benchmark_pool_vms < 2)); then
-    echo "--benchmark-pool-vms must be at least 2" >&2
-    exit 2
-fi
-
-# The --benchmark-apps (M) cross-checks below only apply to the three
-# M-based load benchmarks. benchmark_apps defaults to the physical-core
-# count independently of --benchmark-concurrency/--benchmark-requests
-# (which the pre-existing benchmark-on-demand/benchmark-prewarmed demos
-# use on their own), so gating this on the actually-selected demo(s) keeps
-# those two demos' existing flag combinations working unchanged.
-uses_benchmark_apps=false
-case "$mode" in
-    all) uses_benchmark_apps=true ;;
-    one)
-        case "$selected" in
-            benchmark-resident | benchmark-multi-app | benchmark-orchestrator-contract)
-                uses_benchmark_apps=true
-                ;;
-        esac
-        ;;
-esac
-if "$uses_benchmark_apps"; then
-    if ((benchmark_concurrency < benchmark_apps)); then
-        echo "--benchmark-concurrency must be at least --benchmark-apps" >&2
-        exit 2
-    fi
-    if ((benchmark_apps > benchmark_load_requests)); then
-        echo "--benchmark-apps cannot exceed --benchmark-load-requests" >&2
-        exit 2
-    fi
-    if ((benchmark_concurrency > benchmark_load_requests)); then
-        echo "--benchmark-concurrency cannot exceed --benchmark-load-requests" >&2
-        exit 2
-    fi
-fi
+# --benchmark-requests/--benchmark-vms/--benchmark-pool-vms only apply to
+# the legacy benchmark-on-demand/benchmark-prewarmed demos; --benchmark-
+# apps/--benchmark-load-requests only apply to the three M-based load
+# benchmarks (benchmark-resident/benchmark-multi-app/benchmark-
+# orchestrator-contract). Gating the matching cross-checks on the
+# actually-selected demo(s) keeps each pair's defaults and flag
+# combinations independent of the other.
+compute_benchmark_classes "$mode" "$selected"
+validate_benchmark_flags "$benchmark_requests" "$benchmark_concurrency" \
+    "$benchmark_pool_vms" "$benchmark_apps" "$benchmark_load_requests" \
+    "$uses_benchmark_apps" "$uses_legacy_benchmark" || exit 2
 
 if [[ "$mode" == one || "$mode" == describe ]] &&
     [[ ! " ${demos[*]} " =~ " $selected " ]]; then
