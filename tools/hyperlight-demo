@@ -500,6 +500,8 @@ print_demo_evidence() {
             if [[ "$mode" == prewarmed ]]; then
                 evidence_row "Warm inventory" "$(jq -r '"ready=\(.prewarmed_ready)/\(.prewarmed_inventory), replenishing=\(.prewarmed_replenishing)"' "$benchmark_dir/pool-status.json")"
             fi
+            printf '\n%bHEY OUTPUT%b\n\n' "$c_bold$c_green" "$c_reset"
+            sed 's/^/  /' "$benchmark_dir/hey.txt"
             ;;
         component)
             local component="$output_dir/component/proof.json"
