@@ -778,8 +778,12 @@ impl GuestConfig {
             let runtime = runtime.clone();
             target.register_host_function(
                 broker_runtime::LOGICAL_BROKER_HOST_FUNCTION,
-                move |payload: Vec<u8>| -> hyperlight_host::Result<Vec<u8>> {
-                    Ok(runtime.dispatch_logical(&payload))
+                move |payload: String| -> hyperlight_host::Result<String> {
+                    String::from_utf8(runtime.dispatch_logical(payload.as_bytes())).map_err(|_| {
+                        hyperlight_host::new_error!(
+                            "logical service broker returned a non-UTF-8 response"
+                        )
+                    })
                 },
             )?;
         }
