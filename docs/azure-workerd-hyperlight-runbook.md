@@ -84,9 +84,11 @@ tools/hyperlight-demo --describe node
 tools/hyperlight-demo --describe benchmark-prewarmed
 ```
 
-The code section identifies each module by name and type, decodes JavaScript
-stored in bundle JSON with `jq`, and preserves the source's indentation. The
-capability proof uses the checked-in files under
+The code section identifies each module by name and type and prints at most 20
+source lines so large Workers do not overflow the presenter. It writes the
+complete module set to `demo-output/worker-code/<demo>.json` and prints a
+copy-paste `cat ... | jq -r ...` command that renders the full source with
+module labels. The capability proof uses the checked-in files under
 `examples/workerd-capability-workers/`, so the displayed code is the same
 source compiled into the proof executable. Component demos show both their
 entry module and generated JavaScript module. Host-only WASI and network-broker

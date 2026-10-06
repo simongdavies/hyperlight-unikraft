@@ -375,102 +375,138 @@ worker_code_heading() {
     printf '\n%bWORKER CODE%b\n\n' "$c_bold$c_green" "$c_reset"
 }
 
-print_worker_module() {
-    local name="$1"
-    local module_type="$2"
-    local source="$3"
-    printf '  %b%s%b (%s)\n' "$c_cyan" "$name" "$c_reset" "$module_type"
-    sed 's/^/    /' "$source"
-    printf '\n'
-}
-
-print_bundle_worker_code() {
+write_bundle_worker_code() {
     local bundle="$1"
-    local name module_type
-    while IFS=$'\t' read -r name module_type; do
-        printf '  %b%s%b (%s)\n' "$c_cyan" "$name" "$c_reset" "$module_type"
-        jq -r --arg name "$name" \
-            '.modules[] | select(.name == $name) | .source' \
-            "$bundle" |
-            sed 's/^/    /'
-        printf '\n'
-    done < <(
-        jq -r '
+    local output="$2"
+    jq '{
+        modules: [
             .modules[] |
             select(.type == "esModule" or .type == "commonJsModule") |
-            [.name, .type] | @tsv
-        ' "$bundle"
-    )
+            {name, type, source}
+        ]
+    }' "$bundle" >"$output"
 }
 
-print_source_worker_code() {
-    local name="$1"
-    local module_type="$2"
-    local source="$3"
-    print_worker_module "$name" "$module_type" "$source"
+write_source_worker_code() {
+    local output="$1"
+    shift
+    local temporary="$output.modules.tmp"
+    : >"$temporary"
+    while (($#)); do
+        local name="$1"
+        local module_type="$2"
+        local source="$3"
+        shift 3
+        jq -n \
+            --arg name "$name" \
+            --arg type "$module_type" \
+            --rawfile source "$source" \
+            '{name: $name, type: $type, source: $source}' >>"$temporary"
+    done
+    jq -s '{modules: .}' "$temporary" >"$output"
+    rm -f -- "$temporary"
+}
+
+write_node_worker_code() {
+    local output="$1"
+    jq -n \
+        --rawfile worker \
+        "$root/examples/workerd-capability-workers/node-worker.js" \
+        --rawfile legacy \
+        "$root/examples/workerd-capability-workers/legacy.cjs" \
+        --slurpfile vfs \
+        "$root/examples/workerd-bundles/workerd-vfs-evidence.json" \
+        '{
+            modules: [
+                {name: "worker.js", type: "esModule", source: $worker},
+                {name: "legacy.cjs", type: "commonJsModule", source: $legacy},
+                {
+                    name: "vfs-worker.js",
+                    type: "esModule",
+                    source: (
+                        $vfs[0].modules[] |
+                        select(.name == "worker.js") |
+                        .source
+                    )
+                }
+            ]
+        }' >"$output"
 }
 
 print_worker_code() {
     local demo="$1"
+    local code_dir="$output_dir/worker-code"
+    local artifact="$code_dir/$demo.json"
+    local rendered="$artifact.rendered.tmp"
+    mkdir -p "$code_dir"
+    rm -f -- "$artifact" "$rendered"
     worker_code_heading
     case "$demo" in
         isolation)
-            print_bundle_worker_code "$root/examples/workerd-bundles/acceptance.json"
+            write_bundle_worker_code \
+                "$root/examples/workerd-bundles/acceptance.json" "$artifact"
             ;;
         policy|kv|cache|sql|durable-objects)
-            print_source_worker_code \
+            write_source_worker_code "$artifact" \
                 "worker.js" "esModule" \
                 "$root/examples/workerd-capability-workers/data-worker.js"
             ;;
         ingress)
-            print_source_worker_code \
+            write_source_worker_code "$artifact" \
                 "worker.js" "esModule" \
                 "$root/examples/workerd-capability-workers/ingress-worker.js"
             ;;
         node)
-            print_source_worker_code \
-                "worker.js" "esModule" \
-                "$root/examples/workerd-capability-workers/node-worker.js"
-            print_source_worker_code \
-                "legacy.cjs" "commonJsModule" \
-                "$root/examples/workerd-capability-workers/legacy.cjs"
-            print_bundle_worker_code \
-                "$root/examples/workerd-bundles/workerd-vfs-evidence.json"
+            write_node_worker_code "$artifact"
             ;;
         storage)
-            print_bundle_worker_code \
-                "$root/examples/workerd-bundles/workerd-vfs-evidence.json"
+            write_bundle_worker_code \
+                "$root/examples/workerd-bundles/workerd-vfs-evidence.json" "$artifact"
             ;;
         core-wasm|web-apis)
-            print_bundle_worker_code \
-                "$root/examples/workerd-bundles/workerd-wintertc-demo.json"
+            write_bundle_worker_code \
+                "$root/examples/workerd-bundles/workerd-wintertc-demo.json" "$artifact"
             ;;
         component)
-            print_source_worker_code \
+            write_source_worker_code "$artifact" \
                 "worker.mjs" "esModule" \
-                "$root/experiments/workerd-component-model/worker.mjs"
-            print_source_worker_code \
+                "$root/experiments/workerd-component-model/worker.mjs" \
                 "generated/component.js" "esModule" \
                 "$root/experiments/workerd-component-model/generated/component.js"
             ;;
         fetch)
-            print_bundle_worker_code \
-                "$root/examples/workerd-bundles/fetch-policy-demo.json"
+            write_bundle_worker_code \
+                "$root/examples/workerd-bundles/fetch-policy-demo.json" "$artifact"
             ;;
         benchmark-on-demand|benchmark-prewarmed)
-            print_bundle_worker_code \
-                "$root/examples/workerd-bundles/workerd-pool-benchmark.json"
+            write_bundle_worker_code \
+                "$root/examples/workerd-bundles/workerd-pool-benchmark.json" "$artifact"
             ;;
         wasi-p2|wasi-p3)
             printf '  No JavaScript runs in Workerd for this WASI host-contract demo.\n\n'
+            return
             ;;
         tcp-tls|udp|websocket)
             printf '  No JavaScript runs in Workerd for this host-broker contract demo.\n\n'
+            return
             ;;
         *)
             printf '  No Worker JavaScript source is associated with this demo.\n\n'
+            return
             ;;
     esac
+    jq -r '.modules[] | "// \(.name) (\(.type))\n\(.source)"' \
+        "$artifact" >"$rendered"
+    sed -n '1,20p' "$rendered" | sed 's/^/  /'
+    local rendered_lines
+    rendered_lines="$(wc -l <"$rendered")"
+    if ((rendered_lines > 20)); then
+        printf '  ... %d additional lines omitted ...\n' "$((rendered_lines - 20))"
+    fi
+    rm -f -- "$rendered"
+    printf '\n  Full code: %s\n' "$artifact"
+    printf "  Command: cat %q | jq -r '%s'\n\n" \
+        "$artifact" '.modules[] | "// \(.name) (\(.type))\n\(.source)"'
 }
 
 print_result_lines() {
