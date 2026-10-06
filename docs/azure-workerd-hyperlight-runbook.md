@@ -143,8 +143,8 @@ failing stage, artifact location, and final 30 log lines.
 | `websocket` | Controlled WebSocket broker boundary | Real local WebSocket exchanges enforce endpoint, message-size, lifetime, reset, and denial rules |
 | `web-apis` | WinterTC and Web APIs | Timers, streams, handlers, MessagePort, and state reset pass |
 | `fetch` | Constrained outbound fetch | One declared loopback service works; other routes and redirects stay bounded |
-| `benchmark-on-demand` | Create VMs as requests arrive | Sends 320 requests, with up to 32 running at once, and confirms every request succeeds and cleanup finishes |
-| `benchmark-prewarmed` | Reuse a pool of ready VMs | Sends the same requests and shows how many ready VMs remain and whether replacements are being prepared |
+| `benchmark-on-demand` | Create VMs as requests arrive | Sends the configured load through a bounded number of concurrent request VMs and confirms every request succeeds and cleanup finishes |
+| `benchmark-prewarmed` | Reuse a pool of ready VMs | Sends the same configured load and shows how many ready VMs remain and whether replacements are being prepared |
 
 The presenter reuses the repository's existing VFS, named-storage, WinterTC,
 and fetch scripts and their checked-in Worker bundles. Use their `--list`
@@ -267,15 +267,56 @@ This demo does not add native Component Model loading.
 
 ## Compare creating VMs with using ready VMs
 
-Both demos send the same 320 requests, with up to 32 running at once.
+Both demos derive their defaults from:
+
+```bash
+LC_ALL=C lscpu | grep -E '^(CPU\(s\)|Socket|Core|Thread)'
+```
+
+Total requests default to 100 times `CPU(s)`. Concurrent requests and
+concurrent request VMs both default to `CPU(s)`. The prewarmed inventory
+defaults to `CPU(s)` plus the physical core count (`Socket(s)` multiplied by
+`Core(s) per socket`). A machine with 32 logical CPUs, one socket, 16 cores,
+and two threads per core therefore defaults to 3200 total requests, 32
+concurrent requests, 32 concurrent request VMs, and 48 prewarmed VMs.
 `benchmark-on-demand` creates or restores VMs as requests arrive.
-`benchmark-prewarmed` begins with ready VMs and prepares replacements as they
-are used.
+`benchmark-prewarmed` begins with the derived ready inventory and prepares
+replacements as VMs are used.
+
+Override any dimension independently:
+
+```bash
+tools/hyperlight-demo \
+  --benchmark-requests 1000 \
+  --benchmark-concurrency 64 \
+  --benchmark-vms 32 \
+  --benchmark-pool-vms 48 \
+  --demo benchmark-on-demand
+
+tools/hyperlight-demo \
+  --benchmark-requests 1000 \
+  --benchmark-concurrency 64 \
+  --benchmark-vms 32 \
+  --benchmark-pool-vms 48 \
+  --demo benchmark-prewarmed
+```
+
+`--benchmark-requests` controls the total `hey` request count.
+`--benchmark-concurrency` controls concurrent `hey` requests.
+`--benchmark-vms` bounds concurrent request VMs for either mode.
+`--benchmark-pool-vms` controls the initial ready inventory for the prewarmed
+mode, must be at least 2, and is ignored by the on-demand server. The same
+settings can be supplied through `HYPERLIGHT_BENCHMARK_REQUESTS`,
+`HYPERLIGHT_BENCHMARK_CONCURRENCY`, `HYPERLIGHT_BENCHMARK_VMS`, and
+`HYPERLIGHT_BENCHMARK_POOL_VMS`.
 
 The presenter reports response time and request rate, confirms that no work is
 left running or waiting, and shows whether replacement VMs are still being
-prepared. Run both demos on the same machine for a meaningful comparison. Raw
-results are saved under `demo-output/benchmark-on-demand/` and
+prepared. Its evidence includes both a compact logical/physical CPU summary and
+an `LSCPU OUTPUT` section containing the exact filtered command output used to
+derive the defaults. Run both demos on the same machine for a meaningful
+comparison. Raw results, including `lscpu.txt` and the complete `hey` report,
+are saved under `demo-output/benchmark-on-demand/` and
 `demo-output/benchmark-prewarmed/`.
 
 ## Stop and clean up

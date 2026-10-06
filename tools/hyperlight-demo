@@ -34,12 +34,40 @@ normalize_path() {
     printf '%s\n' "$value"
 }
 
+cpu_topology="$(LC_ALL=C lscpu 2>/dev/null || true)"
+lscpu_value() {
+    local label="$1"
+    awk -F: -v label="$label" '
+        $1 == label {
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2)
+            print $2
+            exit
+        }
+    ' <<<"$cpu_topology"
+}
+
+logical_cpus="$(lscpu_value "CPU(s)")"
+if [[ ! "$logical_cpus" =~ ^[1-9][0-9]*$ ]]; then
+    logical_cpus="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+fi
+cpu_sockets="$(lscpu_value "Socket(s)")"
+[[ "$cpu_sockets" =~ ^[1-9][0-9]*$ ]] || cpu_sockets=1
+cores_per_socket="$(lscpu_value "Core(s) per socket")"
+[[ "$cores_per_socket" =~ ^[1-9][0-9]*$ ]] || cores_per_socket="$logical_cpus"
+threads_per_core="$(lscpu_value "Thread(s) per core")"
+[[ "$threads_per_core" =~ ^[1-9][0-9]*$ ]] || threads_per_core=1
+physical_cores=$((cpu_sockets * cores_per_socket))
+
 root="$(normalize_path "$(cd "$(dirname "$0")/.." && pwd)")"
 output_dir="${HYPERLIGHT_DEMO_OUTPUT:-$root/demo-output}"
 demo_pid=""
 upstream_pid=""
 verbose=false
 capability_proof_ran=false
+benchmark_requests="${HYPERLIGHT_BENCHMARK_REQUESTS:-$((logical_cpus * 100))}"
+benchmark_concurrency="${HYPERLIGHT_BENCHMARK_CONCURRENCY:-$logical_cpus}"
+benchmark_vms="${HYPERLIGHT_BENCHMARK_VMS:-$logical_cpus}"
+benchmark_pool_vms="${HYPERLIGHT_BENCHMARK_POOL_VMS:-$((logical_cpus + physical_cores))}"
 go_bin="${GOBIN:-}"
 if [[ -z "$go_bin" ]] && command -v go >/dev/null; then
     go_bin="$(go env GOBIN 2>/dev/null || true)"
@@ -98,6 +126,13 @@ Options:
   --describe NAME   Render one demo's narration without running
   --clear           Remove this checkout's generated demo output and exit
   --output-dir DIR  Override the output directory
+  --benchmark-requests N
+                    Total requests (default: 100 x detected CPU(s))
+  --benchmark-concurrency N
+                    Concurrent hey requests (default: detected CPU(s))
+  --benchmark-vms N Concurrent request VMs (default: detected CPU(s))
+  --benchmark-pool-vms N
+                    Prewarmed inventory (default: CPU(s) + physical cores)
   --verbose         Stream raw command output as well as saving it
   -h, --help        Show this help
 EOF
@@ -175,8 +210,8 @@ action() {
         websocket) echo "Open an allowed WebSocket, exchange messages, then exceed the message limit." ;;
         web-apis) echo "Call the timer, stream, handler, MessagePort, and fresh-state routes." ;;
         fetch) echo "Fetch one declared loopback endpoint and probe blocked network targets." ;;
-        benchmark-on-demand) echo "Send 320 requests, with up to 32 running at once, while VMs are created as needed." ;;
-        benchmark-prewarmed) echo "Send the same requests using ready VMs and watch replacements being prepared." ;;
+        benchmark-on-demand) echo "Send $benchmark_requests requests, with up to $benchmark_concurrency requests and $benchmark_vms VMs running at once, while VMs are created as needed." ;;
+        benchmark-prewarmed) echo "Send $benchmark_requests requests, with up to $benchmark_concurrency requests and $benchmark_vms VMs running at once, using a ready inventory of $benchmark_pool_vms VMs." ;;
         *) return 1 ;;
     esac
 }
@@ -272,11 +307,11 @@ result_lines() {
             echo "EXPECTED DENIAL: Other hosts, ports, schemes, private ranges, and redirect following were blocked."
             ;;
         benchmark-on-demand)
-            echo "RESULT: All 320 requests succeeded."
+            echo "RESULT: All $benchmark_requests requests succeeded."
             echo "RESULT: After the final response, no requests were running or waiting and cleanup was complete."
             ;;
         benchmark-prewarmed)
-            echo "RESULT: All 320 requests succeeded."
+            echo "RESULT: All $benchmark_requests requests succeeded."
             echo "RESULT: The demo showed how many ready VMs remained and whether replacements were being prepared."
             ;;
         *) return 1 ;;
@@ -594,7 +629,12 @@ print_demo_evidence() {
         benchmark-on-demand|benchmark-prewarmed)
             local mode="${demo#benchmark-}"
             local benchmark_dir="$output_dir/benchmark-$mode"
-            evidence_row "Requests" "320 / 320 HTTP 200"
+            evidence_row "Requests" "$benchmark_requests / $benchmark_requests HTTP 200"
+            evidence_row "Concurrency" "$benchmark_concurrency requests / $benchmark_vms VMs"
+            evidence_row "CPU topology" "$logical_cpus logical / $physical_cores physical / $threads_per_core threads per core"
+            if [[ "$mode" == prewarmed ]]; then
+                evidence_row "Configured pool" "$benchmark_pool_vms ready VMs"
+            fi
             evidence_row "Throughput" "$(grep -m1 'Requests/sec:' "$benchmark_dir/hey.txt" | xargs)"
             evidence_row "Mean latency" "$(grep -m1 'Average:' "$benchmark_dir/hey.txt" | xargs)"
             evidence_row "Restore mode" "$(jq -r '.restore_mode' "$benchmark_dir/pool-status.json")"
@@ -602,6 +642,8 @@ print_demo_evidence() {
             if [[ "$mode" == prewarmed ]]; then
                 evidence_row "Warm inventory" "$(jq -r '"ready=\(.prewarmed_ready)/\(.prewarmed_inventory), replenishing=\(.prewarmed_replenishing)"' "$benchmark_dir/pool-status.json")"
             fi
+            printf '\n%bLSCPU OUTPUT%b\n\n' "$c_bold$c_green" "$c_reset"
+            sed 's/^/  /' "$benchmark_dir/lscpu.txt"
             printf '\n%bHEY OUTPUT%b\n\n' "$c_bold$c_green" "$c_reset"
             sed 's/^/  /' "$benchmark_dir/hey.txt"
             ;;
@@ -745,7 +787,7 @@ require_runtime() {
             exit 2
         }
     done
-    for required in cargo curl docker hey jq python3 sha256sum sqlite3; do
+    for required in cargo curl docker hey jq lscpu python3 sha256sum sqlite3; do
         command -v "$required" >/dev/null || {
             echo "missing required command: $required" >&2
             exit 2
@@ -1222,29 +1264,39 @@ wait_for_pool_quiescence() {
 run_benchmark() {
     local mode="$1"
     local dir="$output_dir/benchmark-$mode"
+    local queue_capacity=256
+    local ready_high_watermark="$benchmark_pool_vms"
+    local ready_low_watermark
+    ((benchmark_concurrency > queue_capacity)) &&
+        queue_capacity="$benchmark_concurrency"
+    ready_low_watermark=$((ready_high_watermark / 2))
+    ((ready_low_watermark > 1)) || ready_low_watermark=2
     local args=(
         --bundle "$root/examples/workerd-bundles/workerd-pool-benchmark.json"
         --scratch-mb 384
         --request-timeout-ms 30000
         --restore-mode "$mode"
-        --max-concurrent-sandboxes 32
-        --queue-capacity 256
+        --max-concurrent-sandboxes "$benchmark_vms"
+        --queue-capacity "$queue_capacity"
         --profile-log-every 64
     )
     if [[ "$mode" == prewarmed ]]; then
         args+=(
-            --prewarmed-sandboxes 48
+            --prewarmed-sandboxes "$benchmark_pool_vms"
             --max-concurrent-restores 1
             --warm-floor 1
-            --ready-low-watermark 16
-            --ready-high-watermark 32
+            --ready-low-watermark "$ready_low_watermark"
+            --ready-high-watermark "$ready_high_watermark"
             --max-replenish-batch 2
         )
     fi
     mkdir -p "$dir"
+    LC_ALL=C lscpu |
+        grep -E '^(CPU\(s\)|Socket|Core|Thread)' >"$dir/lscpu.txt"
     start_server "$dir/server.log" "${args[@]}"
-    hey -n 320 -c 32 http://127.0.0.1:8787/sync | tee "$dir/hey.txt"
-    grep -Eq '\[200\][[:space:]]+320 responses' "$dir/hey.txt"
+    hey -n "$benchmark_requests" -c "$benchmark_concurrency" \
+        http://127.0.0.1:8787/sync | tee "$dir/hey.txt"
+    grep -Eq "\\[200\\][[:space:]]+${benchmark_requests} responses" "$dir/hey.txt"
     wait_for_pool_quiescence "$mode" "$dir/pool-status.json"
     jq '{
             restore_mode,
@@ -1385,6 +1437,38 @@ while (($#)); do
             output_dir="$2"
             shift 2
             ;;
+        --benchmark-requests)
+            (($# >= 2)) || {
+                echo "--benchmark-requests requires a value" >&2
+                exit 2
+            }
+            benchmark_requests="$2"
+            shift 2
+            ;;
+        --benchmark-concurrency)
+            (($# >= 2)) || {
+                echo "--benchmark-concurrency requires a value" >&2
+                exit 2
+            }
+            benchmark_concurrency="$2"
+            shift 2
+            ;;
+        --benchmark-vms)
+            (($# >= 2)) || {
+                echo "--benchmark-vms requires a value" >&2
+                exit 2
+            }
+            benchmark_vms="$2"
+            shift 2
+            ;;
+        --benchmark-pool-vms)
+            (($# >= 2)) || {
+                echo "--benchmark-pool-vms requires a value" >&2
+                exit 2
+            }
+            benchmark_pool_vms="$2"
+            shift 2
+            ;;
         --verbose)
             verbose=true
             shift
@@ -1400,6 +1484,26 @@ while (($#)); do
             ;;
     esac
 done
+
+for benchmark_value in \
+    benchmark_requests \
+    benchmark_concurrency \
+    benchmark_vms \
+    benchmark_pool_vms; do
+    if [[ ! "${!benchmark_value}" =~ ^[1-9][0-9]*$ ]]; then
+        printf '%s must be a positive integer, got %q\n' \
+            "$benchmark_value" "${!benchmark_value}" >&2
+        exit 2
+    fi
+done
+if ((benchmark_concurrency > benchmark_requests)); then
+    echo "--benchmark-concurrency cannot exceed --benchmark-requests" >&2
+    exit 2
+fi
+if ((benchmark_pool_vms < 2)); then
+    echo "--benchmark-pool-vms must be at least 2" >&2
+    exit 2
+fi
 
 if [[ "$mode" == one || "$mode" == describe ]] &&
     [[ ! " ${demos[*]} " =~ " $selected " ]]; then
