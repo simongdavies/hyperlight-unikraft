@@ -16,6 +16,8 @@ mod extensions;
 mod fetch;
 mod pool;
 mod protocol;
+mod resident;
+mod resident_pool;
 mod sandbox;
 mod snapshot;
 mod timer;
@@ -30,6 +32,10 @@ pub use pool::{
     WorkerRequestPool,
 };
 pub use protocol::*;
+pub use resident::{ResidentPolicy, ResidentWorkerSandbox};
+pub use resident_pool::{
+    ResidentHandle, ResidentPoolConfig, ResidentPoolStatus, ResidentWorkerPool,
+};
 pub use sandbox::{
     ExecutionProfile, InitializationFailure, InitializationProfile, StorageBinding, StoragePolicy,
     WorkerCapabilityPolicy, WorkerVersionSandbox,
