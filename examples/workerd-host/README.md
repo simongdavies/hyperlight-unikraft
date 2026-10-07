@@ -50,6 +50,7 @@ hluk workerd-host --config apps.json --bind 127.0.0.1:8080
       },
       "bundle_path": "/abs/path/storefront-bundle.json",
       "scratch_memory_mb": 384,
+      "snapshot_dir": null,
       "execute_timeout_secs": 30,
       "capability_policy": {},
       "pool": {
@@ -75,6 +76,17 @@ hluk workerd-host --config apps.json --bind 127.0.0.1:8080
   full match wins; a config where two routes could match the same
   `(hostname, path)` pair fails to load (exit code 2) rather than picking
   one silently.
+- `snapshot_dir`: optional path to a directory produced by
+  `hluk workerd-prewarm-snapshot` (bundle loaded, guest JS initialized, then
+  snapshotted). When set, every VM for this app is restored from that
+  snapshot instead of booting `bundle_path` fresh, and `scratch_memory_mb`
+  is ignored (the snapshot's own memory layout applies). It must have been
+  produced from the same `bundle_path`/`rootfs_path`/`executor_path`/
+  `capability_policy`; a mismatch fails config load (exit code 2). This
+  skips the guest boot-and-init step only (tens of milliseconds); it does
+  **not** reduce the cost of creating the underlying Hyperlight/KVM VM
+  itself, which is the dominant per-VM cost and is paid identically either
+  way. See "Prewarmed snapshots" below for measured numbers.
 - `capability_policy`: reserved for future per-app capability tuning; today
   only `{}` (deny-all fetch/storage, matching every other `hluk` Workerd
   entry point) is supported.
@@ -92,6 +104,31 @@ hluk workerd-host --config apps.json --bind 127.0.0.1:8080
   that connection are guaranteed to observe the same VM's state. A
   `disposable` app ignores `connection_affinity` (disposable VMs are never
   reused across requests, by design).
+
+## Prewarmed snapshots (`hluk workerd-prewarm-snapshot`)
+
+```sh
+hluk workerd-prewarm-snapshot \
+  --rootfs-path rootfs.img --executor-path executor \
+  --bundle-path storefront-bundle.json --scratch-memory-mb 384 \
+  --out-dir ./storefront-snapshot
+```
+
+This boots one VM from `--bundle-path`, runs guest JS initialization, saves
+the result to `--out-dir`, and exits. Point one or more apps' `snapshot_dir`
+at that directory (see above) to restore every VM for those apps from the
+snapshot instead of booting the bundle fresh each time.
+
+**What this does and does not help with:** restoring from a snapshot skips
+only the guest boot-and-init step, which measured well under 100ms. The
+dominant per-VM cost — creating the underlying Hyperlight/KVM VM itself via
+`WorkerVersionSandbox::restore()` — is paid identically whether the source
+image is a cold boot or a saved snapshot. In measured comparisons (single
+VM, repeated), prewarming shaved only a few percent off total time-to-ready.
+It does **not** address large-`--benchmark-apps` setup time in
+`benchmark-resident` (dominated by per-app VM creation, not guest init), and
+should not be used as a scaling optimization for that scenario. It remains
+useful for apps whose guest-side init work (not VM creation) is expensive.
 
 ## Orchestrator contract
 

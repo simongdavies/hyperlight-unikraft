@@ -520,6 +520,17 @@ sets a small `max_requests_per_vm` to demonstrate retirement:
   recycling, so `max_requests_per_vm`/`max_lifetime_secs` do not apply to
   it at all.
 
+At large `--benchmark-apps` counts, `timing.setup_seconds` is dominated by
+per-app VM creation (`WorkerVersionSandbox::restore()`), not guest boot/init
+work. `harness/app_config` can pass every app the same
+`hluk workerd-prewarm-snapshot` output via `snapshot_dir` (see
+[`examples/workerd-host/README.md`](../examples/workerd-host/README.md#prewarmed-snapshots-hluk-workerd-prewarm-snapshot)),
+but doing so does **not** meaningfully reduce `setup_seconds` at scale:
+measured restores from a prewarmed snapshot cost essentially the same as a
+cold boot (the skipped guest-init step is a small fraction of the total).
+There is currently no mechanism in this repo that avoids paying VM-creation
+cost per app.
+
 ### `--benchmark-apps`, `--benchmark-load-requests`, and `--benchmark-concurrency` scope
 
 `--benchmark-apps` controls how many independent or routed apps the load
