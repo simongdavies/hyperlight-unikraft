@@ -876,6 +876,48 @@ impl WorkerVersionSandbox {
         })
     }
 
+    /// Skip the expensive boot+init+snapshot sequence
+    /// ([`initialize_with_policy`](Self::initialize_with_policy)) by
+    /// restoring directly from an on-disk snapshot a prior call already
+    /// built and saved (via [`Self::snapshot`]'s
+    /// [`VerifiedSnapshot::save`]) — the same save/open/restore round trip
+    /// [`tests/workerd_sandbox.rs`] already exercises, now reachable from a
+    /// `bundle_path`/`rootfs`/`executor`/policy tuple instead of a
+    /// caller-supplied [`VerifiedSnapshot`].
+    ///
+    /// `bundle`/`rootfs`/`executor`/`policy` must be the exact artifacts
+    /// the snapshot at `snapshot_dir` was built from:
+    /// [`VerifiedSnapshot::open`] hashes and compares every one of them
+    /// (see [`SnapshotBinding::validate`]) and fails closed on any
+    /// mismatch, so a stale or wrong snapshot directory is rejected rather
+    /// than silently restoring the wrong code. `policy`'s `broker_runtime`
+    /// and Workerd `bindings` are not supported here (matching every other
+    /// `from_verified_snapshot*` constructor): a policy carrying either is
+    /// rejected up front rather than silently dropped.
+    pub fn initialize_from_snapshot_dir(
+        snapshot_dir: impl AsRef<Path>,
+        bundle: &WorkerBundle,
+        rootfs: impl AsRef<Path>,
+        executor: impl AsRef<Path>,
+        policy: WorkerCapabilityPolicy,
+    ) -> Result<Self> {
+        if policy.broker_runtime.is_some() || !policy.bindings.is_empty() {
+            return Err(Error::Snapshot(
+                "snapshot_dir restore does not support a broker runtime or Workerd bindings".into(),
+            ));
+        }
+        let policy_sha256 = policy.sha256();
+        let expected =
+            SnapshotBinding::from_artifacts_with_policy(bundle, rootfs, executor, policy_sha256)?;
+        let image = VerifiedSnapshot::open(snapshot_dir, &expected)?;
+        Self::from_verified_snapshot_with_storage(
+            image,
+            policy.fetch_broker,
+            policy.timer_limits,
+            policy.storage_policy,
+        )
+    }
+
     pub fn snapshot(&self) -> &VerifiedSnapshot {
         &self.image
     }

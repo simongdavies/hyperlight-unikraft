@@ -6,8 +6,9 @@
 
 use hyperlight_unikraft::workerd::{
     AppConfig, AppPoolConfig, AppRegistry, AppRegistryError, AppRoute, ConnectionAffinity,
-    DisposablePoolConfig, HostConfig, PROTOCOL_VERSION, RequestEnvelope, ResidentPoolConfigJson,
-    WorkerBundle, WorkerCapabilityPolicyConfig, WorkerVersionId,
+    DisposablePoolConfig, FetchBroker, HostConfig, PROTOCOL_VERSION, RequestEnvelope,
+    ResidentPoolConfigJson, StoragePolicy, TimerLimits, WorkerBundle, WorkerCapabilityPolicy,
+    WorkerCapabilityPolicyConfig, WorkerVersionId, WorkerVersionSandbox,
 };
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -74,6 +75,22 @@ fn disposable_app(app_id: &str, hostname: &str, bundle_path: PathBuf) -> AppConf
             queue_capacity: 2,
         }),
         connection_affinity: ConnectionAffinity::None,
+        snapshot_dir: None,
+    }
+}
+
+/// Same shape as [`disposable_app`], but configured to restore the worker
+/// from a prebuilt `snapshot_dir` instead of booting `bundle_path` fresh
+/// (see `WorkerVersionSandbox::initialize_from_snapshot_dir`).
+fn disposable_app_from_snapshot(
+    app_id: &str,
+    hostname: &str,
+    bundle_path: PathBuf,
+    snapshot_dir: PathBuf,
+) -> AppConfig {
+    AppConfig {
+        snapshot_dir: Some(snapshot_dir),
+        ..disposable_app(app_id, hostname, bundle_path)
     }
 }
 
@@ -95,6 +112,7 @@ fn resident_app(app_id: &str, hostname: &str, bundle_path: PathBuf) -> AppConfig
             max_lifetime_secs: None,
         }),
         connection_affinity: ConnectionAffinity::None,
+        snapshot_dir: None,
     }
 }
 
@@ -215,4 +233,97 @@ fn host_config_round_trips_through_json() {
     std::fs::remove_file(&path).ok();
     assert_eq!(loaded.apps.len(), 1);
     assert_eq!(loaded.apps[0].route.app_id, "hello");
+}
+
+/// `AppConfig.capability_policy` is always `WorkerCapabilityPolicyConfig {}`
+/// today (see `.build()` above), which always builds the same deny-all
+/// `WorkerCapabilityPolicy` this helper uses, so a snapshot saved here binds
+/// to exactly the policy `AppRegistry::from_host_config` will build.
+fn denied_policy() -> WorkerCapabilityPolicy {
+    WorkerCapabilityPolicy::new(
+        FetchBroker::denied(),
+        TimerLimits::default(),
+        StoragePolicy::denied(),
+    )
+}
+
+#[test]
+fn disposable_app_restores_from_snapshot_dir_instead_of_booting_fresh() {
+    #[cfg(windows)]
+    hyperlight_unikraft::configure_surrogates(4);
+    let (rootfs, executor) = artifacts();
+    let tmp = tempfile::tempdir().unwrap();
+    let bundle_path = write_script_bundle(tmp.path(), "snapshot-app.json", "snapshot-app-v1");
+
+    let bundle = WorkerBundle::from_path(&bundle_path).unwrap();
+    let prebuilt = WorkerVersionSandbox::initialize_with_policy(
+        bundle,
+        &rootfs,
+        &executor,
+        64,
+        Duration::from_secs(10),
+        denied_policy(),
+    )
+    .unwrap();
+    let snapshot_dir = tmp.path().join("snapshot-app.snapshot");
+    prebuilt.snapshot().save(&snapshot_dir).unwrap();
+    drop(prebuilt);
+
+    let config = HostConfig {
+        rootfs_path: rootfs,
+        executor_path: executor,
+        apps: vec![disposable_app_from_snapshot(
+            "snapshot-app",
+            "snapshot.test",
+            bundle_path,
+            snapshot_dir,
+        )],
+    };
+    let registry = AppRegistry::from_host_config(config).unwrap();
+    let response = submit_and_wait(&registry, "snapshot.test", "/", "snapshot-1").unwrap();
+    assert_eq!(response.status, 200);
+}
+
+#[test]
+fn snapshot_dir_mismatched_with_bundle_path_is_rejected_before_serving() {
+    #[cfg(windows)]
+    hyperlight_unikraft::configure_surrogates(4);
+    let (rootfs, executor) = artifacts();
+    let tmp = tempfile::tempdir().unwrap();
+    let saved_bundle_path = write_script_bundle(tmp.path(), "saved.json", "saved-app-v1");
+    let other_bundle_path = write_script_bundle(tmp.path(), "other.json", "other-app-v1");
+
+    let saved_bundle = WorkerBundle::from_path(&saved_bundle_path).unwrap();
+    let prebuilt = WorkerVersionSandbox::initialize_with_policy(
+        saved_bundle,
+        &rootfs,
+        &executor,
+        64,
+        Duration::from_secs(10),
+        denied_policy(),
+    )
+    .unwrap();
+    let snapshot_dir = tmp.path().join("saved.snapshot");
+    prebuilt.snapshot().save(&snapshot_dir).unwrap();
+    drop(prebuilt);
+
+    // `other_bundle_path` has a different worker version/source than the
+    // bundle the snapshot at `snapshot_dir` was built from: this must fail
+    // closed (reject the whole registry) rather than silently restoring the
+    // wrong code under the "other-app" route.
+    let config = HostConfig {
+        rootfs_path: rootfs,
+        executor_path: executor,
+        apps: vec![disposable_app_from_snapshot(
+            "other-app",
+            "other.test",
+            other_bundle_path,
+            snapshot_dir,
+        )],
+    };
+    match AppRegistry::from_host_config(config) {
+        Ok(_) => panic!("expected snapshot/bundle mismatch rejection"),
+        Err(AppRegistryError::WorkerInit { app_id, .. }) => assert_eq!(app_id, "other-app"),
+        Err(other) => panic!("unexpected error: {other}"),
+    }
 }

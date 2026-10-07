@@ -81,6 +81,7 @@ fn disposable_app(app_id: &str, hostname: &str, bundle_path: PathBuf) -> AppConf
             queue_capacity: 2,
         }),
         connection_affinity: ConnectionAffinity::None,
+        snapshot_dir: None,
     }
 }
 

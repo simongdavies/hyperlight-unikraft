@@ -82,6 +82,7 @@ fn resident_app(
             max_lifetime_secs: None,
         }),
         connection_affinity: affinity,
+        snapshot_dir: None,
     }
 }
 

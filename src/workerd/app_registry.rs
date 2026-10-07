@@ -174,6 +174,21 @@ pub struct AppConfig {
     pub pool: AppPoolConfig,
     #[serde(default)]
     pub connection_affinity: ConnectionAffinity,
+    /// Optional prebuilt, on-disk [`super::VerifiedSnapshot`] directory
+    /// (as written by a prior `.snapshot().save(dir)`, or the `hluk
+    /// workerd-host --prewarm-snapshot` one-shot command). When set, this
+    /// app's worker is restored directly from it
+    /// ([`super::WorkerVersionSandbox::initialize_from_snapshot_dir`]),
+    /// skipping the boot+init+snapshot sequence entirely — the dominant
+    /// per-app startup cost at large `--benchmark-apps` counts. Only safe
+    /// when `bundle_path`/the shared `rootfs_path`/`executor_path`/
+    /// `capability_policy` are *exactly* what the snapshot was built from:
+    /// a mismatch is rejected (fails closed), never silently restores the
+    /// wrong code — see [`super::VerifiedSnapshot::open`]. Omitted/`None`
+    /// (the default) keeps today's fresh-boot-every-app behavior
+    /// unchanged.
+    #[serde(default)]
+    pub snapshot_dir: Option<PathBuf>,
 }
 
 /// Top-level multi-app host configuration. `rootfs_path`/`executor_path`
@@ -415,20 +430,36 @@ impl AppRegistry {
                                     }
                                 })?;
                             let policy = app.capability_policy.build();
-                            let worker = WorkerVersionSandbox::initialize_with_policy(
-                                bundle,
-                                rootfs_path,
-                                executor_path,
-                                app.scratch_memory_mb,
-                                Duration::from_secs(app.execute_timeout_secs),
-                                policy,
-                            )
-                            .map_err(|source| {
-                                AppRegistryError::WorkerInit {
-                                    app_id: app_id.clone(),
-                                    source,
-                                }
-                            })?;
+                            let worker = if let Some(snapshot_dir) = &app.snapshot_dir {
+                                WorkerVersionSandbox::initialize_from_snapshot_dir(
+                                    snapshot_dir,
+                                    &bundle,
+                                    rootfs_path,
+                                    executor_path,
+                                    policy,
+                                )
+                                .map_err(|source| {
+                                    AppRegistryError::WorkerInit {
+                                        app_id: app_id.clone(),
+                                        source,
+                                    }
+                                })?
+                            } else {
+                                WorkerVersionSandbox::initialize_with_policy(
+                                    bundle,
+                                    rootfs_path,
+                                    executor_path,
+                                    app.scratch_memory_mb,
+                                    Duration::from_secs(app.execute_timeout_secs),
+                                    policy,
+                                )
+                                .map_err(|source| {
+                                    AppRegistryError::WorkerInit {
+                                        app_id: app_id.clone(),
+                                        source,
+                                    }
+                                })?
+                            };
                             let handle = match app.pool {
                                 AppPoolConfig::Disposable(pool_config) => {
                                     let pool = WorkerRequestPool::with_restore_mode(
