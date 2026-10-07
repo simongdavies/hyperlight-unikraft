@@ -597,6 +597,9 @@ previously dominated wall-clock time. `--benchmark-load-driver` has no
 effect on `benchmark-multi-app` or `benchmark-orchestrator-contract`,
 which always use `hey`; `require_runtime` only requires the `vegeta`
 binary on `PATH` when `--benchmark-load-driver vegeta` is selected.
+`tools/setup-workerd-demo.sh --install-deps` `go install`s `vegeta`
+automatically (same as it already does for `hey`), so a normal setup
+run makes both drivers available without any extra steps.
 
 Under vegeta, per-app results are synthesized back into the exact same
 `hey`-report-format text file (`Total:`/`Average:`/`Requests/sec:`/

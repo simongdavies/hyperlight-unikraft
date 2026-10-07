@@ -149,8 +149,10 @@ benchmark_setup_parallel_explicit=false
 # every app's URL from one shared targets file instead, eliminating the
 # N-process fork/barrier/progress overhead entirely for the load phase
 # (setup/teardown, which still forks one `hluk workerd-host` per app,
-# are unaffected). Requires the `vegeta` binary on PATH. Left unset here:
-# defaults to "hey" (today's behavior, unchanged) once parsing finishes.
+# are unaffected). Requires the `vegeta` binary on PATH (installed by
+# `tools/setup-workerd-demo.sh --install-deps`, same as `hey`). Left
+# unset here: defaults to "hey" (today's behavior, unchanged) once
+# parsing finishes.
 benchmark_load_driver="${HYPERLIGHT_BENCHMARK_LOAD_DRIVER:-hey}"
 go_bin="${GOBIN:-}"
 if [[ -z "$go_bin" ]] && command -v go >/dev/null; then
@@ -277,9 +279,10 @@ Options:
                     one shared targets file instead, avoiding the N-process
                     fork/barrier/progress overhead of one hey process per
                     app at high --benchmark-apps counts. Requires the
-                    vegeta binary on PATH. benchmark-multi-app and
-                    benchmark-orchestrator-contract ignore this and always
-                    use hey
+                    vegeta binary on PATH (tools/setup-workerd-demo.sh
+                    --install-deps go-installs it, same as hey).
+                    benchmark-multi-app and benchmark-orchestrator-contract
+                    ignore this and always use hey
   --verbose         Stream raw command output as well as saving it
   -h, --help        Show this help
 EOF

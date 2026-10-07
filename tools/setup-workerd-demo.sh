@@ -206,6 +206,13 @@ fi
 if ! command -v hey >/dev/null; then
     go install github.com/rakyll/hey@v0.1.4
 fi
+# Only required by tools/hyperlight-demo's benchmark-resident
+# --benchmark-load-driver vegeta (default remains "hey"; see its
+# require_runtime/launch_vegeta_load for the json schemas this version
+# was validated against).
+if ! command -v vegeta >/dev/null; then
+    go install github.com/tsenart/vegeta/v12@v12.13.0
+fi
 if ! command -v wasm-tools >/dev/null ||
     [[ "$(wasm-tools --version)" != "wasm-tools 1.252.0" ]]; then
     cargo +"$RUST_VERSION" install wasm-tools --version 1.252.0 --locked
