@@ -653,7 +653,7 @@ is always `"per_wave"` when timing data is present, to make this
 single-wave-only guarantee explicit rather than implying every app
 launched simultaneously.
 
-`summary.json`'s `aggregate` object reports three different throughput
+`summary.json`'s `aggregate` object reports four different throughput
 numbers because of that wave behavior:
 
 - `sum_of_app_requests_per_sec` adds up each app's own independently
@@ -682,11 +682,29 @@ numbers because of that wave behavior:
   inter-wave orchestration overhead, but NOT what "end to end" means
   here. `end_to_end_requests_per_sec` and `active_wave_requests_per_sec`
   are equal when `hey_waves == 1` (no inter-wave gap exists).
+- `hey_self_measured_requests_per_sec` is computed ENTIRELY from each
+  `hey` process's own self-reported output — no orchestrator wall-clock
+  timestamps involved at all. It divides `aggregate.actual_successful_
+  responses` (the sum, across apps, of each app's own "Status code
+  distribution: `[200] N responses`" count — requests `hey` itself
+  confirmed got a 200, not the configured/requested count) by
+  `aggregate.max_app_hey_total_seconds` (the largest of each app's own
+  self-reported `Summary: Total: X secs` duration — the straggler app's
+  own measured span). Since every app in a wave is released from the
+  same barrier at effectively the same instant, this closely tracks
+  `active_wave_requests_per_sec`/`end_to_end_requests_per_sec`; a large
+  divergence from those orchestrator-measured numbers is worth
+  investigating (clock skew, barrier-release jitter, a wall-clock
+  instrumentation bug), while small differences are expected since
+  `hey`'s own clock and this script's monotonic-clock reads are
+  independent measurements of almost (but not exactly) the same span.
 
 Both `end_to_end_requests_per_sec` and `active_wave_requests_per_sec` are
 `null` when timing/wave data is unavailable for a phase (e.g.
 `benchmark-orchestrator-contract`'s phase summaries do not currently
-measure them).
+measure them). `hey_self_measured_requests_per_sec` (and
+`max_app_hey_total_seconds`) are `null` whenever no app reported any
+successful response, independent of whether timing/wave data is present.
 
 ## Stop and clean up
 

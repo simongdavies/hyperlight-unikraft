@@ -2546,25 +2546,39 @@ write_collected_hey_report() {
 #
 # Parses one `hey` text report into a per-app JSON summary object, using
 # the requests/concurrency the caller already configured rather than
-# re-deriving them from the report. Missing fields (e.g. a skipped
+# re-deriving them from the report. Also extracts hey's own self-measured
+# `Total:` duration and its actual (not configured/requested) count of
+# [200] responses from the "Status code distribution" section: these let
+# write_benchmark_summary compute an aggregate throughput number derived
+# purely from hey's own per-process output (real observed successes over
+# the slowest app's own observed duration), independent of this script's
+# own wall-clock barrier instrumentation (wave_active_seconds/
+# load_wall_seconds) -- a cross-check against, not a replacement for,
+# those orchestrator-measured numbers. Missing fields (e.g. a skipped
 # zero-request job) default to 0.
 build_app_summary() {
     local app_id="$1" requests="$2" concurrency="$3" hey_file="$4"
-    local rps avg_s
+    local rps avg_s total_s successes
     rps="$(grep -m1 'Requests/sec:' "$hey_file" | awk '{print $2}')"
     avg_s="$(grep -m1 '  Average:' "$hey_file" | awk '{print $2}')"
+    total_s="$(grep -m1 '  Total:' "$hey_file" | awk '{print $2}')"
+    successes="$(grep -oE '\[200\][[:space:]]+[0-9]+' "$hey_file" | grep -oE '[0-9]+$')"
     jq -n \
         --arg app_id "$app_id" \
         --argjson requests "$requests" \
         --argjson concurrency "$concurrency" \
         --argjson rps "${rps:-0}" \
         --argjson avg_s "${avg_s:-0}" \
+        --argjson total_s "${total_s:-0}" \
+        --argjson successes "${successes:-0}" \
         '{
             app_id: $app_id,
             requests: $requests,
             concurrency: $concurrency,
             requests_per_sec: $rps,
-            average_latency_ms: ($avg_s * 1000)
+            average_latency_ms: ($avg_s * 1000),
+            hey_total_seconds: $total_s,
+            successful_responses: $successes
         }'
 }
 
@@ -2610,10 +2624,22 @@ seconds_between() {
 # host stdout/stderr untouched. Only written to the file: callers that
 # also want the line on the terminal (e.g. a failure) should echo/printf
 # it themselves in addition to calling this.
+#
+# Uses bash's own `printf '%(FORMAT)T'` time-formatting builtin (bash
+# 4.2+; this script already requires 4.3+ for namerefs) instead of
+# shelling out to `date`: this function is called at least twice per app
+# in launch_hey_jobs's hot path (queued + finished), so at hundreds/
+# thousands of apps a per-call `date` fork is not free -- measured at
+# ~4.4ms/call via external `date` vs ~0.06ms/call via this builtin (a
+# ~75x difference), i.e. real, attributable seconds of the gap between
+# timing.load_seconds (whole-phase wall clock, includes this logging
+# overhead) and timing.wave_active_seconds (pure barrier-release-to-
+# finish request-serving time only, see launch_hey_jobs/
+# make_phase_timing's docstrings) at the scale this script targets.
 log_line() {
     local logfile="$1"
     shift
-    printf '[%s] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" >>"$logfile"
+    printf '[%(%Y-%m-%dT%H:%M:%S%z)T] %s\n' -1 "$*" >>"$logfile"
 }
 
 # print_progress_bar CURRENT TOTAL LABEL ELAPSED_SECONDS
@@ -2753,6 +2779,25 @@ make_phase_timing() {
 # Both are null when TIMING_JSON/MAX_PARALLEL are not supplied
 # (orchestrator-contract's phase summaries do not currently measure
 # this).
+#
+# aggregate.hey_self_measured_requests_per_sec is a THIRD, independent
+# cross-check computed ENTIRELY from each app's own hey process output --
+# no orchestrator wall-clock timestamps involved at all. It divides
+# actual_successful_responses (the sum, across apps, of each app's own
+# "Status code distribution: [200] N responses" count -- requests hey
+# itself confirmed it received a 200 for, not the configured/requested
+# count) by max_app_hey_total_seconds (the largest of each app's own
+# self-reported "Summary: Total: X secs" duration -- the straggler app's
+# own measured wall-clock span). Since every app in a wave is released
+# from the same barrier at effectively the same instant, this should
+# closely track active_wave_requests_per_sec/end_to_end_requests_per_sec;
+# a large divergence between this and those orchestrator-measured numbers
+# is a signal worth investigating (e.g. clock skew, barrier-release
+# jitter, or a bug in the wall-clock instrumentation), whereas small
+# differences are expected since hey's own clock and this script's
+# monotonic-clock reads are independent measurements of almost (but not
+# exactly) the same span. Both new aggregate fields are 0/null when no
+# app reported any successful response.
 write_benchmark_summary() {
     local scenario="$1" per_app_json="$2" timing_json="${3:-null}"
     local max_parallel="${4:-0}" output="$5"
@@ -2774,6 +2819,8 @@ write_benchmark_summary() {
         --argjson max_parallel "$max_parallel" '
         ($apps_file[0]) as $apps |
         ($apps | map(.requests) | add) as $total_requests |
+        ($apps | map(.successful_responses // 0) | add) as $actual_successes |
+        ($apps | map(.hey_total_seconds // 0) | max) as $max_hey_total_seconds |
         {
             scenario: $scenario,
             apps: $apps,
@@ -2791,6 +2838,12 @@ write_benchmark_summary() {
                         ($total_requests / $timing.wave_active_seconds)
                     else null end
                 ),
+                hey_self_measured_requests_per_sec: (
+                    if $max_hey_total_seconds > 0 then ($actual_successes / $max_hey_total_seconds)
+                    else null end
+                ),
+                actual_successful_responses: $actual_successes,
+                max_app_hey_total_seconds: (if $max_hey_total_seconds > 0 then $max_hey_total_seconds else null end),
                 weighted_mean_latency_ms: (
                     ($apps | map(.average_latency_ms * .requests) | add) /
                     (if $total_requests > 0 then $total_requests else 1 end)
