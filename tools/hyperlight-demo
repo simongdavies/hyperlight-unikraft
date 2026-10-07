@@ -858,7 +858,8 @@ print_demo_evidence() {
             evidence_row "Apps" "$benchmark_apps independent resident processes"
             evidence_row "Total requests" "$benchmark_load_requests / aggregate concurrency $benchmark_concurrency"
             evidence_row "Sum-of-rates throughput" "$(jq -r '.aggregate.sum_of_app_requests_per_sec' "$dir/summary.json") req/s (sum of each app's own hey rate; overstates true throughput once hey_waves > 1)"
-            evidence_row "End-to-end throughput" "$(jq -r '.aggregate.end_to_end_requests_per_sec' "$dir/summary.json") req/s (total_requests / measured load wall-clock seconds)"
+            evidence_row "End-to-end throughput" "$(jq -r '.aggregate.end_to_end_requests_per_sec' "$dir/summary.json") req/s (total_requests / sum of each wave's barrier-release-to-finish seconds; excludes all forking/spawn overhead and inter-wave gaps)"
+            evidence_row "Load-wall throughput" "$(jq -r '.aggregate.load_wall_requests_per_sec' "$dir/summary.json") req/s (total_requests / first-wave-release-to-last-wave-finish seconds; includes inter-wave gaps -- same as end-to-end when hey_waves == 1)"
             evidence_row "Hey waves" "$(jq -r '.aggregate.hey_waves' "$dir/summary.json") (apps=$benchmark_apps, max $(jq -r '.aggregate.max_parallel_hey_jobs' "$dir/summary.json") concurrent hey processes)"
             evidence_row "Phase timing" "$(jq -c '.timing' "$dir/summary.json")"
             evidence_row "Weighted mean latency" "$(jq -r '.aggregate.weighted_mean_latency_ms' "$dir/summary.json") ms"
@@ -883,7 +884,8 @@ print_demo_evidence() {
             evidence_row "Apps" "$benchmark_apps routed apps, one process and port"
             evidence_row "Total requests" "$benchmark_load_requests / aggregate concurrency $benchmark_concurrency"
             evidence_row "Sum-of-rates throughput" "$(jq -r '.aggregate.sum_of_app_requests_per_sec' "$dir/summary.json") req/s (sum of each app's own hey rate; overstates true throughput once hey_waves > 1)"
-            evidence_row "End-to-end throughput" "$(jq -r '.aggregate.end_to_end_requests_per_sec' "$dir/summary.json") req/s (total_requests / measured load wall-clock seconds)"
+            evidence_row "End-to-end throughput" "$(jq -r '.aggregate.end_to_end_requests_per_sec' "$dir/summary.json") req/s (total_requests / sum of each wave's barrier-release-to-finish seconds; excludes all forking/spawn overhead and inter-wave gaps)"
+            evidence_row "Load-wall throughput" "$(jq -r '.aggregate.load_wall_requests_per_sec' "$dir/summary.json") req/s (total_requests / first-wave-release-to-last-wave-finish seconds; includes inter-wave gaps -- same as end-to-end when hey_waves == 1)"
             evidence_row "Hey waves" "$(jq -r '.aggregate.hey_waves' "$dir/summary.json") (apps=$benchmark_apps, max $(jq -r '.aggregate.max_parallel_hey_jobs' "$dir/summary.json") concurrent hey processes)"
             evidence_row "Phase timing" "$(jq -c '.timing' "$dir/summary.json")"
             evidence_row "Status" "$(jq -c '[.[] | {app_id, kind}]' "$dir/status.json")"
@@ -1991,8 +1993,116 @@ self_test() {
     assert_exact_frequency "M=32,N=1000,C=64 exact distribution" 1000 32 "${conc_c64[@]}"
     unset -f assert_exact_frequency
 
+    # Regression guard for the launch_hey_jobs barrier-timing fix: before
+    # this fix, a wave's timestamp was taken BEFORE the per-job forking
+    # loop, so any slowness in forking/spawning N paused `hey` subshells
+    # was silently folded into the reported load duration alongside the
+    # actual request-serving time it was supposed to isolate. The fix
+    # moves the timestamp to immediately before the barrier-release gate
+    # file is created. Prove this with a fake `hey` binary (so this stays
+    # offline -- no real demo process, no network) and a self-test-only
+    # `_LHJ_TEST_PRE_RELEASE_SLEEP` hook that simulates slow pre-release
+    # work: a pre-release delay must NOT show up in the reported
+    # wave_active_seconds even though it does lengthen the function's own
+    # real wall-clock duration, while a post-release delay (the fake
+    # `hey`'s own sleep, standing in for real request-serving time) MUST
+    # show up. Also proves multi-wave accumulation: two waves (forced via
+    # hey_max_parallel_jobs=1) each contribute their own active duration
+    # to the sum, and load_wall_seconds (first-release-to-last-finish)
+    # is at least as large as that sum once an inter-wave gap exists.
+    assert_barrier_timing() {
+        local fake_bin work_dir
+        fake_bin="$(mktemp -d)"
+        work_dir="$(mktemp -d)"
+        cat >"$fake_bin/hey" <<'FAKE_HEY'
+#!/usr/bin/env bash
+# Self-test stub standing in for the real `hey` binary: sleeps for
+# HYPERLIGHT_DEMO_FAKE_HEY_SLEEP seconds (simulating real request-serving
+# time happening strictly after launch_hey_jobs's barrier release), then
+# prints just enough of a real hey report's shape that nothing downstream
+# chokes on a missing field, ignoring all of its own arguments.
+sleep "${HYPERLIGHT_DEMO_FAKE_HEY_SLEEP:-0}"
+cat <<'REPORT'
+
+Summary:
+  Total:        0.0100 secs
+  Average:      0.0050 secs
+  Requests/sec: 100.0000
+
+Status code distribution:
+  [200]  1 responses
+REPORT
+FAKE_HEY
+        chmod +x "$fake_bin/hey"
+
+        # Case 1: a 0.3s delay injected after forking but before the
+        # barrier release must not leak into wave_active_seconds, even
+        # though it does lengthen launch_hey_jobs's own real duration.
+        local -a reqs=(1) concs=(1) urls=("http://example.invalid/") hosts=("")
+        local -a timeouts=(5) outfiles=("$work_dir/pre.txt") statuses
+        local active_pre="" wall_pre="" outer_t0 outer_t1 outer_elapsed
+        outer_t0="$(now_seconds)"
+        PATH="$fake_bin:$PATH" HYPERLIGHT_DEMO_FAKE_HEY_SLEEP=0 \
+            _LHJ_TEST_PRE_RELEASE_SLEEP=0.3 \
+            launch_hey_jobs reqs concs urls hosts timeouts outfiles statuses \
+            "" active_pre wall_pre
+        outer_t1="$(now_seconds)"
+        outer_elapsed="$(seconds_between "$outer_t0" "$outer_t1")"
+        if ! awk -v o="$outer_elapsed" 'BEGIN { exit !(o >= 0.25) }'; then
+            printf 'FAIL barrier-timing pre-release case: outer elapsed %ss did not reflect the 0.3s pre-release sleep\n' \
+                "$outer_elapsed" >&2
+            failures=$((failures + 1))
+        fi
+        if ! awk -v a="$active_pre" 'BEGIN { exit !(a < 0.15) }'; then
+            printf 'FAIL barrier-timing pre-release case: wave_active_seconds=%ss unexpectedly absorbed the pre-release delay (expected < 0.15s)\n' \
+                "$active_pre" >&2
+            failures=$((failures + 1))
+        fi
+
+        # Case 2: a 0.3s delay in the fake hey process itself (strictly
+        # after the barrier release) must show up in wave_active_seconds.
+        local active_post="" wall_post=""
+        local -a outfiles2=("$work_dir/post.txt") statuses2
+        PATH="$fake_bin:$PATH" HYPERLIGHT_DEMO_FAKE_HEY_SLEEP=0.3 \
+            launch_hey_jobs reqs concs urls hosts timeouts outfiles2 statuses2 \
+            "" active_post wall_post
+        if ! awk -v a="$active_post" 'BEGIN { exit !(a >= 0.25 && a < 1.2) }'; then
+            printf 'FAIL barrier-timing post-release case: wave_active_seconds=%ss did not reflect the 0.3s post-release (hey-side) sleep\n' \
+                "$active_post" >&2
+            failures=$((failures + 1))
+        fi
+
+        # Case 3: two single-job waves (hey_max_parallel_jobs=1), each
+        # with a 0.2s post-release sleep, must accumulate wave_active_
+        # seconds across both waves (~0.4s), and load_wall_seconds must be
+        # at least that much (it also spans the inter-wave gap).
+        local -a reqs3=(1 1) concs3=(1 1)
+        local -a urls3=("http://example.invalid/" "http://example.invalid/")
+        local -a hosts3=("" "") timeouts3=(5 5)
+        local -a outfiles3=("$work_dir/w1.txt" "$work_dir/w2.txt") statuses3
+        local active_multi="" wall_multi=""
+        local hey_max_parallel_jobs=1 hey_ramp_ms=0
+        PATH="$fake_bin:$PATH" HYPERLIGHT_DEMO_FAKE_HEY_SLEEP=0.2 \
+            launch_hey_jobs reqs3 concs3 urls3 hosts3 timeouts3 outfiles3 statuses3 \
+            "" active_multi wall_multi
+        if ! awk -v a="$active_multi" 'BEGIN { exit !(a >= 0.35 && a < 1.5) }'; then
+            printf 'FAIL barrier-timing multi-wave case: wave_active_seconds=%ss did not reflect two accumulated 0.2s waves (expected >= 0.35s)\n' \
+                "$active_multi" >&2
+            failures=$((failures + 1))
+        fi
+        if ! awk -v w="$wall_multi" -v a="$active_multi" 'BEGIN { exit !(w >= a - 0.05) }'; then
+            printf 'FAIL barrier-timing multi-wave case: load_wall_seconds=%ss is smaller than wave_active_seconds=%ss (wall must be >= sum of wave actives)\n' \
+                "$wall_multi" "$active_multi" >&2
+            failures=$((failures + 1))
+        fi
+
+        rm -rf "$fake_bin" "$work_dir"
+    }
+    assert_barrier_timing
+    unset -f assert_barrier_timing
+
     if ((failures == 0)); then
-        echo "self-test: all allocate_evenly, benchmark-flag-validation, helper-executability, post-signal-probe-classification, phase-b-batch-sizing, hey-request-snapping, request-conservation, and request-conservation-fairness assertions passed"
+        echo "self-test: all allocate_evenly, benchmark-flag-validation, helper-executability, post-signal-probe-classification, phase-b-batch-sizing, hey-request-snapping, request-conservation, request-conservation-fairness, and launch_hey_jobs-barrier-timing assertions passed"
         return 0
     fi
     echo "self-test: $failures assertion(s) failed" >&2
@@ -2025,7 +2135,9 @@ spawn_hey_paused() {
     ) >"$outfile" 2>&1 &
 }
 
-# launch_hey_jobs REQS_ARR CONC_ARR URL_ARR HOST_ARR TIMEOUT_ARR OUTFILE_ARR STATUS_ARRNAME [LOG_FILE]
+# launch_hey_jobs REQS_ARR CONC_ARR URL_ARR HOST_ARR TIMEOUT_ARR OUTFILE_ARR
+#                 STATUS_ARRNAME [LOG_FILE] [ACTIVE_SECONDS_VARNAME]
+#                 [WALL_SECONDS_VARNAME]
 #
 # Runs one `hey` invocation per index across the given parallel arrays, at
 # most $hey_max_parallel_jobs concurrently (bounding heavy client
@@ -2039,24 +2151,58 @@ spawn_hey_paused() {
 # app's own hey-reported requests/sec reflects only its own wave, so
 # summing every app's rate does not equal the true wall-clock aggregate
 # throughput once more than one wave runs (see write_benchmark_summary's
-# end_to_end_requests_per_sec for that number).
+# end_to_end_requests_per_sec/load_wall_requests_per_sec for the two
+# honest aggregate numbers).
 #
 # Within one wave, every job is pre-spawned *paused*: each is forked as a
 # subshell that blocks on a per-wave gate file before it execs `hey`, so
 # the whole batch is already forked and ready before any of them starts
-# sending requests. Once every job in the batch is forked, the gate file
-# is created, releasing all of them together, rather than requests
-# starting as a side effect of however long forking itself took. When
-# $hey_ramp_ms is greater than 0, each job's release is additionally
+# sending requests. Once every job in the batch is forked, a monotonic-ish
+# high-resolution timestamp (`now_seconds`, backed by `date +%s.%N` --
+# bash has no portable CLOCK_MONOTONIC primitive without shelling out to
+# an extra tool per call, and a benchmark run is short/local enough that a
+# wall-clock NTP step during it is not a realistic risk worth that cost)
+# is taken as THIS WAVE'S BARRIER-RELEASE INSTANT, immediately before the
+# gate file is created, so forking cost itself is never counted as load.
+# When $hey_ramp_ms is greater than 0, each job's release is additionally
 # delayed by its position in the batch times that many milliseconds (job
 # 0 starts immediately on release, job 1 after one ramp step, and so on),
 # staggering actual request start without staggering (and thereby
 # delaying) the forking itself; this adds roughly
-# (batch_size - 1) * hey_ramp_ms to each wave's wall-clock time, which is
-# folded into the reported phase timing like any other wave cost. When
-# LOG_FILE is given, appends timestamped wave queue/release/finish and
-# per-app hey start/finish (command, exit code, output path) entries to
-# it.
+# (batch_size - 1) * hey_ramp_ms to each wave's *active* wall-clock time
+# (it happens after the barrier release, so it is correctly counted as
+# load), which is folded into the reported phase timing like any other
+# wave cost. When LOG_FILE is given, appends timestamped wave queue/
+# release/finish and per-app hey start/finish (command, exit code, output
+# path) entries to it.
+#
+# ACTIVE_SECONDS_VARNAME and WALL_SECONDS_VARNAME, if given, name caller
+# variables that this function sets (via `printf -v`, not namerefs, since
+# they are scalars) to two different honest timing numbers once every
+# wave has finished:
+#   - ACTIVE_SECONDS_VARNAME: the sum, across all waves, of each wave's
+#     own (barrier-release -> that wave's last job finishing) duration.
+#     Excludes every wave's pre-release forking/spawning cost AND excludes
+#     the gaps between waves (post-signal teardown of one wave's gate
+#     file, mktemp for the next, etc.) -- i.e. only time during which
+#     `hey` processes were actually permitted to send requests. This is
+#     what aggregate.end_to_end_requests_per_sec divides by.
+#   - WALL_SECONDS_VARNAME: (first wave's barrier-release instant -> last
+#     wave's last job finishing), a single span covering every wave
+#     including the inter-wave gaps, but still excluding the first wave's
+#     own pre-release forking cost (since it starts at that wave's release
+#     instant, identically to ACTIVE_SECONDS_VARNAME's first term). This
+#     is what aggregate.load_wall_requests_per_sec divides by, and is the
+#     more realistic number once hey_waves > 1, since an external observer
+#     watching the whole load phase does see the inter-wave gaps.
+#
+# `_LHJ_TEST_PRE_RELEASE_SLEEP`, if set to a nonzero seconds value, sleeps
+# for that long after a wave's jobs are all forked but before the barrier
+# timestamp/release -- a self-test-only hook (see self_test's
+# assert_barrier_timing) used to prove, deterministically and without a
+# real demo process, that pre-release delay does not leak into
+# ACTIVE_SECONDS_VARNAME/WALL_SECONDS_VARNAME. It is never set by any real
+# caller and defaults to doing nothing.
 launch_hey_jobs() {
     # Namerefs use a `_lhj_` prefix so they can never alias a caller-side
     # array of the same base name (bash namerefs otherwise self-reference
@@ -2067,11 +2213,13 @@ launch_hey_jobs() {
     local -n _lhj_timeouts="$5" _lhj_outfiles="$6"
     local -n _lhj_statuses="$7"
     local _lhj_logfile="${8:-}"
+    local _lhj_active_var="${9:-}" _lhj_wall_var="${10:-}"
     local max_parallel="$hey_max_parallel_jobs"
     local n="${#_lhj_reqs[@]}"
     _lhj_statuses=()
     local i=0
     local wave=0
+    local total_active="0" first_release="" last_finish=""
     while ((i < n)); do
         wave=$((wave + 1))
         local -a batch_pids=() batch_indexes=()
@@ -2084,7 +2232,6 @@ launch_hey_jobs() {
             "hey wave $wave queue: apps $i-$((batch_end - 1)) of $n" \
             "${hey_ramp_ms:+ramp=${hey_ramp_ms}ms per job on release}"
         local wave_t0 wave_t1
-        wave_t0="$(now_seconds)"
         local j
         for ((j = i; j < batch_end; j++)); do
             if ((_lhj_reqs[j] <= 0)); then
@@ -2108,9 +2255,23 @@ launch_hey_jobs() {
             batch_pids+=("$!")
             batch_indexes+=("$j")
         done
+        # Self-test-only hook: see this function's docstring. Sleeps
+        # AFTER forking but BEFORE the barrier timestamp/release, proving
+        # that slow spawning never leaks into the reported active/wall
+        # timing. No real caller sets this.
+        if [[ -n "${_LHJ_TEST_PRE_RELEASE_SLEEP:-}" && "${_LHJ_TEST_PRE_RELEASE_SLEEP}" != 0 ]]; then
+            sleep "$_LHJ_TEST_PRE_RELEASE_SLEEP"
+        fi
+        # Barrier-release instant: captured immediately before the gate
+        # file is created (the actual synchronized release), so every
+        # job's own fork/setup cost above is excluded from the measured
+        # wave duration -- only the time after every job in the wave was
+        # simultaneously released to start sending requests counts as load.
+        wave_t0="$(now_seconds)"
         [[ -n "$_lhj_logfile" ]] && log_line "$_lhj_logfile" \
             "hey wave $wave release: ${#batch_pids[@]} jobs"
         : >"$gate_file"
+        [[ -z "$first_release" ]] && first_release="$wave_t0"
         local k
         for ((k = 0; k < ${#batch_pids[@]}; k++)); do
             local pid="${batch_pids[k]}" idx="${batch_indexes[k]}"
@@ -2122,10 +2283,22 @@ launch_hey_jobs() {
         done
         rm -f "$gate_file" 2>/dev/null
         wave_t1="$(now_seconds)"
+        last_finish="$wave_t1"
+        total_active="$(awk -v a="$total_active" -v s="$wave_t0" -v e="$wave_t1" \
+            'BEGIN { printf "%.6f", a + (e - s) }')"
         [[ -n "$_lhj_logfile" ]] && log_line "$_lhj_logfile" \
-            "hey wave $wave finish: elapsed=$(seconds_between "$wave_t0" "$wave_t1")s"
+            "hey wave $wave finish: elapsed=$(seconds_between "$wave_t0" "$wave_t1")s" \
+            "(barrier-release to wave-finish; excludes this wave's own pre-release forking cost)"
         i="$batch_end"
     done
+    [[ -n "$_lhj_active_var" ]] && printf -v "$_lhj_active_var" '%s' "$total_active"
+    if [[ -n "$_lhj_wall_var" ]]; then
+        if [[ -n "$first_release" ]]; then
+            printf -v "$_lhj_wall_var" '%s' "$(seconds_between "$first_release" "$last_finish")"
+        else
+            printf -v "$_lhj_wall_var" '%s' "0"
+        fi
+    fi
 }
 
 # write_collected_hey_report OUTPUT APP_IDS_ARRNAME ADDR_ARRNAME CMD_ARRNAME
@@ -2208,24 +2381,42 @@ log_line() {
 }
 
 # make_phase_timing SETUP_SECONDS LOAD_SECONDS TEARDOWN_SECONDS TOTAL_SECONDS
+#                    WAVE_ACTIVE_SECONDS LOAD_WALL_SECONDS
 # -> prints the shared {setup_seconds, load_seconds, teardown_seconds,
-#    total_seconds} JSON object used by benchmark-resident/benchmark-
-#    multi-app's summary.json. setup_seconds covers starting the
-#    workerd-host process(es) and writing configs, up to (not including)
-#    the hey load; load_seconds is the wall-clock span of the hey load
-#    phase itself (launch_hey_jobs, which may run in multiple sequential
-#    waves -- see hey_max_parallel_jobs); teardown_seconds covers
-#    post-load status collection and process shutdown; total_seconds is
-#    the full run_benchmark_* function duration (may exceed the sum of
-#    the other three by a small amount spent on bookkeeping between
-#    phases).
+#    total_seconds, wave_active_seconds, load_wall_seconds} JSON object
+#    used by benchmark-resident/benchmark-multi-app's summary.json.
+#    setup_seconds covers starting the workerd-host process(es) and
+#    writing configs, up to (not including) the hey load; load_seconds is
+#    the caller-measured wall-clock span around the entire
+#    launch_hey_jobs call (includes the first wave's pre-release forking
+#    cost, since the caller's clock starts before calling in); teardown_
+#    seconds covers post-load status collection and process shutdown;
+#    total_seconds is the full run_benchmark_* function duration (may
+#    exceed the sum of the other three by a small amount spent on
+#    bookkeeping between phases).
+#
+# WAVE_ACTIVE_SECONDS and LOAD_WALL_SECONDS are launch_hey_jobs's own
+# barrier-anchored measurements (see its docstring for the exact
+# boundaries): WAVE_ACTIVE_SECONDS sums every wave's (barrier-release ->
+# wave-finish) span, excluding all pre-release forking cost and every
+# inter-wave gap -- this is pure request-serving time, and is what
+# aggregate.end_to_end_requests_per_sec divides by. LOAD_WALL_SECONDS
+# spans (first wave's barrier-release -> last wave's finish), including
+# inter-wave gaps but still excluding the first wave's own pre-release
+# forking cost -- the number an external observer watching the whole
+# multi-wave load phase actually sees, and what
+# aggregate.load_wall_requests_per_sec divides by. Both are 0/null when
+# the caller has nothing to report (e.g. orchestrator-contract passes
+# `null` for the whole TIMING_JSON).
 make_phase_timing() {
     jq -n \
         --argjson setup_seconds "$1" \
         --argjson load_seconds "$2" \
         --argjson teardown_seconds "$3" \
         --argjson total_seconds "$4" \
-        '{setup_seconds: $setup_seconds, load_seconds: $load_seconds, teardown_seconds: $teardown_seconds, total_seconds: $total_seconds}'
+        --argjson wave_active_seconds "${5:-0}" \
+        --argjson load_wall_seconds "${6:-0}" \
+        '{setup_seconds: $setup_seconds, load_seconds: $load_seconds, teardown_seconds: $teardown_seconds, total_seconds: $total_seconds, wave_active_seconds: $wave_active_seconds, load_wall_seconds: $load_wall_seconds}'
 }
 
 # write_benchmark_summary SCENARIO PER_APP_ARRAY_JSON TIMING_JSON MAX_PARALLEL
@@ -2242,13 +2433,36 @@ make_phase_timing() {
 # up rates from waves that did not overlap in wall-clock time and
 # overstates true throughput by roughly the wave count.
 #
-# aggregate.end_to_end_requests_per_sec instead divides total_requests by
-# the load phase's measured wall-clock duration (timing.load_seconds):
-# this is the number that matches what an external observer actually saw
-# across however many waves the load took, and is the one to trust for
-# true aggregate throughput. It is null when TIMING_JSON/MAX_PARALLEL are
-# not supplied (orchestrator-contract's phase summaries do not currently
-# measure this).
+# Two different, deliberately separately-named honest aggregate rates are
+# reported instead of one ambiguous number (see launch_hey_jobs/
+# make_phase_timing for the exact boundaries each is measured between):
+#
+# aggregate.end_to_end_requests_per_sec divides total_requests by
+# timing.wave_active_seconds -- the sum, across every wave, of
+# (barrier-release -> that wave's finish). This excludes ALL per-wave
+# forking/spawn cost and every inter-wave gap, so it measures only the
+# time `hey` processes were actually permitted to send requests: the
+# truest "pure load" throughput number, and the one closest to what the
+# name historically implied but, before the barrier-timing fix, did not
+# actually deliver (the old timing.load_seconds additionally counted the
+# first wave's forking cost and, for multi-wave runs, nothing extra beyond
+# that -- so it was already close for a single wave, but silently included
+# un-measured startup cost for any run small enough that forking wasn't
+# negligible).
+#
+# aggregate.load_wall_requests_per_sec divides total_requests by
+# timing.load_wall_seconds -- (first wave's barrier-release -> last wave's
+# finish). This still excludes the first wave's pre-release forking cost,
+# but DOES include every inter-wave gap, matching what an external
+# observer watching the whole load phase actually experiences once
+# hey_waves > 1. Prefer end_to_end_requests_per_sec when comparing raw
+# request-serving throughput across different MAX_PARALLEL settings;
+# prefer load_wall_requests_per_sec when reporting the throughput a real
+# caller issuing this exact load would observe.
+#
+# Both are null when TIMING_JSON/MAX_PARALLEL are not supplied
+# (orchestrator-contract's phase summaries do not currently measure
+# this).
 write_benchmark_summary() {
     local scenario="$1" per_app_json="$2" timing_json="${3:-null}"
     local max_parallel="${4:-0}" output="$5"
@@ -2266,8 +2480,13 @@ write_benchmark_summary() {
                 total_requests: $total_requests,
                 sum_of_app_requests_per_sec: ($apps | map(.requests_per_sec) | add),
                 end_to_end_requests_per_sec: (
-                    if ($timing | type) == "object" and (($timing.load_seconds // 0) > 0) then
-                        ($total_requests / $timing.load_seconds)
+                    if ($timing | type) == "object" and (($timing.wave_active_seconds // 0) > 0) then
+                        ($total_requests / $timing.wave_active_seconds)
+                    else null end
+                ),
+                load_wall_requests_per_sec: (
+                    if ($timing | type) == "object" and (($timing.load_wall_seconds // 0) > 0) then
+                        ($total_requests / $timing.load_wall_seconds)
                     else null end
                 ),
                 weighted_mean_latency_ms: (
@@ -2897,6 +3116,7 @@ run_benchmark_resident() {
     mkdir -p "$dir"
     LC_ALL=C lscpu | grep -E '^(CPU\(s\)|Socket|Core|Thread)' >"$dir/lscpu.txt"
     local t_start t_setup_done t_load_done t_end
+    local wave_active_seconds load_wall_seconds
     t_start="$(now_seconds)"
     local run_log="$dir/run.log"
     : >"$run_log"
@@ -2995,9 +3215,11 @@ run_benchmark_resident() {
     t_setup_done="$(now_seconds)"
     log_line "$run_log" "setup phase complete: elapsed=$(seconds_between "$t_start" "$t_setup_done")s"
     log_line "$run_log" "load phase start: $benchmark_apps apps, $benchmark_load_requests total requests"
-    launch_hey_jobs reqs concs urls hosts timeouts outfiles statuses "$run_log"
+    launch_hey_jobs reqs concs urls hosts timeouts outfiles statuses "$run_log" \
+        wave_active_seconds load_wall_seconds
     t_load_done="$(now_seconds)"
-    log_line "$run_log" "load phase complete: elapsed=$(seconds_between "$t_setup_done" "$t_load_done")s"
+    log_line "$run_log" "load phase complete: elapsed=$(seconds_between "$t_setup_done" "$t_load_done")s" \
+        "wave_active_seconds=${wave_active_seconds}s load_wall_seconds=${load_wall_seconds}s"
 
     local -a app_ids cmds
     local app_summaries="[]"
@@ -3071,7 +3293,8 @@ run_benchmark_resident() {
         "$(seconds_between "$t_start" "$t_setup_done")" \
         "$(seconds_between "$t_setup_done" "$t_load_done")" \
         "$(seconds_between "$t_load_done" "$t_end")" \
-        "$(seconds_between "$t_start" "$t_end")")"
+        "$(seconds_between "$t_start" "$t_end")" \
+        "$wave_active_seconds" "$load_wall_seconds")"
     write_benchmark_summary "benchmark-resident" "$app_summaries" "$timing_json" \
         "$hey_max_parallel_jobs" "$dir/summary.json"
     log_line "$run_log" "benchmark-resident complete: total_elapsed=$(seconds_between "$t_start" "$t_end")s"
@@ -3084,6 +3307,7 @@ run_benchmark_multi_app() {
     LC_ALL=C lscpu | grep -E '^(CPU\(s\)|Socket|Core|Thread)' >"$dir/lscpu.txt"
     local bind=127.0.0.1:8330
     local t_start t_setup_done t_load_done t_end
+    local wave_active_seconds load_wall_seconds
     t_start="$(now_seconds)"
     local run_log="$dir/run.log"
     : >"$run_log"
@@ -3172,9 +3396,11 @@ run_benchmark_multi_app() {
     t_setup_done="$(now_seconds)"
     log_line "$run_log" "setup phase complete: elapsed=$(seconds_between "$t_start" "$t_setup_done")s"
     log_line "$run_log" "load phase start: $benchmark_apps apps, $benchmark_load_requests total requests"
-    launch_hey_jobs reqs concs urls hosts timeouts outfiles statuses "$run_log"
+    launch_hey_jobs reqs concs urls hosts timeouts outfiles statuses "$run_log" \
+        wave_active_seconds load_wall_seconds
     t_load_done="$(now_seconds)"
-    log_line "$run_log" "load phase complete: elapsed=$(seconds_between "$t_setup_done" "$t_load_done")s"
+    log_line "$run_log" "load phase complete: elapsed=$(seconds_between "$t_setup_done" "$t_load_done")s" \
+        "wave_active_seconds=${wave_active_seconds}s load_wall_seconds=${load_wall_seconds}s"
 
     local -a app_ids addrs cmds
     local app_summaries="[]"
@@ -3249,7 +3475,8 @@ run_benchmark_multi_app() {
         "$(seconds_between "$t_start" "$t_setup_done")" \
         "$(seconds_between "$t_setup_done" "$t_load_done")" \
         "$(seconds_between "$t_load_done" "$t_end")" \
-        "$(seconds_between "$t_start" "$t_end")")"
+        "$(seconds_between "$t_start" "$t_end")" \
+        "$wave_active_seconds" "$load_wall_seconds")"
     write_benchmark_summary "benchmark-multi-app" "$app_summaries" "$timing_json" \
         "$hey_max_parallel_jobs" "$dir/summary.json"
     log_line "$run_log" "benchmark-multi-app complete: total_elapsed=$(seconds_between "$t_start" "$t_end")s"

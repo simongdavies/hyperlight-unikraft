@@ -611,21 +611,29 @@ Each demo also writes a `run.log` recording start/stage/failure lines
 (including the lifecycle-limit values noted above, plus the effective
 `hey_max_parallel_jobs`/`hey_ramp_ms` for the run) and a `timing.json`-
 shaped `timing` object inside `summary.json`, with `setup_seconds`,
-`load_seconds`, `teardown_seconds`, and `total_seconds` phase durations.
+`load_seconds`, `teardown_seconds`, `total_seconds`, `wave_active_seconds`,
+and `load_wall_seconds` phase durations (the last two are the
+barrier-anchored measurements described below).
 `hey` itself is always launched as a separate OS process per app; by
 default every app's `hey` process launches in one synchronized wave
 (`hey_max_parallel_jobs` defaults to `--benchmark-apps`, overridable with
 `--benchmark-hey-parallel`/`HYPERLIGHT_BENCHMARK_HEY_PARALLEL` — see
 above); lowering that cap below the app count makes later apps' `hey`
 runs happen in a later sequential wave rather than fully overlapping the
-first wave. Within a wave, every job is pre-spawned paused and released
-together, staggered by default (`hey_ramp_ms` defaults to 10,
-overridable with `--benchmark-hey-ramp-ms`/`HYPERLIGHT_BENCHMARK_HEY_RAMP_MS`
-— see above, set to 0 to release every job in a wave at once); `run.log`
-records each job's queue/release and each wave's queue/release/finish
-lines.
+first wave. Within a wave, every job is pre-spawned paused (forked but
+blocked behind a per-wave gate file) and then released together via a
+barrier: once every job in the wave is forked, a timestamp is taken
+immediately before the gate file is created, so none of that wave's own
+forking/spawn cost is ever counted as load; staggered by default
+(`hey_ramp_ms` defaults to 10, overridable with
+`--benchmark-hey-ramp-ms`/`HYPERLIGHT_BENCHMARK_HEY_RAMP_MS` — see above,
+set to 0 to release every job in a wave at once, which happens after the
+barrier timestamp so it is correctly counted as load, not startup);
+`run.log` records each job's queue/release and each wave's
+queue/release/finish lines, with the finish line's elapsed time now
+labeled as barrier-release-to-wave-finish.
 
-`summary.json`'s `aggregate` object reports two different throughput
+`summary.json`'s `aggregate` object reports three different throughput
 numbers because of that wave behavior:
 
 - `sum_of_app_requests_per_sec` adds up each app's own independently
@@ -636,14 +644,27 @@ numbers because of that wave behavior:
   app count, in which case apps beyond that cap run in later waves whose
   rates this sum keeps adding even though they did not overlap in
   wall-clock time, overstating true throughput by roughly the wave count.
-- `end_to_end_requests_per_sec` instead divides the total request count
-  by the load phase's measured wall-clock duration
-  (`timing.load_seconds`). This is the number that matches what an
-  external observer actually saw across however many waves the load took,
-  and is the one to trust for true aggregate throughput. It is `null`
-  when timing/wave data is unavailable for a phase (e.g.
-  `benchmark-orchestrator-contract`'s phase summaries do not currently
-  measure it).
+- `end_to_end_requests_per_sec` divides the total request count by
+  `timing.wave_active_seconds`: the sum, across every wave, of
+  (barrier-release instant → that wave's last job finishing). This
+  excludes every wave's pre-release forking/spawn cost AND every
+  inter-wave gap, so it measures only the time `hey` processes were
+  actually permitted to send requests — the purest "load-serving only"
+  throughput number, unaffected by how slow or fast the harness itself
+  was at spawning processes.
+- `load_wall_requests_per_sec` divides the total request count by
+  `timing.load_wall_seconds`: (first wave's barrier-release instant →
+  last wave's finish), a single span that still excludes the first
+  wave's pre-release forking cost but DOES include every inter-wave gap
+  (post-wave gate-file cleanup, next wave's `mktemp`/fork setup, etc.).
+  This is the number that matches what an external observer watching the
+  whole load phase actually experiences once `hey_waves > 1`; it equals
+  `end_to_end_requests_per_sec` when there is only one wave.
+
+Both `end_to_end_requests_per_sec` and `load_wall_requests_per_sec` are
+`null` when timing/wave data is unavailable for a phase (e.g.
+`benchmark-orchestrator-contract`'s phase summaries do not currently
+measure them).
 
 ## Stop and clean up
 
