@@ -11,11 +11,11 @@ BAZELISK_VERSION=1.28.1
 BAZELISK_SHA256=22e7d3a188699982f661cf4687137ee52d1f24fec1ec893d91a6c4d791a75de8
 LLVM_VERSION=22
 # Ubuntu jammy's golang-go package is 1.18, too old for vegeta's go.mod
-# (requires go 1.22+). Pin a newer toolchain, downloaded on demand, used
-# only for the hey/vegeta `go install`s below; the system golang-go stays
-# untouched.
+# (requires go 1.22+). Pin a newer toolchain, fetched on demand via
+# golang.org/dl (Go's own SDK installer, verified against the official
+# checksum database), used only for the hey/vegeta `go install`s below;
+# the system golang-go stays untouched.
 GO_TOOLCHAIN_VERSION=1.27.1
-GO_TOOLCHAIN_LINUX_AMD64_SHA256=63d339f0da5ab53635a56f2490a7984dfe12dfcff22ad749f63edaf590168445
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cache_root="${XDG_CACHE_HOME:-$HOME/.cache}/hyperlight-workerd"
@@ -114,29 +114,17 @@ installed_docker_ce_packages() {
 
 pinned_go=""
 ensure_pinned_go() {
-    local go_root="$cache_root/go-$GO_TOOLCHAIN_VERSION"
-    local tarball
-
     [[ -n "$pinned_go" ]] && return
-    if [[ ! -x "$go_root/bin/go" ]]; then
+    if ! command -v "go$GO_TOOLCHAIN_VERSION" >/dev/null; then
         step "Installing a pinned Go $GO_TOOLCHAIN_VERSION toolchain"
-        tarball="$(mktemp)"
-        curl --proto '=https' --tlsv1.2 --fail --show-error --silent \
-            --retry 3 --retry-all-errors --retry-delay 2 \
-            -o "$tarball" \
-            "https://go.dev/dl/go$GO_TOOLCHAIN_VERSION.linux-amd64.tar.gz"
-        echo "$GO_TOOLCHAIN_LINUX_AMD64_SHA256  $tarball" |
-            sha256sum -c - || {
-            rm -f -- "$tarball"
-            fail "downloaded Go toolchain failed checksum verification" \
-                "(retry; likely a corrupted/truncated download, not a bad pin)"
-        }
-        rm -rf -- "$go_root"
-        mkdir -p "$go_root"
-        tar -xzf "$tarball" -C "$go_root" --strip-components=1
-        rm -f -- "$tarball"
+        go install "golang.org/dl/go$GO_TOOLCHAIN_VERSION@latest"
     fi
-    pinned_go="$go_root/bin/go"
+    # Idempotent: no-ops if the SDK is already downloaded. Fetched via
+    # Go's own module proxy/checksum database (GOSUMDB), not a raw
+    # binary download, so it doesn't depend on go.dev serving a tarball
+    # intact over whatever network path this host has.
+    "go$GO_TOOLCHAIN_VERSION" download
+    pinned_go="go$GO_TOOLCHAIN_VERSION"
 }
 
 [[ "$(uname -s)" == Linux ]] || fail "this setup script requires Linux"
