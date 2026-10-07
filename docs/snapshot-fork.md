@@ -7,10 +7,20 @@ model in which each Unix-like process runs in a separate Hyperlight-Unikraft
 
 ## Status and scope
 
-The first prototype proves only the snapshot-fork mechanism and its host
-lifecycle. It targets Linux x86-64 with KVM and a single live application
-thread at the fork point. It does not integrate with OpenShell or replace
-HLUK's existing `vfork()+execve()` support.
+The first production-oriented host slice factors VM process ownership out of
+the acceptance test into `hyperlight_unikraft::process`. It targets Linux
+x86-64 with KVM and a single live application thread at a running-process fork
+point. It does not integrate with OpenShell, implement a production guest fork
+ABI, or replace HLUK's existing `vfork()+execve()` support.
+
+The reusable host API deliberately distinguishes:
+
+- `WarmRestore`: a new logical process from a prepared application snapshot.
+- `RunningProcessFork`: continuation from an in-flight running-process
+  snapshot, accepted only when it represents one live application thread.
+
+Both paths restore a distinct VM. The current `fork.prepare` / `fork.result`
+host functions remain acceptance-test protocol, not public POSIX semantics.
 
 ## Verified current behavior
 
@@ -98,8 +108,15 @@ Every capability type must declare one fork disposition:
 
 OpenVMM mesh is the model: typed movable capabilities, ports, bounded
 backpressured pipes, cancellation/deadlines, and host-side ownership. The
-prototype connects child stdout to a bounded host channel and uses channel
-closure as EOF.
+host process abstraction connects each VM's stdout to a bounded synchronous
+channel. A full channel blocks the guest's `HostWrite` call, and dropping the
+VM and its handler closes the sender so the consumer observes EOF.
+
+This slice only implements `Close in child`. Any live capability requesting
+share, duplicate, copy, recreate, or explicitly unsupported inheritance fails
+before a VM is restored. Adding a disposition requires a concrete typed
+capability implementation; unknown or merely named resources are never
+implicitly inherited.
 
 Private guest memory uses Hyperlight snapshot copy-on-write. Explicit shared
 memory requires one host-backed shared-memory capability mapped into both VMs.
@@ -125,6 +142,11 @@ that maps that capability at an agreed virtual address.
   the registry.
 - Hard cancellation uses `InterruptHandle::kill()`. The resulting poisoned VM
   is dropped and reported as deterministically terminated.
+- Cooperative cancellation is first exposed through the per-process
+  `process.cancelled` host capability. If the process has not completed by the
+  caller's grace period, the host uses `InterruptHandle::kill()`.
+- Virtual PIDs are monotonically allocated by one host registry and are not
+  reused after wait/reaping.
 - Host functions must not block indefinitely while holding resources needed to
   cancel or reap a child. Bounded output pipes intentionally apply
   backpressure, so a host consumer must drain them.
@@ -160,20 +182,25 @@ in the host task registry.
 
 ## Prototype acceptance evidence
 
-The focused `fork_prototype` integration test is the executable contract:
+The focused `fork_prototype` real-KVM integration test consumes the reusable
+host process API and is the executable contract:
 
 1. A guest calls `fork.prepare`, the call returns, and the guest reaches a
    timer-backed clean boundary before the host snapshots it.
 2. The original VM receives a host virtual PID and a restored VM receives zero.
 3. Both executions continue from the same in-flight call and mutate a
    pre-snapshot guest object to different values, proving private divergence.
-4. A host task wrapper reports the child's completed status through `wait`.
-5. Child stdout traverses a bounded synchronous channel; dropping the child VM
-   and its handler closes the channel and produces EOF.
+4. The host registry allocates the child's virtual PID, exposes typed state,
+   reports its completed status through `wait`, and reaps the registry entry.
+5. Child stdout traverses a bounded synchronous channel with one-chunk
+   capacity; dropping the child VM and its handler closes the channel and
+   produces EOF.
 6. A restored child enters the guest `SleepCancel` function,
-   `InterruptHandle::kill()` terminates the running entry, the poisoned VM is
-   dropped, and the parent observes a deterministic terminated status.
-7. Shared writable memory is reported as blocked by the exact Hyperlight API
+   cooperative cancellation is requested, and `InterruptHandle::kill()`
+   terminates the still-running entry. The registry marks the VM poisoned,
+   wait drops and reaps it, and a later process gets a fresh VM and PID.
+7. Unsupported capability inheritance fails closed before restore.
+8. Shared writable memory remains blocked by the exact Hyperlight API
    limitation above; no copied value is presented as shared memory.
 
 Passing this test on Linux x86-64 KVM demonstrates the prototype only. It does

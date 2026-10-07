@@ -24,6 +24,24 @@ examples_dir    := root_dir / "examples"
 conformance_dir := root_dir / "conformance"
 benchmarks_dir  := root_dir / "benchmarks"
 
+# ── Validation ──────────────────────────────────────────────────
+
+fmt-apply:
+    cargo fmt --all --manifest-path "{{root_dir}}/Cargo.toml"
+
+clippy:
+    cargo clippy --locked --workspace --all-targets \
+        --manifest-path "{{root_dir}}/Cargo.toml" -- -D warnings
+
+# Cross-check the Windows GNU target from Linux. This requires the Rust target
+# and x86_64-w64-mingw32-gcc (gcc-mingw-w64-x86-64 on Ubuntu).
+clippyw:
+    CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc \
+        CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc \
+        cargo clippy --locked --workspace --all-targets \
+        --target x86_64-pc-windows-gnu \
+        --manifest-path "{{root_dir}}/Cargo.toml" -- -D warnings
+
 # Per-runtime scratch memory (MiB). Must cover rootfs extraction +
 # runtime startup.
 scratch_c          := "64"

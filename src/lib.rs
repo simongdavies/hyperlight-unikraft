@@ -39,6 +39,7 @@ mod errno;
 mod hostfs;
 mod hostnet;
 pub mod net_policy;
+pub mod process;
 mod profile;
 
 pub use net_policy::{AllowList, BlockList, ListenPorts, NetworkPolicy, ResolveError};

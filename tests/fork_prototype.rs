@@ -9,16 +9,18 @@
 
 mod common;
 
-use std::io;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use hyperlight_unikraft::{AppSandbox, Error, SandboxBuilder, Snapshot, Yield};
+use hyperlight_unikraft::process::{
+    CancelOutcome, CapabilityDisposition, InheritedCapability, ProcessExitStatus, ProcessOptions,
+    ProcessState, TrustedProcessSnapshot, VmProcessHost,
+};
+use hyperlight_unikraft::{AppSandbox, Error, SandboxBuilder, Yield};
 
-const CHILD_PID: i64 = 10_001;
 const RESULT_PENDING: i64 = -1;
 
 const FORK_SCRIPT: &str = r#"
@@ -42,12 +44,6 @@ fork_state["private"] = "child" if fork_result == 0 else "parent"
 print(f"fork-result={fork_result} private={fork_state['private']}", flush=True)
 hyperlight.call("fork.report", fork_result, fork_state["private"])
 "#;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum ChildStatus {
-    Exited(i32),
-    Terminated,
-}
 
 struct ForkEndpoint {
     result: Arc<AtomicI64>,
@@ -106,36 +102,6 @@ impl ForkEndpoint {
     }
 }
 
-struct VirtualChild {
-    pid: i64,
-    stdout: thread::JoinHandle<Vec<u8>>,
-    status: Receiver<ChildStatus>,
-    interrupt: Receiver<Arc<dyn hyperlight_unikraft::hyperlight_host::hypervisor::InterruptHandle>>,
-    worker: thread::JoinHandle<()>,
-}
-
-impl VirtualChild {
-    fn wait(self) -> (ChildStatus, Vec<u8>) {
-        let status = self.status.recv().expect("child status");
-        self.worker.join().expect("child worker");
-        let output = self.stdout.join().expect("stdout collector");
-        (status, output)
-    }
-}
-
-fn stdout_pipe() -> (
-    impl Fn(&[u8]) -> io::Result<()> + Send + Sync + 'static,
-    Receiver<Vec<u8>>,
-) {
-    let (sender, receiver) = sync_channel::<Vec<u8>>(1);
-    let handler = move |bytes: &[u8]| {
-        sender
-            .send(bytes.to_vec())
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stdout reader dropped"))
-    };
-    (handler, receiver)
-}
-
 fn finish_fork_call(sandbox: &mut AppSandbox) -> Result<(), Error> {
     loop {
         match sandbox.step(Duration::from_secs(2))? {
@@ -144,55 +110,6 @@ fn finish_fork_call(sandbox: &mut AppSandbox) -> Result<(), Error> {
             Yield::Exited { status } => return Err(Error::GuestExited { status }),
             Yield::Blocked { .. } => {}
         }
-    }
-}
-
-fn spawn_child(
-    pid: i64,
-    snapshot: Arc<Snapshot>,
-    endpoint: ForkEndpoint,
-    cancel_after_fork: bool,
-) -> VirtualChild {
-    let (stdout_handler, stdout) = stdout_pipe();
-    let (status_tx, status) = sync_channel(1);
-    let (interrupt_tx, interrupt) = sync_channel(1);
-    let stdout = thread::spawn(move || {
-        let mut output = Vec::new();
-        while let Ok(chunk) = stdout.recv() {
-            output.extend_from_slice(&chunk);
-        }
-        output
-    });
-    let worker = thread::spawn(move || {
-        let builder = endpoint
-            .apply(SandboxBuilder::from_snapshot(snapshot))
-            .stdout_handler(stdout_handler);
-        let mut sandbox = builder.boot().expect("restore child");
-        finish_fork_call(&mut sandbox).expect("finish child fork continuation");
-
-        let handle = sandbox.interrupt_handle();
-        interrupt_tx.send(handle).expect("publish interrupt handle");
-
-        if cancel_after_fork {
-            let result = sandbox.call("SleepCancel", "null");
-            assert!(result.is_err(), "SleepCancel should be interrupted");
-            drop(sandbox);
-            status_tx
-                .send(ChildStatus::Terminated)
-                .expect("publish terminated status");
-        } else {
-            drop(sandbox);
-            status_tx
-                .send(ChildStatus::Exited(0))
-                .expect("publish exit status");
-        }
-    });
-    VirtualChild {
-        pid,
-        stdout,
-        status,
-        interrupt,
-        worker,
     }
 }
 
@@ -215,22 +132,43 @@ fn vm_per_process_snapshot_fork_prototype() {
     );
 
     let snapshot = parent_vm.snapshot().expect("snapshot clean fork boundary");
-    parent_result.store(CHILD_PID, Ordering::Release);
+    let process_host = VmProcessHost::new();
 
     let child_endpoint = ForkEndpoint::new(0);
     let child_reports = child_endpoint.reports.clone();
-    let child = spawn_child(CHILD_PID, snapshot.clone(), child_endpoint, false);
+    let mut child = process_host
+        .spawn(
+            TrustedProcessSnapshot::running_process_fork(snapshot.clone(), 1),
+            ProcessOptions::default()
+                .stdout_chunks(std::num::NonZeroUsize::new(1).expect("one is non-zero")),
+            move |builder| child_endpoint.apply(builder),
+            |sandbox, _| {
+                finish_fork_call(sandbox)?;
+                Ok(0)
+            },
+        )
+        .expect("spawn restored child");
+    let child_pid = child.pid();
+    parent_result.store(
+        i64::try_from(child_pid.get()).expect("virtual PID fits fork prototype ABI"),
+        Ordering::Release,
+    );
+    let child_stdout = child.take_stdout().expect("take child stdout");
+    let child_output = thread::spawn(move || child_stdout.read_to_end());
 
     finish_fork_call(&mut parent_vm).expect("finish parent fork continuation");
     assert_eq!(
         parent_reports.lock().unwrap().as_slice(),
-        &[(CHILD_PID, "parent".to_string())]
+        &[(
+            i64::try_from(child_pid.get()).expect("virtual PID fits fork prototype ABI"),
+            "parent".to_string()
+        )]
     );
 
-    let child_pid = child.pid;
-    let (status, output) = child.wait();
-    assert_eq!(child_pid, CHILD_PID);
-    assert_eq!(status, ChildStatus::Exited(0));
+    let status = child.wait().expect("wait for child");
+    let output = child_output.join().expect("stdout collector");
+    assert_eq!(status, ProcessExitStatus::Exited(0));
+    assert_eq!(process_host.state(child_pid), None, "wait reaps the PID");
     assert_eq!(
         child_reports.lock().unwrap().as_slice(),
         &[(0, "child".to_string())]
@@ -250,13 +188,84 @@ fn vm_per_process_snapshot_fork_prototype() {
 
     let (cancel_started_tx, cancel_started_rx) = sync_channel(1);
     let cancelled_endpoint = ForkEndpoint::new(0).with_cancel_started(cancel_started_tx);
-    let cancelled = spawn_child(CHILD_PID + 1, snapshot, cancelled_endpoint, true);
-    let interrupt = cancelled.interrupt.recv().expect("interrupt handle");
+    let cancelled = process_host
+        .spawn(
+            TrustedProcessSnapshot::running_process_fork(snapshot.clone(), 1),
+            ProcessOptions::default(),
+            move |builder| cancelled_endpoint.apply(builder),
+            |sandbox, _| {
+                finish_fork_call(sandbox)?;
+                sandbox.call("SleepCancel", "null")?;
+                Ok(0)
+            },
+        )
+        .expect("spawn cancellable child");
+    let cancelled_pid = cancelled.pid();
     cancel_started_rx
         .recv_timeout(Duration::from_secs(2))
         .expect("SleepCancel entered");
-    thread::sleep(Duration::from_millis(20));
-    assert!(interrupt.kill(), "SleepCancel must be running when killed");
-    let (status, _) = cancelled.wait();
-    assert_eq!(status, ChildStatus::Terminated);
+    assert_eq!(
+        cancelled
+            .cancel(Duration::from_millis(20))
+            .expect("cancel child"),
+        CancelOutcome::HardKilled
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if matches!(
+            process_host.state(cancelled_pid),
+            Some(ProcessState::Poisoned(ProcessExitStatus::Cancelled))
+        ) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "killed VM did not become poisoned"
+        );
+        thread::yield_now();
+    }
+    assert_eq!(
+        cancelled.wait().expect("wait for cancelled child"),
+        ProcessExitStatus::Cancelled
+    );
+    assert_eq!(
+        process_host.state(cancelled_pid),
+        None,
+        "poisoned VM is dropped and reaped"
+    );
+
+    let replacement_endpoint = ForkEndpoint::new(0);
+    let replacement = process_host
+        .spawn(
+            TrustedProcessSnapshot::running_process_fork(snapshot.clone(), 1),
+            ProcessOptions::default(),
+            move |builder| replacement_endpoint.apply(builder),
+            |sandbox, _| {
+                finish_fork_call(sandbox)?;
+                Ok(0)
+            },
+        )
+        .expect("restore a fresh VM after poison");
+    assert!(
+        replacement.pid() > cancelled_pid,
+        "virtual PIDs and killed VMs are never reused"
+    );
+    assert_eq!(
+        replacement.wait().expect("wait for replacement"),
+        ProcessExitStatus::Exited(0)
+    );
+
+    let unsupported = process_host.spawn(
+        TrustedProcessSnapshot::running_process_fork(snapshot, 1),
+        ProcessOptions::default().capabilities([InheritedCapability::new(
+            "workspace",
+            CapabilityDisposition::ShareOpenDescription,
+        )]),
+        |builder| builder,
+        |_, _| Ok(0),
+    );
+    assert!(
+        unsupported.is_err(),
+        "unsupported inheritance must fail before restoring a VM"
+    );
 }
