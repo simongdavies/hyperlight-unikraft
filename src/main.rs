@@ -56,6 +56,16 @@ enum Command {
     /// Boundaries 1-3's resident VM, bounded pool, and multi-app routing
     /// are meant to run under.
     WorkerdHost(WorkerdHostArgs),
+
+    /// One-shot "prewarm": boot a trusted Worker bundle, run its guest
+    /// `init` call, and save the post-init snapshot to disk — the
+    /// load -> init -> snapshot half of the load -> init -> snapshot ->
+    /// restore x N pattern. Boots with the same deny-all capability
+    /// policy `AppRegistry::from_host_config` always builds today, so the
+    /// saved directory is directly usable from a `HostConfig`'s
+    /// `AppConfig.snapshot_dir` to restore N apps without paying this
+    /// boot+init cost again in each of their processes.
+    WorkerdPrewarmSnapshot(WorkerdPrewarmSnapshotArgs),
 }
 
 #[derive(Subcommand)]
@@ -108,6 +118,77 @@ struct WorkerdArgs {
     /// Fetch timeout in milliseconds.
     #[arg(long, default_value_t = 10_000)]
     request_timeout_ms: u64,
+}
+
+#[derive(clap::Args)]
+struct WorkerdPrewarmSnapshotArgs {
+    /// Trusted protocol-v1 Worker bundle JSON.
+    #[arg(long, conflicts_with = "script")]
+    bundle: Option<PathBuf>,
+
+    /// Convenience single ES module; source is sent only during initialization.
+    #[arg(long, conflicts_with = "bundle")]
+    script: Option<PathBuf>,
+
+    /// Worker version for --script.
+    #[arg(long, default_value = "cli-v1")]
+    version: String,
+
+    /// Compatibility date for --script.
+    #[arg(long, default_value = "2025-01-01")]
+    compatibility_date: String,
+
+    /// Packaged executor image/rootfs.
+    #[arg(long, default_value = "build-elfloader/workerd-executor/rootfs.img")]
+    rootfs: PathBuf,
+
+    /// Matching trusted executor artifact.
+    #[arg(long, default_value = "build-elfloader/workerd-executor/executor")]
+    executor: PathBuf,
+
+    /// Scratch memory in MiB. Must match the `scratch_memory_mb` every
+    /// `AppConfig` restoring from this snapshot will use (the snapshot's
+    /// own memory layout applies on restore; this only governs the fresh
+    /// boot happening here).
+    #[arg(long, default_value_t = 512)]
+    scratch_mb: usize,
+
+    /// Initialization timeout in milliseconds.
+    #[arg(long, default_value_t = 90_000)]
+    init_timeout_ms: u64,
+
+    /// Directory to save the verified snapshot to. Must not already
+    /// exist (snapshots are write-once, matching
+    /// `workerd::VerifiedSnapshot::save`'s own guarantee).
+    #[arg(long)]
+    snapshot_dir: PathBuf,
+}
+
+/// Builds a `WorkerBundle` from `--bundle`/`--script` (or, if neither is
+/// given, the demo helloworld bundle), shared by `workerd` and
+/// `workerd-prewarm-snapshot` so both parse identical CLI shapes the same way.
+fn build_workerd_bundle(
+    bundle: Option<PathBuf>,
+    script: Option<PathBuf>,
+    version: String,
+    compatibility_date: String,
+) -> CliResult<hyperlight_unikraft::workerd::WorkerBundle> {
+    use hyperlight_unikraft::workerd::{WorkerBundle, WorkerVersionId};
+    match (bundle, script) {
+        (Some(path), None) => Ok(WorkerBundle::from_path(path)?),
+        (None, Some(path)) => Ok(WorkerBundle::single_script(
+            WorkerVersionId::new(version)?,
+            compatibility_date,
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("worker.js"),
+            std::fs::read_to_string(&path)?,
+        )?),
+        (None, None) => Ok(WorkerBundle::from_path(
+            "examples/workerd-bundles/helloworld_esm.json",
+        )?),
+        (Some(_), Some(_)) => unreachable!("clap rejects conflicting arguments"),
+    }
 }
 
 /// Arguments for `workerd-host` — the orchestrator-ready multi-app,
@@ -544,23 +625,14 @@ fn cmd_run(args: RunArgs) -> CliResult<()> {
 }
 
 fn cmd_workerd(args: WorkerdArgs) -> CliResult<()> {
-    use hyperlight_unikraft::workerd::{
-        PROTOCOL_VERSION, RequestEnvelope, WorkerBundle, WorkerVersionId, WorkerVersionSandbox,
-    };
+    use hyperlight_unikraft::workerd::{PROTOCOL_VERSION, RequestEnvelope, WorkerVersionSandbox};
 
-    let bundle = match (args.bundle, args.script) {
-        (Some(path), None) => WorkerBundle::from_path(path)?,
-        (None, Some(path)) => WorkerBundle::single_script(
-            WorkerVersionId::new(args.version)?,
-            args.compatibility_date,
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("worker.js"),
-            std::fs::read_to_string(&path)?,
-        )?,
-        (None, None) => WorkerBundle::from_path("examples/workerd-bundles/helloworld_esm.json")?,
-        (Some(_), Some(_)) => unreachable!("clap rejects conflicting arguments"),
-    };
+    let bundle = build_workerd_bundle(
+        args.bundle,
+        args.script,
+        args.version,
+        args.compatibility_date,
+    )?;
     let version = bundle.worker_version.clone();
     let bundle_sha256 = bundle.sha256()?;
     let worker = WorkerVersionSandbox::initialize(
@@ -594,6 +666,41 @@ fn cmd_workerd(args: WorkerdArgs) -> CliResult<()> {
         &mut std::io::stdout(),
         &STANDARD.decode(response.body_base64)?,
     )?;
+    Ok(())
+}
+
+fn cmd_workerd_prewarm_snapshot(args: WorkerdPrewarmSnapshotArgs) -> CliResult<()> {
+    use hyperlight_unikraft::workerd::WorkerVersionSandbox;
+
+    let bundle = build_workerd_bundle(
+        args.bundle,
+        args.script,
+        args.version,
+        args.compatibility_date,
+    )?;
+    let version = bundle.worker_version.clone();
+    let bundle_sha256 = bundle.sha256()?;
+    // Same deny-all policy `AppConfig`'s default `capability_policy` always
+    // builds (`WorkerCapabilityPolicyConfig::build()`), so the saved
+    // snapshot's `capability_policy_sha256` binds to exactly what
+    // `AppRegistry::from_host_config` will check against when an
+    // `AppConfig.snapshot_dir` restores from it.
+    let (worker, profile) = WorkerVersionSandbox::initialize_profiled(
+        bundle,
+        args.rootfs,
+        args.executor,
+        args.scratch_mb,
+        Duration::from_millis(args.init_timeout_ms),
+    )
+    .map_err(|failure| failure.to_string())?;
+    worker.snapshot().save(&args.snapshot_dir)?;
+    eprintln!(
+        "worker={} bundle={} snapshot_dir={} profile={}",
+        version.as_str(),
+        bundle_sha256,
+        args.snapshot_dir.display(),
+        serde_json::to_string(&profile)?
+    );
     Ok(())
 }
 
@@ -1594,6 +1701,7 @@ fn cli_main() -> CliResult<()> {
         Command::Run(args) => cmd_run(args),
         Command::Workerd(args) => cmd_workerd(args),
         Command::WorkerdHost(args) => cmd_workerd_host(args),
+        Command::WorkerdPrewarmSnapshot(args) => cmd_workerd_prewarm_snapshot(args),
         Command::Snapshot(cmd) => match cmd {
             SnapshotCommand::Save(args) => cmd_snapshot_save(args),
             SnapshotCommand::Run(args) => cmd_snapshot_run(args),
