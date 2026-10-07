@@ -122,11 +122,15 @@ ensure_pinned_go() {
         step "Installing a pinned Go $GO_TOOLCHAIN_VERSION toolchain"
         tarball="$(mktemp)"
         curl --proto '=https' --tlsv1.2 --fail --show-error --silent \
+            --retry 3 --retry-all-errors --retry-delay 2 \
             -o "$tarball" \
             "https://go.dev/dl/go$GO_TOOLCHAIN_VERSION.linux-amd64.tar.gz"
         echo "$GO_TOOLCHAIN_LINUX_AMD64_SHA256  $tarball" |
-            sha256sum -c - ||
-            fail "downloaded Go toolchain failed checksum verification"
+            sha256sum -c - || {
+            rm -f -- "$tarball"
+            fail "downloaded Go toolchain failed checksum verification" \
+                "(retry; likely a corrupted/truncated download, not a bad pin)"
+        }
         rm -rf -- "$go_root"
         mkdir -p "$go_root"
         tar -xzf "$tarball" -C "$go_root" --strip-components=1
