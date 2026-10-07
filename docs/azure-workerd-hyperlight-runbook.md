@@ -582,6 +582,47 @@ position times this value, regardless of which demo launched it, so the
 default single-wave launch above ramps up instead of releasing every job
 at the same instant; set it to 0 for the old all-at-once release.
 
+### `--benchmark-load-driver {hey|vegeta}`
+
+`benchmark-resident`'s load phase defaults to `hey` (or
+`HYPERLIGHT_BENCHMARK_LOAD_DRIVER`, default `hey`): one `hey` process per
+app, the per-app/per-wave model described above, unchanged. Passing
+`--benchmark-load-driver vegeta` instead runs exactly ONE `vegeta attack`
+process against a single shared targets file listing every app's exact
+request count, round-robin interleaved across apps, avoiding the
+N-process fork/barrier/progress overhead of one `hey` process per app —
+this is what makes high `--benchmark-apps` counts (hundreds to
+thousands) practical, where per-process fork/barrier overhead with `hey`
+previously dominated wall-clock time. `--benchmark-load-driver` has no
+effect on `benchmark-multi-app` or `benchmark-orchestrator-contract`,
+which always use `hey`; `require_runtime` only requires the `vegeta`
+binary on `PATH` when `--benchmark-load-driver vegeta` is selected.
+
+Under vegeta, per-app results are synthesized back into the exact same
+`hey`-report-format text file (`Total:`/`Average:`/`Requests/sec:`/
+`[200] N responses`) that `hey` itself would have produced, from
+vegeta's own `report -type=json` (overall duration) and
+`encode -to=json` (per-request records, grouped by target URL) — so
+every downstream consumer (`build_app_summary`, the collected
+`hey.txt`, `summary.json`'s aggregate fields) works unmodified
+regardless of which driver ran. Since vegeta delivers each app's exact
+requested count via a finite target list (no `hey`-style "count must be
+a multiple of concurrency" constraint), the achievable-count snapping
+and `conservation-remainder` extra-job mechanism described above (the
+`hey`-only paragraph just above) is skipped entirely for vegeta: every
+app's allocated request count is used as-is, and no
+`conservation-remainder` artifacts are ever produced for a
+vegeta-driven run. Because vegeta runs everything as one shared
+process/timeline rather than hey's per-app/per-wave model,
+`summary.json`'s `aggregate.max_parallel_hey_jobs`, `hey_waves`, and
+`barrier_scope` are always `null` for a vegeta-driven run, and
+`aggregate.load_driver` records `"vegeta"` so a `summary.json` alone
+says which driver produced it; `hey_self_measured_requests_per_sec` and
+the other aggregate throughput numbers remain meaningful for either
+driver (vegeta's single-attack timing plays the same role hey's
+barrier-anchored timing does for `active_wave_requests_per_sec`/
+`end_to_end_requests_per_sec`, since there is only one "wave").
+
 ### Raw `hey` output, logs, timing, and throughput metrics
 
 Each of the three load benchmarks saves the complete raw `hey` report for
