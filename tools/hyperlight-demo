@@ -858,9 +858,9 @@ print_demo_evidence() {
             evidence_row "Apps" "$benchmark_apps independent resident processes"
             evidence_row "Total requests" "$benchmark_load_requests / aggregate concurrency $benchmark_concurrency"
             evidence_row "Sum-of-rates throughput" "$(jq -r '.aggregate.sum_of_app_requests_per_sec' "$dir/summary.json") req/s (sum of each app's own hey rate; overstates true throughput once hey_waves > 1)"
-            evidence_row "End-to-end throughput" "$(jq -r '.aggregate.end_to_end_requests_per_sec' "$dir/summary.json") req/s (total_requests / sum of each wave's barrier-release-to-finish seconds; excludes all forking/spawn overhead and inter-wave gaps)"
-            evidence_row "Load-wall throughput" "$(jq -r '.aggregate.load_wall_requests_per_sec' "$dir/summary.json") req/s (total_requests / first-wave-release-to-last-wave-finish seconds; includes inter-wave gaps -- same as end-to-end when hey_waves == 1)"
-            evidence_row "Hey waves" "$(jq -r '.aggregate.hey_waves' "$dir/summary.json") (apps=$benchmark_apps, max $(jq -r '.aggregate.max_parallel_hey_jobs' "$dir/summary.json") concurrent hey processes)"
+            evidence_row "End-to-end throughput" "$(jq -r '.aggregate.end_to_end_requests_per_sec' "$dir/summary.json") req/s (total_requests / first-wave-release-to-last-wave-finish seconds; includes inter-wave gaps -- the number to report/compare as this run's throughput)"
+            evidence_row "Active-wave throughput" "$(jq -r '.aggregate.active_wave_requests_per_sec' "$dir/summary.json") req/s (total_requests / sum of each wave's barrier-release-to-finish seconds; excludes all forking/spawn overhead AND inter-wave gaps -- narrower than end-to-end once hey_waves > 1, same value when hey_waves == 1)"
+            evidence_row "Hey waves / barrier scope" "$(jq -r '.aggregate.hey_waves' "$dir/summary.json") wave(s), barrier_scope=$(jq -r '.aggregate.barrier_scope' "$dir/summary.json") (apps=$benchmark_apps, max $(jq -r '.aggregate.max_parallel_hey_jobs' "$dir/summary.json") concurrent hey processes; the barrier only holds jobs within ONE wave together -- apps do not all launch simultaneously when hey_waves > 1)"
             evidence_row "Phase timing" "$(jq -c '.timing' "$dir/summary.json")"
             evidence_row "Weighted mean latency" "$(jq -r '.aggregate.weighted_mean_latency_ms' "$dir/summary.json") ms"
             evidence_row "Per-app" "$(jq -c '[.apps[] | {app_id, requests, requests_per_sec}]' "$dir/summary.json")"
@@ -884,9 +884,9 @@ print_demo_evidence() {
             evidence_row "Apps" "$benchmark_apps routed apps, one process and port"
             evidence_row "Total requests" "$benchmark_load_requests / aggregate concurrency $benchmark_concurrency"
             evidence_row "Sum-of-rates throughput" "$(jq -r '.aggregate.sum_of_app_requests_per_sec' "$dir/summary.json") req/s (sum of each app's own hey rate; overstates true throughput once hey_waves > 1)"
-            evidence_row "End-to-end throughput" "$(jq -r '.aggregate.end_to_end_requests_per_sec' "$dir/summary.json") req/s (total_requests / sum of each wave's barrier-release-to-finish seconds; excludes all forking/spawn overhead and inter-wave gaps)"
-            evidence_row "Load-wall throughput" "$(jq -r '.aggregate.load_wall_requests_per_sec' "$dir/summary.json") req/s (total_requests / first-wave-release-to-last-wave-finish seconds; includes inter-wave gaps -- same as end-to-end when hey_waves == 1)"
-            evidence_row "Hey waves" "$(jq -r '.aggregate.hey_waves' "$dir/summary.json") (apps=$benchmark_apps, max $(jq -r '.aggregate.max_parallel_hey_jobs' "$dir/summary.json") concurrent hey processes)"
+            evidence_row "End-to-end throughput" "$(jq -r '.aggregate.end_to_end_requests_per_sec' "$dir/summary.json") req/s (total_requests / first-wave-release-to-last-wave-finish seconds; includes inter-wave gaps -- the number to report/compare as this run's throughput)"
+            evidence_row "Active-wave throughput" "$(jq -r '.aggregate.active_wave_requests_per_sec' "$dir/summary.json") req/s (total_requests / sum of each wave's barrier-release-to-finish seconds; excludes all forking/spawn overhead AND inter-wave gaps -- narrower than end-to-end once hey_waves > 1, same value when hey_waves == 1)"
+            evidence_row "Hey waves / barrier scope" "$(jq -r '.aggregate.hey_waves' "$dir/summary.json") wave(s), barrier_scope=$(jq -r '.aggregate.barrier_scope' "$dir/summary.json") (apps=$benchmark_apps, max $(jq -r '.aggregate.max_parallel_hey_jobs' "$dir/summary.json") concurrent hey processes; the barrier only holds jobs within ONE wave together -- apps do not all launch simultaneously when hey_waves > 1)"
             evidence_row "Phase timing" "$(jq -c '.timing' "$dir/summary.json")"
             evidence_row "Status" "$(jq -c '[.[] | {app_id, kind}]' "$dir/status.json")"
             evidence_row "Per-app" "$(jq -c '[.apps[] | {app_id, requests, requests_per_sec}]' "$dir/summary.json")"
@@ -2101,8 +2101,42 @@ FAKE_HEY
     assert_barrier_timing
     unset -f assert_barrier_timing
 
+    # Regression guard for the monotonic-clock requirement behind the
+    # barrier timings above: now_monotonic_seconds must never go
+    # backwards across two successive reads (the defining property that
+    # justifies using it over wall-clock now_seconds for interval
+    # measurement), and must actually advance over a short real sleep so
+    # it is not a frozen/constant stub.
+    assert_monotonic_clock() {
+        local t0 t1
+        t0="$(now_monotonic_seconds)"
+        sleep 0.05
+        t1="$(now_monotonic_seconds)"
+        if ! awk -v a="$t0" -v b="$t1" 'BEGIN { exit !(b >= a) }'; then
+            printf 'FAIL now_monotonic_seconds: second read %s is before first read %s (not monotonic)\n' \
+                "$t1" "$t0" >&2
+            failures=$((failures + 1))
+        fi
+        if ! awk -v a="$t0" -v b="$t1" 'BEGIN { exit !(b > a) }'; then
+            printf 'FAIL now_monotonic_seconds: second read %s did not advance past first read %s across a real 0.05s sleep\n' \
+                "$t1" "$t0" >&2
+            failures=$((failures + 1))
+        fi
+        if [[ -r /proc/uptime ]]; then
+            local uptime_seconds
+            read -r uptime_seconds _ </proc/uptime
+            if ! awk -v u="$uptime_seconds" -v t="$t1" 'BEGIN { exit !((t - u < 1) && (t - u > -1)) }'; then
+                printf 'FAIL now_monotonic_seconds: value %s is not close to /proc/uptime (%s) even though /proc/uptime is readable -- not using the monotonic source\n' \
+                    "$t1" "$uptime_seconds" >&2
+                failures=$((failures + 1))
+            fi
+        fi
+    }
+    assert_monotonic_clock
+    unset -f assert_monotonic_clock
+
     if ((failures == 0)); then
-        echo "self-test: all allocate_evenly, benchmark-flag-validation, helper-executability, post-signal-probe-classification, phase-b-batch-sizing, hey-request-snapping, request-conservation, request-conservation-fairness, and launch_hey_jobs-barrier-timing assertions passed"
+        echo "self-test: all allocate_evenly, benchmark-flag-validation, helper-executability, post-signal-probe-classification, phase-b-batch-sizing, hey-request-snapping, request-conservation, request-conservation-fairness, launch_hey_jobs-barrier-timing, and monotonic-clock assertions passed"
         return 0
     fi
     echo "self-test: $failures assertion(s) failed" >&2
@@ -2151,22 +2185,27 @@ spawn_hey_paused() {
 # app's own hey-reported requests/sec reflects only its own wave, so
 # summing every app's rate does not equal the true wall-clock aggregate
 # throughput once more than one wave runs (see write_benchmark_summary's
-# end_to_end_requests_per_sec/load_wall_requests_per_sec for the two
-# honest aggregate numbers).
+# end_to_end_requests_per_sec/active_wave_requests_per_sec for the two
+# honest aggregate numbers). IMPORTANT: the barrier below is scoped to
+# ONE WAVE -- there is no single barrier spanning every app when more
+# than one wave runs; only the jobs within a given wave are held and
+# released together.
 #
 # Within one wave, every job is pre-spawned *paused*: each is forked as a
 # subshell that blocks on a per-wave gate file before it execs `hey`, so
 # the whole batch is already forked and ready before any of them starts
-# sending requests. Once every job in the batch is forked, a monotonic-ish
-# high-resolution timestamp (`now_seconds`, backed by `date +%s.%N` --
-# bash has no portable CLOCK_MONOTONIC primitive without shelling out to
-# an extra tool per call, and a benchmark run is short/local enough that a
-# wall-clock NTP step during it is not a realistic risk worth that cost)
-# is taken as THIS WAVE'S BARRIER-RELEASE INSTANT, immediately before the
+# sending requests. Once every job in the batch is forked, a timestamp is
+# taken as THIS WAVE'S BARRIER-RELEASE INSTANT, immediately before the
 # gate file is created, so forking cost itself is never counted as load.
-# When $hey_ramp_ms is greater than 0, each job's release is additionally
-# delayed by its position in the batch times that many milliseconds (job
-# 0 starts immediately on release, job 1 after one ramp step, and so on),
+# That timestamp is taken with `now_monotonic_seconds` (see its own
+# docstring): on Linux/WSL this reads `/proc/uptime`, a true monotonic
+# clock (time since boot, immune to wall-clock/NTP adjustments), at
+# roughly 0.01s resolution; it falls back to the wall-clock `now_seconds`
+# (`date +%s.%N`) ONLY when `/proc/uptime` is unreadable, which this
+# function's self-test explicitly exercises/asserts. When $hey_ramp_ms is
+# greater than 0, each job's release is additionally delayed by its
+# position in the batch times that many milliseconds (job 0 starts
+# immediately on release, job 1 after one ramp step, and so on),
 # staggering actual request start without staggering (and thereby
 # delaying) the forking itself; this adds roughly
 # (batch_size - 1) * hey_ramp_ms to each wave's *active* wall-clock time
@@ -2185,16 +2224,20 @@ spawn_hey_paused() {
 #     Excludes every wave's pre-release forking/spawning cost AND excludes
 #     the gaps between waves (post-signal teardown of one wave's gate
 #     file, mktemp for the next, etc.) -- i.e. only time during which
-#     `hey` processes were actually permitted to send requests. This is
-#     what aggregate.end_to_end_requests_per_sec divides by.
+#     `hey` processes were actually permitted to send requests. This is a
+#     narrower "pure request-serving" number; it is what
+#     aggregate.active_wave_requests_per_sec divides by, NOT what
+#     "end to end" means in this codebase.
 #   - WALL_SECONDS_VARNAME: (first wave's barrier-release instant -> last
 #     wave's last job finishing), a single span covering every wave
 #     including the inter-wave gaps, but still excluding the first wave's
 #     own pre-release forking cost (since it starts at that wave's release
 #     instant, identically to ACTIVE_SECONDS_VARNAME's first term). This
-#     is what aggregate.load_wall_requests_per_sec divides by, and is the
-#     more realistic number once hey_waves > 1, since an external observer
-#     watching the whole load phase does see the inter-wave gaps.
+#     is the TRUE end-to-end span and is what
+#     aggregate.end_to_end_requests_per_sec divides by: the number an
+#     external observer watching the whole load phase actually
+#     experiences, including every inter-wave gap. Equals
+#     ACTIVE_SECONDS_VARNAME when hey_waves == 1.
 #
 # `_LHJ_TEST_PRE_RELEASE_SLEEP`, if set to a nonzero seconds value, sleeps
 # for that long after a wave's jobs are all forked but before the barrier
@@ -2267,7 +2310,10 @@ launch_hey_jobs() {
         # job's own fork/setup cost above is excluded from the measured
         # wave duration -- only the time after every job in the wave was
         # simultaneously released to start sending requests counts as load.
-        wave_t0="$(now_seconds)"
+        # Uses now_monotonic_seconds (see its docstring), not wall-clock
+        # now_seconds, since this measures a short local interval, not an
+        # absolute timestamp.
+        wave_t0="$(now_monotonic_seconds)"
         [[ -n "$_lhj_logfile" ]] && log_line "$_lhj_logfile" \
             "hey wave $wave release: ${#batch_pids[@]} jobs"
         : >"$gate_file"
@@ -2282,7 +2328,7 @@ launch_hey_jobs() {
                 "hey app #$idx finished: exit=$status output=${_lhj_outfiles[idx]}"
         done
         rm -f "$gate_file" 2>/dev/null
-        wave_t1="$(now_seconds)"
+        wave_t1="$(now_monotonic_seconds)"
         last_finish="$wave_t1"
         total_active="$(awk -v a="$total_active" -v s="$wave_t0" -v e="$wave_t1" \
             'BEGIN { printf "%.6f", a + (e - s) }')"
@@ -2360,6 +2406,31 @@ build_app_summary() {
 # now_seconds -> current wall-clock time, sub-second precision.
 now_seconds() { date +%s.%N; }
 
+# now_monotonic_seconds -> best-available monotonic time in seconds for
+# measuring short local intervals (e.g. barrier-release-to-finish spans
+# in launch_hey_jobs), immune to wall-clock adjustments (NTP steps,
+# manual clock changes) that would otherwise corrupt an interval
+# computed from two now_seconds() wall-clock reads. On Linux (including
+# WSL, which is what every live validation in this repo runs under),
+# reads the kernel's own monotonic "seconds since boot" counter from
+# /proc/uptime's first field -- true CLOCK_MONOTONIC semantics, at
+# /proc/uptime's roughly 0.01s resolution (coarser than now_seconds's
+# nanosecond text but a real monotonic source, not an approximation of
+# one). Falls back to the wall-clock now_seconds ONLY when /proc/uptime
+# is unreadable (non-Linux); self_test's assert_barrier_timing exercises
+# both the /proc/uptime path (when available) and asserts the function
+# never goes backwards across two successive reads, so a real regression
+# to a non-monotonic source would be caught.
+now_monotonic_seconds() {
+    if [[ -r /proc/uptime ]]; then
+        local uptime_seconds
+        read -r uptime_seconds _ </proc/uptime
+        printf '%s' "$uptime_seconds"
+    else
+        now_seconds
+    fi
+}
+
 # seconds_between START END -> (END - START) with 3 decimal places.
 seconds_between() {
     awk -v start="$1" -v end="$2" 'BEGIN { printf "%.3f", end - start }'
@@ -2400,12 +2471,12 @@ log_line() {
 # boundaries): WAVE_ACTIVE_SECONDS sums every wave's (barrier-release ->
 # wave-finish) span, excluding all pre-release forking cost and every
 # inter-wave gap -- this is pure request-serving time, and is what
-# aggregate.end_to_end_requests_per_sec divides by. LOAD_WALL_SECONDS
+# aggregate.active_wave_requests_per_sec divides by. LOAD_WALL_SECONDS
 # spans (first wave's barrier-release -> last wave's finish), including
 # inter-wave gaps but still excluding the first wave's own pre-release
 # forking cost -- the number an external observer watching the whole
 # multi-wave load phase actually sees, and what
-# aggregate.load_wall_requests_per_sec divides by. Both are 0/null when
+# aggregate.end_to_end_requests_per_sec divides by. Both are 0/null when
 # the caller has nothing to report (e.g. orchestrator-contract passes
 # `null` for the whole TIMING_JSON).
 make_phase_timing() {
@@ -2435,30 +2506,30 @@ make_phase_timing() {
 #
 # Two different, deliberately separately-named honest aggregate rates are
 # reported instead of one ambiguous number (see launch_hey_jobs/
-# make_phase_timing for the exact boundaries each is measured between):
+# make_phase_timing for the exact boundaries each is measured between).
+# IMPORTANT: the barrier itself is scoped to ONE WAVE -- when hey_waves >
+# 1 (apps exceed MAX_PARALLEL), there is no single barrier spanning every
+# app; only the jobs within each wave are released together. Neither rate
+# below implies all apps launched simultaneously unless hey_waves == 1
+# (see aggregate.barrier_scope/hey_waves).
 #
 # aggregate.end_to_end_requests_per_sec divides total_requests by
+# timing.load_wall_seconds -- (first wave's barrier-release -> last
+# wave's finish). This is the true "end to end" number: it still excludes
+# only the first wave's pre-release forking cost, but DOES include every
+# inter-wave gap, matching what an external observer watching the whole
+# load phase actually experiences. This is the number to report/compare
+# as "the" throughput of a run.
+#
+# aggregate.active_wave_requests_per_sec divides total_requests by
 # timing.wave_active_seconds -- the sum, across every wave, of
 # (barrier-release -> that wave's finish). This excludes ALL per-wave
-# forking/spawn cost and every inter-wave gap, so it measures only the
-# time `hey` processes were actually permitted to send requests: the
-# truest "pure load" throughput number, and the one closest to what the
-# name historically implied but, before the barrier-timing fix, did not
-# actually deliver (the old timing.load_seconds additionally counted the
-# first wave's forking cost and, for multi-wave runs, nothing extra beyond
-# that -- so it was already close for a single wave, but silently included
-# un-measured startup cost for any run small enough that forking wasn't
-# negligible).
-#
-# aggregate.load_wall_requests_per_sec divides total_requests by
-# timing.load_wall_seconds -- (first wave's barrier-release -> last wave's
-# finish). This still excludes the first wave's pre-release forking cost,
-# but DOES include every inter-wave gap, matching what an external
-# observer watching the whole load phase actually experiences once
-# hey_waves > 1. Prefer end_to_end_requests_per_sec when comparing raw
-# request-serving throughput across different MAX_PARALLEL settings;
-# prefer load_wall_requests_per_sec when reporting the throughput a real
-# caller issuing this exact load would observe.
+# forking/spawn cost AND every inter-wave gap, so it measures only the
+# time `hey` processes were actually permitted to send requests: a
+# narrower "pure request-serving" number, useful for isolating load
+# generation cost from inter-wave orchestration overhead, but NOT the
+# number to call "end to end" since it hides inter-wave gaps. Equals
+# end_to_end_requests_per_sec when hey_waves == 1.
 #
 # Both are null when TIMING_JSON/MAX_PARALLEL are not supplied
 # (orchestrator-contract's phase summaries do not currently measure
@@ -2480,13 +2551,13 @@ write_benchmark_summary() {
                 total_requests: $total_requests,
                 sum_of_app_requests_per_sec: ($apps | map(.requests_per_sec) | add),
                 end_to_end_requests_per_sec: (
-                    if ($timing | type) == "object" and (($timing.wave_active_seconds // 0) > 0) then
-                        ($total_requests / $timing.wave_active_seconds)
-                    else null end
-                ),
-                load_wall_requests_per_sec: (
                     if ($timing | type) == "object" and (($timing.load_wall_seconds // 0) > 0) then
                         ($total_requests / $timing.load_wall_seconds)
+                    else null end
+                ),
+                active_wave_requests_per_sec: (
+                    if ($timing | type) == "object" and (($timing.wave_active_seconds // 0) > 0) then
+                        ($total_requests / $timing.wave_active_seconds)
                     else null end
                 ),
                 weighted_mean_latency_ms: (
@@ -2498,7 +2569,8 @@ write_benchmark_summary() {
                     if $max_parallel > 0 then
                         ((($apps | length) + $max_parallel - 1) / $max_parallel | floor)
                     else null end
-                )
+                ),
+                barrier_scope: (if $max_parallel > 0 then "per_wave" else null end)
             }
         }' >"$output"
 }
