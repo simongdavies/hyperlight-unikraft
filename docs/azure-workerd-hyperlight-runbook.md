@@ -555,25 +555,25 @@ at the same instant; set it to 0 for the old all-at-once release.
 
 ### Raw `hey` output, logs, timing, and throughput metrics
 
-Each of the three load benchmarks saves and displays the complete raw
-`hey` report for every app: a per-app file (`demo-output/<demo>/app-N/
-hey.txt` for `benchmark-resident`, `demo-output/<demo>/app-N-hey.txt` for
+Each of the three load benchmarks saves the complete raw `hey` report for
+every app: a per-app file (`demo-output/<demo>/app-N/hey.txt` for
+`benchmark-resident`, `demo-output/<demo>/app-N-hey.txt` for
 `benchmark-multi-app`) plus a single collected top-level `demo-output/
 <demo>/hey.txt` concatenating all per-app reports with `==== app: NAME
-====` separators. The presenter prints this entire collected file inline
-under a `RAW HEY OUTPUT` heading as part of its evidence (condensed to a
-per-app Summary/Requests-per-sec/Latency-distribution/Status-code-
-distribution block, skipping the histogram/details, once `--benchmark-
-apps` exceeds `HYPERLIGHT_BENCHMARK_RAW_HEY_INLINE_THRESHOLD`/16 — the
-uncondensed per-app and collected files on disk are unaffected), so the
-full `Summary:`/`Requests/sec:`/`Latency distribution:` block for every
-app is visible in the terminal, not only on disk, at any app count. A
-deliberately-concatenated multi-app raw-hey report is a presentation of
-independent per-app `hey` runs placed one after another, not a single
-merged statistical distribution — `hey` reports cannot be averaged or
-combined after the fact into one true aggregate latency/percentile
-distribution, which is why the two numeric aggregate metrics below are
-computed independently rather than parsed out of the concatenated text.
+====` separators. For `benchmark-resident` and `benchmark-multi-app`,
+the presenter prints this collected report inline under a
+`RAW HEY OUTPUT` heading only when exactly one hey client ran
+(`--benchmark-apps 1`); with more than one hey client it prints a short
+note instead (the per-app and collected files on disk are unaffected —
+only the terminal/log inline dump is omitted), since concatenating many
+independent per-app raw reports into the terminal does not scale and is
+rarely what's needed there. A deliberately-concatenated multi-app
+raw-hey report is a presentation of independent per-app `hey` runs
+placed one after another, not a single merged statistical distribution
+— `hey` reports cannot be averaged or combined after the fact into one
+true aggregate latency/percentile distribution, which is why the two
+numeric aggregate metrics below are computed independently rather than
+parsed out of the concatenated text.
 
 Each demo also writes a `run.log` recording start/stage/failure lines
 (including the lifecycle-limit values noted above, plus the effective

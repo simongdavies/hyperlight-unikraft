@@ -129,16 +129,6 @@ hey_max_parallel_jobs_explicit=false
 hey_ramp_ms="${HYPERLIGHT_BENCHMARK_HEY_RAMP_MS:-}"
 hey_ramp_ms_explicit=false
 [[ -n "$hey_ramp_ms" ]] && hey_ramp_ms_explicit=true
-# Above this many apps, the benchmark-resident/benchmark-multi-app presenter
-# switches its inline "RAW HEY OUTPUT" section from dumping every app's full
-# raw hey report (histogram, details, status code distribution -- ~30-40
-# lines each) to a condensed per-app block (Summary/Requests-per-sec/Latency
-# distribution/Status code distribution only, no histogram/details), since
-# at high app counts (e.g. 128) the full dump is thousands of lines and
-# unreadable. The full, uncondensed per-app raw hey output is always still
-# written to disk (dir/hey.txt and each app's own hey.txt file) regardless
-# of this threshold -- only the terminal/log presentation is condensed.
-raw_hey_inline_threshold="${HYPERLIGHT_BENCHMARK_RAW_HEY_INLINE_THRESHOLD:-16}"
 go_bin="${GOBIN:-}"
 if [[ -z "$go_bin" ]] && command -v go >/dev/null; then
     go_bin="$(go env GOBIN 2>/dev/null || true)"
@@ -880,15 +870,10 @@ print_demo_evidence() {
             printf '\n%bSUMMARY JSON%b\n\n' "$c_bold$c_green" "$c_reset"
             jq '.' "$dir/summary.json" | sed 's/^/  /'
             printf '\n%bRAW HEY OUTPUT%b\n\n' "$c_bold$c_green" "$c_reset"
-            if ((benchmark_apps > raw_hey_inline_threshold)); then
-                printf '  (condensed: %d apps > %d-app inline threshold; full raw per-app' \
-                    "$benchmark_apps" "$raw_hey_inline_threshold"
-                printf ' output remains in %s and each app-N/hey.txt)\n' "$dir/hey.txt"
-                local i
-                for ((i = 0; i < benchmark_apps; i++)); do
-                    printf '\n  ---- app bench-%d ----\n\n' "$i"
-                    condensed_hey_block "$dir/app-$i/hey.txt" | sed 's/^/  /'
-                done
+            if ((benchmark_apps > 1)); then
+                printf '  (omitted from terminal/log display: %d hey clients; full raw' \
+                    "$benchmark_apps"
+                printf ' per-app reports remain on disk in %s and each app-N/hey.txt)\n' "$dir/hey.txt"
             else
                 sed 's/^/  /' "$dir/hey.txt"
             fi
@@ -910,15 +895,10 @@ print_demo_evidence() {
             printf '\n%bSUMMARY JSON%b\n\n' "$c_bold$c_green" "$c_reset"
             jq '.' "$dir/summary.json" | sed 's/^/  /'
             printf '\n%bRAW HEY OUTPUT%b\n\n' "$c_bold$c_green" "$c_reset"
-            if ((benchmark_apps > raw_hey_inline_threshold)); then
-                printf '  (condensed: %d apps > %d-app inline threshold; full raw per-app' \
-                    "$benchmark_apps" "$raw_hey_inline_threshold"
-                printf ' output remains in %s and each app-N-hey.txt)\n' "$dir/hey.txt"
-                local i
-                for ((i = 0; i < benchmark_apps; i++)); do
-                    printf '\n  ---- app app-%d ----\n\n' "$i"
-                    condensed_hey_block "$dir/app-$i-hey.txt" | sed 's/^/  /'
-                done
+            if ((benchmark_apps > 1)); then
+                printf '  (omitted from terminal/log display: %d hey clients; full raw' \
+                    "$benchmark_apps"
+                printf ' per-app reports remain on disk in %s and each app-N-hey.txt)\n' "$dir/hey.txt"
             else
                 sed 's/^/  /' "$dir/hey.txt"
             fi
@@ -1678,27 +1658,6 @@ write_collected_hey_report() {
             cat "${_wchr_files[i]}"
         done
     } >"$output"
-}
-
-# condensed_hey_block HEY_OUTPUT_FILE
-#
-# Prints a condensed view of one app's raw `hey` report: the Summary
-# block (includes Requests/sec), the Latency distribution block, and the
-# Status code distribution block -- but skips the verbose Response time
-# histogram and per-phase Details blocks. Used by the benchmark-resident
-# and benchmark-multi-app presenters for the inline "RAW HEY OUTPUT"
-# section once --benchmark-apps exceeds $raw_hey_inline_threshold, so a
-# 128-app run doesn't dump thousands of lines of histogram bars to the
-# terminal/log. The full, uncondensed report is unaffected by this and
-# remains on disk (see write_collected_hey_report and each app's own
-# hey-output file).
-condensed_hey_block() {
-    local file="$1"
-    sed -n '/^Summary:/,/^Response time histogram:/p' "$file" | sed '$d'
-    echo
-    sed -n '/^Latency distribution:/,/^Details (/p' "$file" | sed '$d'
-    echo
-    sed -n '/^Status code distribution:/,$p' "$file"
 }
 
 # build_app_summary APP_ID REQUESTS CONCURRENCY HEY_OUTPUT_FILE
