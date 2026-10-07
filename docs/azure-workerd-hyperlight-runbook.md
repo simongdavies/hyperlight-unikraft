@@ -593,6 +593,20 @@ true aggregate latency/percentile distribution, which is why the two
 numeric aggregate metrics below are computed independently rather than
 parsed out of the concatenated text.
 
+For `benchmark-resident` and `benchmark-multi-app`, `hey` itself truncates
+a client's delivered request count to a multiple of its `-c` concurrency
+(e.g. `hey -n 31 -c 2` sends only 30 requests), so per-app request/
+concurrency shares are jointly allocated to keep every app's count an
+exact multiple of its own concurrency while still summing to exactly the
+requested `--benchmark-load-requests` total. On the rare combination of
+app count, concurrency, and request total where that isn't exactly
+expressible (every app sharing one concurrency value with a deficit that
+isn't a multiple of it), the shortfall is covered by one extra
+concurrency-1 `hey` job against the first app, reported as its own
+`summary.json` entry (`bench-0-remainder` / `app-0-remainder`) and its
+own `demo-output/<demo>/conservation-remainder-hey.txt` file — never
+silently dropped from the reported total.
+
 Each demo also writes a `run.log` recording start/stage/failure lines
 (including the lifecycle-limit values noted above, plus the effective
 `hey_max_parallel_jobs`/`hey_ramp_ms` for the run) and a `timing.json`-

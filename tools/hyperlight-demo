@@ -1278,6 +1278,259 @@ allocate_evenly() {
     done
 }
 
+# snap_reqs_to_hey_achievable REQ_ALLOC_FOR_APP CONC
+#
+# hey (`rakyll/hey`) truncates its own request count to a multiple of its
+# concurrency: it hands every one of its -c workers exactly n/c requests
+# (integer division) with no remainder distribution, so `hey -n 31 -c 2`
+# sends only 30 requests, not 31, whenever -n isn't an exact multiple of
+# -c (confirmed directly: `hey -n 31 -c 2` against a plain HTTP server
+# reports "[200] 30 responses"). Any demo that allocates per-app request
+# counts via allocate_evenly and then asserts on hey's reported response
+# count must snap the target down to what hey will actually send BEFORE
+# launching hey or asserting on its output -- otherwise an allocation that
+# happens to be a non-multiple of its app's concurrency share (e.g.
+# apps=32, load-requests=1000, concurrency=64 gives some apps 31
+# requests at concurrency 2) silently fails with "did not report N 200
+# responses" even though hey exited 0 and the server served every request
+# it received correctly. If the floor lands on 0 (alloc smaller than
+# conc), round up to conc instead of asserting on zero requests.
+snap_reqs_to_hey_achievable() {
+    local req_alloc_for_app="$1" conc="$2"
+    local reqs=$(((req_alloc_for_app / conc) * conc))
+    ((reqs > 0)) || reqs="$conc"
+    printf '%s\n' "$reqs"
+}
+
+# allocate_requests_hey_achievable TOTAL_REQUESTS PARTS CONC_ARRNAME
+#                                  REQ_OUT_ARRNAME REMAINDER_VARNAME
+#
+# Like snap_reqs_to_hey_achievable, but jointly across every app instead
+# of one app at a time: snapping each app's request count down to a
+# multiple of its own concurrency independently (as the simpler
+# per-app-only helper does) can under-deliver the caller's requested
+# TOTAL_REQUESTS -- e.g. apps=32, load-requests=1000, concurrency=64
+# gives 24 apps a (31 requests, concurrency 2) share, each of which snaps
+# down to 30, so only 976 of the requested 1000 would ever be sent. This
+# demo claims "All $benchmark_load_requests requests ... succeeded", so
+# silently sending fewer is incorrect, not merely imprecise.
+#
+# Starts from allocate_evenly's proportional per-app target (which sums
+# to TOTAL_REQUESTS exactly), floors each app down to the nearest
+# multiple of CONC_ARRNAME[i] (the only direction a floor can go without
+# exceeding what hey can actually deliver at that concurrency -- see
+# snap_reqs_to_hey_achievable), then restores as much of the lost total
+# as is mathematically expressible, distributing the restored chunks
+# round-robin across apps sharing each concurrency denomination (rather
+# than dumping it all on one app), which keeps the distribution close to
+# even as the ACTION text promises.
+#
+# Restoring the lost total is a non-negative coin-change search: the
+# distinct concurrency values actually present are the available "coin"
+# denominations, each reusable any number of times across apps (bumping
+# the same app more than once keeps its count a multiple of its own
+# concurrency just as well as spreading across apps does). A GREEDY
+# round-robin sweep (try each app in order, bump if it fits, repeat) was
+# tried first and is wrong: it can burn a scarce denomination on an app
+# visited early and leave a leftover that denomination can no longer
+# complete, even though a full-coverage combination exists using only
+# the OTHER denomination (confirmed live: apps=32, concurrency=65 gives
+# 31 apps at concurrency 2 and 1 at concurrency 3; a deficit of 26 is
+# fully expressible as thirteen 2s, but greedily bumping the lone
+# concurrency-3 app first leaves an odd, concurrency-2-only leftover of
+# 23, which is NOT expressible, producing a false nonzero remainder).
+# So this instead runs an exact unbounded coin-change DP over
+# 0..remaining using the distinct denominations present, to find the
+# LARGEST amount of the deficit that is actually expressible by any
+# combination (not just the first one a greedy sweep happens to try),
+# and only reports whatever truly can't be expressed as the remainder.
+#
+# This always succeeds (remainder 0) when at least one denomination with
+# value 1 is available (any app with concurrency 1 can absorb an
+# arbitrary leftover one request at a time), and the DP correctly proves
+# the smaller-scale case this replaces (3 apps all at concurrency 3, with
+# a deficit of 1) is genuinely inexpressible rather than guessing. The
+# true leftover is written to REMAINDER_VARNAME rather than silently
+# dropped; the caller is expected to cover it with a dedicated extra
+# concurrency-1 hey job (see the "conservation remainder" handling in
+# run_benchmark_resident/run_benchmark_multi_app), since a concurrency-1
+# invocation can always deliver any exact count with no truncation risk.
+allocate_requests_hey_achievable() {
+    local total_requests="$1" parts="$2"
+    local -n _arha_conc="$3"
+    local -n _arha_req_out="$4"
+    local -n _arha_remainder="$5"
+
+    local -a proportional
+    allocate_evenly "$total_requests" "$parts" proportional
+
+    local i c floor_i sum_floor=0
+    _arha_req_out=()
+    for ((i = 0; i < parts; i++)); do
+        c="${_arha_conc[i]}"
+        ((c > 0)) || c=1
+        floor_i=$(((proportional[i] / c) * c))
+        _arha_req_out+=("$floor_i")
+        sum_floor=$((sum_floor + floor_i))
+    done
+
+    local remaining=$((total_requests - sum_floor))
+    if ((remaining > 0)); then
+        # Distinct denominations present, with how many apps share each
+        # one. The DP below breaks reachability ties (several
+        # denominations can express the same value) by trying the
+        # denomination with the MOST matching apps first: with only this
+        # change, ties would instead resolve in whatever order the
+        # denominations were first encountered while scanning apps by
+        # index, which can pick a denomination with very few (even just
+        # one) matching apps purely because that app happens to come
+        # first -- confirmed live for apps=32/requests=1000/concurrency=
+        # 65 (31 apps at concurrency 2, 1 app at concurrency 3, with the
+        # lone concurrency-3 app at index 0): encounter order tried
+        # denomination 3 first, and since 2 and 3 can jointly express
+        # every integer >= 2, via[] greedily kept choosing 3 for nearly
+        # the whole deficit, piling eight +3 chunks onto that single app
+        # (30 -> 54 requests, +22 over its target of 32) instead of
+        # spreading the deficit across the 31 apps that share
+        # concurrency 2. Preferring the more popular denomination first
+        # fixes this: it reproduces the intended "thirteen 2s" combination
+        # from this function's docstring, spreading the deficit across
+        # many apps instead of concentrating it on one.
+        local -a denoms=() denom_counts=()
+        local d found di
+        for ((i = 0; i < parts; i++)); do
+            c="${_arha_conc[i]}"
+            ((c > 0)) || c=1
+            found=0
+            for ((di = 0; di < ${#denoms[@]}; di++)); do
+                if [[ "${denoms[di]}" == "$c" ]]; then
+                    found=1
+                    denom_counts[di]=$((denom_counts[di] + 1))
+                    break
+                fi
+            done
+            if ((!found)); then
+                denoms+=("$c")
+                denom_counts+=(1)
+            fi
+        done
+        # Stable descending sort of denoms by denom_counts (insertion
+        # sort; the number of distinct concurrency values is small).
+        local a b tmp_d tmp_cnt
+        for ((a = 1; a < ${#denoms[@]}; a++)); do
+            tmp_d="${denoms[a]}"
+            tmp_cnt="${denom_counts[a]}"
+            b=$((a - 1))
+            while ((b >= 0)) && ((denom_counts[b] < tmp_cnt)); do
+                denoms[b + 1]="${denoms[b]}"
+                denom_counts[b + 1]="${denom_counts[b]}"
+                b=$((b - 1))
+            done
+            denoms[b + 1]="$tmp_d"
+            denom_counts[b + 1]="$tmp_cnt"
+        done
+
+        # reachable[v]=1 if v is expressible as a non-negative combination
+        # of the available denominations; via[v]=denomination last used to
+        # reach v, for reconstructing the combination.
+        local -a reachable via
+        reachable[0]=1
+        local v
+        for ((v = 1; v <= remaining; v++)); do
+            reachable[v]=0
+            for d in "${denoms[@]}"; do
+                if ((v >= d)) && [[ "${reachable[v - d]:-0}" == 1 ]]; then
+                    reachable[v]=1
+                    via[v]="$d"
+                    break
+                fi
+            done
+        done
+
+        # Largest fully-expressible amount <= remaining; whatever is left
+        # over after covering that amount is the genuine remainder.
+        local covered=0
+        for ((v = remaining; v >= 0; v--)); do
+            if [[ "${reachable[v]:-0}" == 1 ]]; then
+                covered="$v"
+                break
+            fi
+        done
+        _arha_remainder=$((remaining - covered))
+
+        # Reconstruct the combination of denomination-chunks that sums to
+        # "covered", then round-robin distribute those chunks across the
+        # apps that share each denomination (bumping an app more than
+        # once if a denomination's chunk count exceeds how many apps use
+        # it).
+        local -a chunk_counts=()
+        for d in "${denoms[@]}"; do chunk_counts+=(0); done
+        v="$covered"
+        while ((v > 0)); do
+            d="${via[v]}"
+            local di=0
+            for ((i = 0; i < ${#denoms[@]}; i++)); do
+                [[ "${denoms[i]}" == "$d" ]] && di="$i" && break
+            done
+            chunk_counts[di]=$((chunk_counts[di] + 1))
+            v=$((v - d))
+        done
+
+        local di
+        for ((di = 0; di < ${#denoms[@]}; di++)); do
+            d="${denoms[di]}"
+            local need="${chunk_counts[di]}"
+            ((need > 0)) || continue
+            # Apps sharing this concurrency denomination, together with
+            # each one's residual (how much of its allocate_evenly
+            # proportional target was lost to the earlier floor step).
+            # Chunks go to the greatest-residual apps first so a bump
+            # moves an under-target app toward its target instead of
+            # pushing an already-on-target app past it -- e.g. for
+            # apps=32/requests=1000/concurrency=64 (uniform conc=2), 24
+            # apps floor from target 31 to 30 (residual 1) and 8 apps
+            # floor from target 32 to 32 (residual 0); preferring the
+            # residual-1 apps for the 12 needed +2 chunks yields 20 apps
+            # at 32 + 12 apps at 30 (max deviation 1 from target), not
+            # the deviation-2 result of bumping residual-0 apps to 34
+            # while leaving residual-1 apps at 30. Ties (equal residual)
+            # break by ascending index for determinism.
+            local -a matching_idx=() matching_residual=()
+            for ((i = 0; i < parts; i++)); do
+                c="${_arha_conc[i]}"
+                ((c > 0)) || c=1
+                if ((c == d)); then
+                    matching_idx+=("$i")
+                    matching_residual+=($((proportional[i] - _arha_req_out[i])))
+                fi
+            done
+            local nmatch="${#matching_idx[@]}"
+            # Stable descending sort by residual (insertion sort; nmatch
+            # is bounded by the demo's app count, so this is cheap).
+            local a b tmp_idx tmp_res
+            for ((a = 1; a < nmatch; a++)); do
+                tmp_idx="${matching_idx[a]}"
+                tmp_res="${matching_residual[a]}"
+                b=$((a - 1))
+                while ((b >= 0)) && ((matching_residual[b] < tmp_res)); do
+                    matching_idx[b + 1]="${matching_idx[b]}"
+                    matching_residual[b + 1]="${matching_residual[b]}"
+                    b=$((b - 1))
+                done
+                matching_idx[b + 1]="$tmp_idx"
+                matching_residual[b + 1]="$tmp_res"
+            done
+            local k idx
+            for ((k = 0; k < need; k++)); do
+                idx="${matching_idx[k % nmatch]}"
+                _arha_req_out[idx]=$((_arha_req_out[idx] + d))
+            done
+        done
+    else
+        _arha_remainder=0
+    fi
+}
+
 # compute_benchmark_classes MODE SELECTED
 #
 # Decides which benchmark flag-validation class(es) apply to the demo
@@ -1568,8 +1821,178 @@ self_test() {
         4 2 2 2
     unset -f assert_phase_b_batch
 
+    # Regression guard for the benchmark-resident/benchmark-multi-app
+    # "did not report N 200 responses" bug: hey truncates -n to a multiple
+    # of -c (confirmed live: `hey -n 31 -c 2` sends only 30 requests), so
+    # any per-app request target computed via allocate_evenly must be
+    # snapped down to what hey will actually send before it's used as both
+    # hey's -n argument and the expected-response-count assertion.
+    assert_snap_reqs() {
+        local label="$1" req_alloc_for_app="$2" conc="$3" expected="$4"
+        local got
+        got="$(snap_reqs_to_hey_achievable "$req_alloc_for_app" "$conc")"
+        if [[ "$got" != "$expected" ]]; then
+            printf 'FAIL snap_reqs_to_hey_achievable %s: expected %s got %s\n' \
+                "$label" "$expected" "$got" >&2
+            failures=$((failures + 1))
+        fi
+    }
+
+    # Exact reported repro: --benchmark-apps 32 --benchmark-load-requests
+    # 1000 --benchmark-concurrency 64 -> allocate_evenly(1000,32) gives 8
+    # apps 32 requests and 24 apps 31 requests; allocate_evenly(64,32)
+    # gives every app conc=2 (C > M, non-divisible per-app share).
+    assert_snap_reqs "exact repro, divisible share (alloc 32, conc 2)" 32 2 32
+    assert_snap_reqs "exact repro, non-divisible share (alloc 31, conc 2)" 31 2 30
+    assert_snap_reqs "alloc smaller than conc rounds up to conc (alloc 1, conc 4)" 1 4 4
+    assert_snap_reqs "alloc exactly equal to conc (alloc 4, conc 4)" 4 4 4
+    assert_snap_reqs "non-divisible large allocation (alloc 75, conc 4)" 75 4 72
+    assert_snap_reqs "concurrency equal to requests, C == N (alloc 64, conc 64)" 64 64 64
+    unset -f assert_snap_reqs
+
+    # Regression guard for the follow-up bug: snap_reqs_to_hey_achievable
+    # is correct per-app but, applied independently to every app, can
+    # under-deliver the user's requested total (e.g. apps=32,
+    # load-requests=1000, concurrency=64 only ever sends 976 of the
+    # requested 1000). allocate_requests_hey_achievable must instead
+    # conserve the exact total across all apps while keeping every app's
+    # count hey-achievable, and must report an honest nonzero remainder
+    # (never silently drop) when that is mathematically impossible with
+    # the given per-app concurrency values.
+    assert_conservation() {
+        local label="$1" expected_remainder="$2" total_requests="$3" parts="$4"
+        shift 4
+        local -a conc_in=("$@")
+        local -a req_out
+        local remainder
+        allocate_requests_hey_achievable "$total_requests" "$parts" conc_in req_out remainder
+        if [[ "$remainder" != "$expected_remainder" ]]; then
+            printf 'FAIL allocate_requests_hey_achievable %s: remainder expected %s got %s\n' \
+                "$label" "$expected_remainder" "$remainder" >&2
+            failures=$((failures + 1))
+            return
+        fi
+        local sum=0 i c
+        for ((i = 0; i < parts; i++)); do
+            sum=$((sum + req_out[i]))
+            c="${conc_in[i]}"
+            ((c > 0)) || c=1
+            if ((req_out[i] % c != 0)); then
+                printf 'FAIL allocate_requests_hey_achievable %s: app %d req=%s not a multiple of conc=%s\n' \
+                    "$label" "$i" "${req_out[i]}" "$c" >&2
+                failures=$((failures + 1))
+            fi
+        done
+        if ((sum + remainder != total_requests)); then
+            printf 'FAIL allocate_requests_hey_achievable %s: sum(req)=%s + remainder=%s != total=%s\n' \
+                "$label" "$sum" "$remainder" "$total_requests" >&2
+            failures=$((failures + 1))
+        fi
+    }
+
+    local -a conc_c64 conc_c32 conc_c65 conc_c9
+    allocate_evenly 64 32 conc_c64
+    allocate_evenly 32 32 conc_c32
+    allocate_evenly 65 32 conc_c65
+    allocate_evenly 9 3 conc_c9
+
+    # Exact reported repro: apps=32, load-requests=1000, concurrency=64 --
+    # every app gets concurrency 2 (uniform, 64/32); must still sum to
+    # exactly 1000, with every per-app count divisible by 2.
+    assert_conservation "M=32,N=1000,C=64 (uniform conc=2)" 0 1000 32 "${conc_c64[@]}"
+    # Adjacent case: concurrency == apps, every app gets concurrency 1
+    # (trivially hey-achievable at any count).
+    assert_conservation "M=32,N=1000,C=32 (uniform conc=1)" 0 1000 32 "${conc_c32[@]}"
+    # Adjacent case: non-divisible C/M gives 31 apps conc=2 and 1 app
+    # conc=3 -- two different concurrency "denominations" in play.
+    assert_conservation "M=32,N=1000,C=65 (non-uniform conc 2/3)" 0 1000 32 "${conc_c65[@]}"
+    # Mathematically-impossible-without-a-remainder case: 3 apps all at
+    # concurrency 3, total 10 -- allocate_evenly(10,3) gives [4,3,3],
+    # flooring to [3,3,3] (sum 9); the missing 1 request cannot be formed
+    # from any non-negative combination of concurrency-3 chunks, so the
+    # function must report remainder=1 rather than silently returning a
+    # sum of 9 and calling it done. The caller's "conservation remainder"
+    # fallback (one extra concurrency-1 hey job) is what actually covers
+    # this in run_benchmark_resident/run_benchmark_multi_app.
+    assert_conservation "M=3,N=10,C=9 (all conc=3, impossible remainder)" 1 10 3 "${conc_c9[@]}"
+    unset -f assert_conservation
+
+    # Regression guard for the DP's denomination-choice fairness bug:
+    # when several denominations could equally extend coverage, the
+    # reconstruction must prefer the denomination with the MOST matching
+    # apps, not whichever concurrency value happens to appear first by
+    # app index -- otherwise it can pile the whole deficit onto one
+    # scarce-denomination app instead of spreading it (confirmed live
+    # for apps=32/concurrency=65: encounter order piled eight extra +3
+    # chunks onto the lone concurrency-3 app, taking its actual count
+    # from a target of 32 to 54). Flooring an app to a multiple of its
+    # own concurrency can only ever move it down by less than its own
+    # concurrency, and no correct reconstruction should need to move an
+    # app further than one more concurrency unit past that, so
+    # |actual - target| must never exceed the app's own concurrency.
+    assert_fairness_bound() {
+        local label="$1" total_requests="$2" parts="$3"
+        shift 3
+        local -a conc_in=("$@")
+        local -a proportional req_out
+        local remainder
+        allocate_evenly "$total_requests" "$parts" proportional
+        allocate_requests_hey_achievable "$total_requests" "$parts" conc_in req_out remainder
+        local i c dev
+        for ((i = 0; i < parts; i++)); do
+            c="${conc_in[i]}"
+            ((c > 0)) || c=1
+            dev=$((req_out[i] - proportional[i]))
+            ((dev < 0)) && dev=$((-dev))
+            if ((dev > c)); then
+                printf 'FAIL allocate_requests_hey_achievable %s: app %d deviates %s from target %s (conc=%s, max allowed %s)\n' \
+                    "$label" "$i" "$((req_out[i] - proportional[i]))" "${proportional[i]}" "$c" "$c" >&2
+                failures=$((failures + 1))
+            fi
+        done
+    }
+    assert_fairness_bound "M=32,N=1000,C=64 (uniform conc=2)" 1000 32 "${conc_c64[@]}"
+    assert_fairness_bound "M=32,N=1000,C=32 (uniform conc=1)" 1000 32 "${conc_c32[@]}"
+    assert_fairness_bound "M=32,N=1000,C=65 (non-uniform conc 2/3)" 1000 32 "${conc_c65[@]}"
+    assert_fairness_bound "M=3,N=10,C=9 (all conc=3, impossible remainder)" 10 3 "${conc_c9[@]}"
+    unset -f assert_fairness_bound
+
+    # Regression guard specifically for the exact reported repro's
+    # distribution: before the residual-priority fairness fix,
+    # reconstruction bumped whichever 12 apps happened to come first in
+    # index order -- which could be 8 apps already sitting exactly on
+    # their proportional target (32) getting pushed to 34 (deviation 2),
+    # while 12 of the 24 under-target apps (target 31, floored to 30)
+    # were left there unfinished. Preferring the greatest-residual apps
+    # first must instead finish exactly 12 of those 24 under-target apps
+    # (30 -> 32), yielding 20 apps total at 32 requests (12 bumped + the
+    # 8 already there) and 12 apps left at 30, with no app anywhere at 34.
+    assert_exact_frequency() {
+        local label="$1" total_requests="$2" parts="$3"
+        shift 3
+        local -a conc_in=("$@")
+        local -a req_out
+        local remainder
+        allocate_requests_hey_achievable "$total_requests" "$parts" conc_in req_out remainder
+        local i count_32=0 count_30=0 count_other=0
+        for ((i = 0; i < parts; i++)); do
+            case "${req_out[i]}" in
+                32) count_32=$((count_32 + 1)) ;;
+                30) count_30=$((count_30 + 1)) ;;
+                *) count_other=$((count_other + 1)) ;;
+            esac
+        done
+        if ((count_32 != 20 || count_30 != 12 || count_other != 0)); then
+            printf 'FAIL allocate_requests_hey_achievable %s: expected 20 apps@32 + 12 apps@30 + 0 other, got %s@32 + %s@30 + %s other\n' \
+                "$label" "$count_32" "$count_30" "$count_other" >&2
+            failures=$((failures + 1))
+        fi
+    }
+    assert_exact_frequency "M=32,N=1000,C=64 exact distribution" 1000 32 "${conc_c64[@]}"
+    unset -f assert_exact_frequency
+
     if ((failures == 0)); then
-        echo "self-test: all allocate_evenly, benchmark-flag-validation, helper-executability, post-signal-probe-classification, and phase-b-batch-sizing assertions passed"
+        echo "self-test: all allocate_evenly, benchmark-flag-validation, helper-executability, post-signal-probe-classification, phase-b-batch-sizing, hey-request-snapping, request-conservation, and request-conservation-fairness assertions passed"
         return 0
     fi
     echo "self-test: $failures assertion(s) failed" >&2
@@ -2486,15 +2909,35 @@ run_benchmark_resident() {
     allocate_evenly "$benchmark_load_requests" "$benchmark_apps" req_alloc
     allocate_evenly "$benchmark_concurrency" "$benchmark_apps" conc_alloc
 
-    local -a reqs concs urls hosts timeouts outfiles statuses status_files
+    # Decide each app's concurrency first (same cap as before: never ask
+    # for more concurrency than that app's proportional request share),
+    # then jointly allocate request counts across ALL apps at once so
+    # every app's count stays an exact multiple of its OWN concurrency
+    # (hey-achievable) while the grand total is still held to exactly
+    # $benchmark_load_requests -- see allocate_requests_hey_achievable's
+    # docstring for why snapping each app independently (as this used to
+    # do) can silently under-deliver the user's requested total.
+    local -a eff_conc
     local i
+    for ((i = 0; i < benchmark_apps; i++)); do
+        local c=$((conc_alloc[i] < req_alloc[i] ? conc_alloc[i] : req_alloc[i]))
+        ((c > 0)) || c=1
+        eff_conc[i]="$c"
+    done
+    local -a reqs_alloc_final
+    local conservation_remainder
+    allocate_requests_hey_achievable "$benchmark_load_requests" "$benchmark_apps" \
+        eff_conc reqs_alloc_final conservation_remainder
+    log_line "$run_log" "request allocation: eff_conc=$(IFS=,; echo "${eff_conc[*]}")" \
+        "reqs=$(IFS=,; echo "${reqs_alloc_final[*]}") conservation_remainder=$conservation_remainder"
+
+    local -a reqs concs urls hosts timeouts outfiles statuses status_files
     for ((i = 0; i < benchmark_apps; i++)); do
         local app_dir="$dir/app-$i"
         mkdir -p "$app_dir"
         local port=$((8320 + i))
         local bind="127.0.0.1:$port"
-        local conc=$((conc_alloc[i] < req_alloc[i] ? conc_alloc[i] : req_alloc[i]))
-        ((conc > 0)) || conc=1
+        local conc="${eff_conc[i]}"
         local queue_capacity=64
         ((conc * 4 > queue_capacity)) && queue_capacity=$((conc * 4))
         local pool
@@ -2518,7 +2961,7 @@ run_benchmark_resident() {
         log_line "$run_log" "app bench-$i launched: pid=$app_pid bind=$bind" \
             "server_log=$app_dir/server.log"
         log_line "$run_log" "app bench-$i ready: elapsed=$(seconds_between "$app_t0" "$app_t1")s"
-        reqs[i]="${req_alloc[i]}"
+        reqs[i]="${reqs_alloc_final[i]}"
         concs[i]="$conc"
         urls[i]="http://$bind/sync"
         hosts[i]="bench.resident.test"
@@ -2526,6 +2969,28 @@ run_benchmark_resident() {
         outfiles[i]="$app_dir/hey.txt"
         status_files[i]="$app_dir/status.json"
     done
+
+    # If the per-app concurrency values could not express the full
+    # requested total exactly (see allocate_requests_hey_achievable's
+    # docstring -- e.g. every app shares one identical concurrency and the
+    # deficit isn't a multiple of it), cover the shortfall with one extra
+    # concurrency-1 job against the first app: a concurrency-1 hey
+    # invocation always delivers exactly the count asked for (n/1 has no
+    # remainder to truncate), so this always restores exact conservation,
+    # and it is reported as its own distinct, clearly-labeled app summary
+    # row rather than folded invisibly into another app's numbers.
+    if ((conservation_remainder > 0)); then
+        local remainder_idx="$benchmark_apps"
+        reqs[remainder_idx]="$conservation_remainder"
+        concs[remainder_idx]=1
+        urls[remainder_idx]="${urls[0]}"
+        hosts[remainder_idx]="${hosts[0]}"
+        timeouts[remainder_idx]="${timeouts[0]}"
+        outfiles[remainder_idx]="$dir/conservation-remainder-hey.txt"
+        log_line "$run_log" "conservation remainder: $conservation_remainder request(s) could not be" \
+            "expressed as a non-negative combination of any app's own concurrency;" \
+            "covering via one extra concurrency-1 hey job against bench-0"
+    fi
 
     t_setup_done="$(now_seconds)"
     log_line "$run_log" "setup phase complete: elapsed=$(seconds_between "$t_start" "$t_setup_done")s"
@@ -2537,17 +3002,27 @@ run_benchmark_resident() {
     local -a app_ids cmds
     local app_summaries="[]"
     for ((i = 0; i < benchmark_apps; i++)); do
+        # These used to be bare `[[ ]]`/`grep -Eq` relying on `set -e` to
+        # abort: that prints nothing to stdout/stderr, so run_one's
+        # top-level per-demo log (which only captures this function's own
+        # stdout/stderr, not the separate run_log that log_line writes to)
+        # was left empty on failure. Printing the diagnostic to stderr
+        # here ensures it lands in both logs.
         if [[ "${statuses[i]}" != 0 ]]; then
             log_line "$run_log" "FAILURE: app bench-$i hey exit=${statuses[i]}" \
                 "see ${outfiles[i]} and $dir/app-$i/server.log"
+            printf 'FAILURE: app bench-%d hey exited %s (see %s and %s)\n' \
+                "$i" "${statuses[i]}" "${outfiles[i]}" "$dir/app-$i/server.log" >&2
+            return 1
         fi
-        [[ "${statuses[i]}" == 0 ]]
-        if ((reqs[i] > 0)); then
-            if ! grep -Eq "\\[200\\][[:space:]]+${reqs[i]} responses" "${outfiles[i]}"; then
-                log_line "$run_log" "FAILURE: app bench-$i did not report ${reqs[i]} 200 responses" \
-                    "see ${outfiles[i]} and $dir/app-$i/server.log"
-            fi
-            grep -Eq "\\[200\\][[:space:]]+${reqs[i]} responses" "${outfiles[i]}"
+        if ((reqs[i] > 0)) &&
+            ! grep -Eq "\\[200\\][[:space:]]+${reqs[i]} responses" "${outfiles[i]}"; then
+            log_line "$run_log" "FAILURE: app bench-$i did not report ${reqs[i]} 200 responses" \
+                "see ${outfiles[i]} and $dir/app-$i/server.log"
+            printf 'FAILURE: app bench-%d did not report [200] %s responses (see %s and %s)\n' \
+                "$i" "${reqs[i]}" "${outfiles[i]}" "$dir/app-$i/server.log" >&2
+            tail -n 10 "${outfiles[i]}" | sed 's/^/  /' >&2
+            return 1
         fi
         local port=$((8320 + i))
         curl --fail-with-body --silent --show-error \
@@ -2559,6 +3034,31 @@ run_benchmark_resident() {
         app_ids[i]="bench-$i"
         cmds[i]="hey -n ${reqs[i]} -c ${concs[i]} -t ${timeouts[i]} -host ${hosts[i]} ${urls[i]}"
     done
+
+    if ((conservation_remainder > 0)); then
+        local remainder_idx="$benchmark_apps"
+        if [[ "${statuses[remainder_idx]}" != 0 ]]; then
+            log_line "$run_log" "FAILURE: conservation-remainder hey job exit=${statuses[remainder_idx]}" \
+                "see ${outfiles[remainder_idx]}"
+            printf 'FAILURE: conservation-remainder hey job exited %s (see %s)\n' \
+                "${statuses[remainder_idx]}" "${outfiles[remainder_idx]}" >&2
+            return 1
+        fi
+        if ! grep -Eq "\\[200\\][[:space:]]+${conservation_remainder} responses" "${outfiles[remainder_idx]}"; then
+            log_line "$run_log" "FAILURE: conservation-remainder hey job did not report ${conservation_remainder} 200 responses" \
+                "see ${outfiles[remainder_idx]}"
+            printf 'FAILURE: conservation-remainder hey job did not report [200] %s responses (see %s)\n' \
+                "$conservation_remainder" "${outfiles[remainder_idx]}" >&2
+            tail -n 10 "${outfiles[remainder_idx]}" | sed 's/^/  /' >&2
+            return 1
+        fi
+        local remainder_one
+        remainder_one="$(build_app_summary "bench-0-remainder" "$conservation_remainder" 1 "${outfiles[remainder_idx]}")"
+        app_summaries="$(jq -c --argjson one "$remainder_one" '. + [$one]' <<<"$app_summaries")"
+        app_ids[remainder_idx]="bench-0-remainder"
+        cmds[remainder_idx]="hey -n ${reqs[remainder_idx]} -c ${concs[remainder_idx]} -t ${timeouts[remainder_idx]} -host ${hosts[remainder_idx]} ${urls[remainder_idx]}"
+        log_line "$run_log" "conservation remainder covered: bench-0-remainder reported ${conservation_remainder} 200 responses"
+    fi
 
     write_collected_hey_report "$dir/hey.txt" app_ids urls cmds outfiles
     jq -s '.' "$dir"/app-*/status.json >"$dir/status.json"
@@ -2597,8 +3097,26 @@ run_benchmark_multi_app() {
     allocate_evenly "$benchmark_load_requests" "$benchmark_apps" req_alloc
     allocate_evenly "$benchmark_concurrency" "$benchmark_apps" conc_alloc
 
-    local -a app_json_lines
+    # Same joint request/concurrency allocation as run_benchmark_resident
+    # (see allocate_requests_hey_achievable's docstring): decide each
+    # app's concurrency first, then allocate request counts across ALL
+    # apps at once so every app's count is hey-achievable while the grand
+    # total still sums to exactly $benchmark_load_requests.
+    local -a eff_conc
     local i
+    for ((i = 0; i < benchmark_apps; i++)); do
+        local c=$((conc_alloc[i] < req_alloc[i] ? conc_alloc[i] : req_alloc[i]))
+        ((c > 0)) || c=1
+        eff_conc[i]="$c"
+    done
+    local -a reqs_alloc_final
+    local conservation_remainder
+    allocate_requests_hey_achievable "$benchmark_load_requests" "$benchmark_apps" \
+        eff_conc reqs_alloc_final conservation_remainder
+    log_line "$run_log" "request allocation: eff_conc=$(IFS=,; echo "${eff_conc[*]}")" \
+        "reqs=$(IFS=,; echo "${reqs_alloc_final[*]}") conservation_remainder=$conservation_remainder"
+
+    local -a app_json_lines
     for ((i = 0; i < benchmark_apps; i++)); do
         local pool
         if ((i % 2 == 0)); then
@@ -2625,15 +3143,32 @@ run_benchmark_multi_app() {
 
     local -a reqs concs urls hosts timeouts outfiles statuses
     for ((i = 0; i < benchmark_apps; i++)); do
-        local conc=$((conc_alloc[i] < req_alloc[i] ? conc_alloc[i] : req_alloc[i]))
-        ((conc > 0)) || conc=1
-        reqs[i]="${req_alloc[i]}"
+        local conc="${eff_conc[i]}"
+        reqs[i]="${reqs_alloc_final[i]}"
         concs[i]="$conc"
         urls[i]="http://$bind/sync"
         hosts[i]="app-$i.bench"
         timeouts[i]=30
         outfiles[i]="$dir/app-$i-hey.txt"
     done
+
+    # See the identical conservation-remainder handling in
+    # run_benchmark_resident: cover any leftover that the per-app
+    # concurrency values couldn't express exactly with one extra
+    # concurrency-1 job (always exact, no truncation risk) against app-0.
+    if ((conservation_remainder > 0)); then
+        local remainder_idx="$benchmark_apps"
+        reqs[remainder_idx]="$conservation_remainder"
+        concs[remainder_idx]=1
+        urls[remainder_idx]="${urls[0]}"
+        hosts[remainder_idx]="${hosts[0]}"
+        timeouts[remainder_idx]="${timeouts[0]}"
+        outfiles[remainder_idx]="$dir/conservation-remainder-hey.txt"
+        log_line "$run_log" "conservation remainder: $conservation_remainder request(s) could not be" \
+            "expressed as a non-negative combination of any app's own concurrency;" \
+            "covering via one extra concurrency-1 hey job against app-0"
+    fi
+
     t_setup_done="$(now_seconds)"
     log_line "$run_log" "setup phase complete: elapsed=$(seconds_between "$t_start" "$t_setup_done")s"
     log_line "$run_log" "load phase start: $benchmark_apps apps, $benchmark_load_requests total requests"
@@ -2644,17 +3179,25 @@ run_benchmark_multi_app() {
     local -a app_ids addrs cmds
     local app_summaries="[]"
     for ((i = 0; i < benchmark_apps; i++)); do
+        # See the identical comment in run_benchmark_resident: a bare
+        # `[[ ]]`/`grep -Eq` assertion here prints nothing on failure, so
+        # the top-level per-demo log stayed empty. Print the diagnostic to
+        # stderr so it lands there.
         if [[ "${statuses[i]}" != 0 ]]; then
             log_line "$run_log" "FAILURE: app app-$i hey exit=${statuses[i]}" \
                 "see ${outfiles[i]} and $dir/server.log"
+            printf 'FAILURE: app app-%d hey exited %s (see %s and %s)\n' \
+                "$i" "${statuses[i]}" "${outfiles[i]}" "$dir/server.log" >&2
+            return 1
         fi
-        [[ "${statuses[i]}" == 0 ]]
-        if ((reqs[i] > 0)); then
-            if ! grep -Eq "\\[200\\][[:space:]]+${reqs[i]} responses" "${outfiles[i]}"; then
-                log_line "$run_log" "FAILURE: app app-$i did not report ${reqs[i]} 200 responses" \
-                    "see ${outfiles[i]} and $dir/server.log"
-            fi
-            grep -Eq "\\[200\\][[:space:]]+${reqs[i]} responses" "${outfiles[i]}"
+        if ((reqs[i] > 0)) &&
+            ! grep -Eq "\\[200\\][[:space:]]+${reqs[i]} responses" "${outfiles[i]}"; then
+            log_line "$run_log" "FAILURE: app app-$i did not report ${reqs[i]} 200 responses" \
+                "see ${outfiles[i]} and $dir/server.log"
+            printf 'FAILURE: app app-%d did not report [200] %s responses (see %s and %s)\n' \
+                "$i" "${reqs[i]}" "${outfiles[i]}" "$dir/server.log" >&2
+            tail -n 10 "${outfiles[i]}" | sed 's/^/  /' >&2
+            return 1
         fi
         local one
         one="$(build_app_summary "app-$i" "${reqs[i]}" "${concs[i]}" "${outfiles[i]}")"
@@ -2663,6 +3206,32 @@ run_benchmark_multi_app() {
         addrs[i]="${urls[i]} (Host: ${hosts[i]})"
         cmds[i]="hey -n ${reqs[i]} -c ${concs[i]} -t ${timeouts[i]} -host ${hosts[i]} ${urls[i]}"
     done
+
+    if ((conservation_remainder > 0)); then
+        local remainder_idx="$benchmark_apps"
+        if [[ "${statuses[remainder_idx]}" != 0 ]]; then
+            log_line "$run_log" "FAILURE: conservation-remainder hey job exit=${statuses[remainder_idx]}" \
+                "see ${outfiles[remainder_idx]}"
+            printf 'FAILURE: conservation-remainder hey job exited %s (see %s)\n' \
+                "${statuses[remainder_idx]}" "${outfiles[remainder_idx]}" >&2
+            return 1
+        fi
+        if ! grep -Eq "\\[200\\][[:space:]]+${conservation_remainder} responses" "${outfiles[remainder_idx]}"; then
+            log_line "$run_log" "FAILURE: conservation-remainder hey job did not report ${conservation_remainder} 200 responses" \
+                "see ${outfiles[remainder_idx]}"
+            printf 'FAILURE: conservation-remainder hey job did not report [200] %s responses (see %s)\n' \
+                "$conservation_remainder" "${outfiles[remainder_idx]}" >&2
+            tail -n 10 "${outfiles[remainder_idx]}" | sed 's/^/  /' >&2
+            return 1
+        fi
+        local remainder_one
+        remainder_one="$(build_app_summary "app-0-remainder" "$conservation_remainder" 1 "${outfiles[remainder_idx]}")"
+        app_summaries="$(jq -c --argjson one "$remainder_one" '. + [$one]' <<<"$app_summaries")"
+        app_ids[remainder_idx]="app-0-remainder"
+        addrs[remainder_idx]="${urls[remainder_idx]} (Host: ${hosts[remainder_idx]})"
+        cmds[remainder_idx]="hey -n ${reqs[remainder_idx]} -c ${concs[remainder_idx]} -t ${timeouts[remainder_idx]} -host ${hosts[remainder_idx]} ${urls[remainder_idx]}"
+        log_line "$run_log" "conservation remainder covered: app-0-remainder reported ${conservation_remainder} 200 responses"
+    fi
 
     curl --fail-with-body --silent --show-error \
         --header "Host: app-0.bench" \
@@ -2795,16 +3364,16 @@ run_benchmark_orchestrator_contract() {
     # hey truncates its own request count to a multiple of -c when -n isn't
     # evenly divisible by -c (observed: `hey -n 75 -c 4` sends only 72, not
     # 75), so the allocated request count is snapped down to the nearest
-    # multiple of its concurrency here, before launching hey or asserting on
-    # its output, rather than asserting on the originally allocated count
-    # and then failing against hey's own silent truncation.
+    # multiple of its concurrency here (snap_reqs_to_hey_achievable, shared
+    # with benchmark-resident and benchmark-multi-app), before launching
+    # hey or asserting on its output, rather than asserting on the
+    # originally allocated count and then failing against hey's own silent
+    # truncation.
     local -a a_reqs a_concs a_urls a_hosts a_timeouts a_outfiles a_statuses
     for ((i = 0; i < benchmark_apps; i++)); do
         local conc=$((conc_alloc[i] < phase_a_alloc[i] ? conc_alloc[i] : phase_a_alloc[i]))
         ((conc > 0)) || conc=1
-        local reqs=$(((phase_a_alloc[i] / conc) * conc))
-        ((reqs > 0)) || reqs="$conc"
-        a_reqs[i]="$reqs"
+        a_reqs[i]="$(snap_reqs_to_hey_achievable "${phase_a_alloc[i]}" "$conc")"
         a_concs[i]="$conc"
         a_urls[i]="http://$bind/sync"
         a_hosts[i]="drain-$i.bench"
