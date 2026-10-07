@@ -1037,22 +1037,32 @@ list_demos() {
 }
 
 stop_processes() {
+    # Two-phase shutdown: signal every tracked process first, then wait on
+    # all of them. Each process's shutdown (closing its VM, flushing
+    # hyperlight resources) then proceeds concurrently instead of being
+    # queued one-at-a-time behind the previous process's wait — at
+    # hundreds of `extra_pids` (one per benchmark-resident app) that
+    # serialized kill-then-wait loop was the dominant teardown cost.
+    local -a signaled_pids=()
     if [[ -n "$demo_pid" ]]; then
         kill -TERM "$demo_pid" 2>/dev/null || true
-        wait "$demo_pid" 2>/dev/null || true
-        demo_pid=""
+        signaled_pids+=("$demo_pid")
     fi
     if [[ -n "$upstream_pid" ]]; then
         kill -TERM "$upstream_pid" 2>/dev/null || true
-        wait "$upstream_pid" 2>/dev/null || true
-        upstream_pid=""
+        signaled_pids+=("$upstream_pid")
     fi
     local pid
     for pid in "${extra_pids[@]:-}"; do
         [[ -n "$pid" ]] || continue
         kill -TERM "$pid" 2>/dev/null || true
+        signaled_pids+=("$pid")
+    done
+    for pid in "${signaled_pids[@]:-}"; do
         wait "$pid" 2>/dev/null || true
     done
+    demo_pid=""
+    upstream_pid=""
     extra_pids=()
 }
 trap stop_processes EXIT INT TERM
@@ -1176,19 +1186,25 @@ write_host_config() {
         >"$output"
 }
 
-# app_config APP_ID HOSTNAME BUNDLE_PATH POOL_JSON [AFFINITY]
+# app_config APP_ID HOSTNAME BUNDLE_PATH POOL_JSON [AFFINITY] [SNAPSHOT_DIR]
 #
 # Builds one `AppConfig` JSON object. POOL_JSON is an already-tagged
 # `AppPoolConfig` object, e.g. `{"kind":"resident","capacity":1,...}`.
+# SNAPSHOT_DIR, if non-empty, is written as the app's `snapshot_dir`
+# (restore-from-prewarmed-snapshot instead of fresh boot+init); omitted
+# entirely otherwise, which keeps today's fresh-boot behavior (the field
+# defaults to `None` server-side).
 app_config() {
     local app_id="$1" hostname="$2" bundle_path="$3" pool_json="$4"
     local affinity="${5:-none}"
+    local snapshot_dir="${6:-}"
     jq -n \
         --arg app_id "$app_id" \
         --arg hostname "$hostname" \
         --arg bundle_path "$bundle_path" \
         --argjson pool "$pool_json" \
         --arg affinity "$affinity" \
+        --arg snapshot_dir "$snapshot_dir" \
         '{
             route: {app_id: $app_id, hostnames: [$hostname], path_prefix: null},
             bundle_path: $bundle_path,
@@ -1197,7 +1213,38 @@ app_config() {
             capability_policy: {},
             pool: $pool,
             connection_affinity: $affinity
-        }'
+        } + (if $snapshot_dir == "" then {} else {snapshot_dir: $snapshot_dir} end)'
+}
+
+# prewarm_shared_snapshot RUN_LOG BUNDLE_PATH SNAPSHOT_DIR
+#
+# Runs `hluk workerd-prewarm-snapshot` once to produce a verified,
+# restorable snapshot at SNAPSHOT_DIR from BUNDLE_PATH (boot + guest
+# `init` + save), so every app config.json generated afterwards can set
+# `snapshot_dir` to it and restore instead of paying its own boot+init
+# cost -- the load -> init -> snapshot -> restore x N pattern. One shared
+# bundle/rootfs/executor/capability-policy means one prewarm covers every
+# app in the run (the fail-closed check in
+# `WorkerVersionSandbox::initialize_from_snapshot_dir` would reject a
+# mismatched one anyway).
+prewarm_shared_snapshot() {
+    local run_log="$1" bundle_path="$2" snapshot_dir="$3"
+    local t0 t1
+    t0="$(now_seconds)"
+    if ! "$root/target/release/hluk" workerd-prewarm-snapshot \
+        --bundle "$bundle_path" \
+        --rootfs "$root/build-elfloader/workerd-executor/rootfs.img" \
+        --executor "$root/build-elfloader/workerd-executor/executor" \
+        --scratch-mb 384 \
+        --snapshot-dir "$snapshot_dir" \
+        --log-level info >"$snapshot_dir.log" 2>&1; then
+        log_line "$run_log" "FAILURE: prewarm snapshot failed; see $snapshot_dir.log"
+        printf 'FAILURE: prewarm snapshot failed (see %s)\n' "$snapshot_dir.log" >&2
+        return 1
+    fi
+    t1="$(now_seconds)"
+    log_line "$run_log" "prewarm snapshot ready: elapsed=$(seconds_between "$t0" "$t1")s" \
+        "snapshot_dir=$snapshot_dir"
 }
 
 wait_for_workerd_host_ready() {
@@ -2135,8 +2182,41 @@ FAKE_HEY
     assert_monotonic_clock
     unset -f assert_monotonic_clock
 
+    # Regression guard for the benchmark-resident "is it hung?" progress
+    # indicator (print_progress_bar): when stdout is NOT a terminal --
+    # the only path self-test/CI can reliably capture via $(...); the
+    # interactive \r bar path requires a real tty and isn't exercised
+    # here -- it must still emit periodic plain-line progress, always
+    # including the very first and last step, and must not error on
+    # TOTAL=0 (guards the division-by-zero edge case).
+    assert_progress_bar() {
+        local out
+        out="$(for ((i = 1; i <= 100; i++)); do print_progress_bar "$i" 100 "test" "$i"; done)"
+        if ! grep -q '1/100' <<<"$out"; then
+            printf 'FAIL print_progress_bar: first step (1/100) not printed\n' >&2
+            failures=$((failures + 1))
+        fi
+        if ! grep -q '100/100' <<<"$out"; then
+            printf 'FAIL print_progress_bar: last step (100/100) not printed\n' >&2
+            failures=$((failures + 1))
+        fi
+        local lines
+        lines=$(grep -c . <<<"$out")
+        if ((lines < 2 || lines > 45)); then
+            printf 'FAIL print_progress_bar: expected roughly ~40 throttled lines for TOTAL=100, got %d\n' "$lines" >&2
+            failures=$((failures + 1))
+        fi
+        local zero_out
+        if ! zero_out="$(print_progress_bar 0 0 "edge" 0 2>&1)"; then
+            printf 'FAIL print_progress_bar: TOTAL=0 should not error, got: %s\n' "$zero_out" >&2
+            failures=$((failures + 1))
+        fi
+    }
+    assert_progress_bar
+    unset -f assert_progress_bar
+
     if ((failures == 0)); then
-        echo "self-test: all allocate_evenly, benchmark-flag-validation, helper-executability, post-signal-probe-classification, phase-b-batch-sizing, hey-request-snapping, request-conservation, request-conservation-fairness, launch_hey_jobs-barrier-timing, and monotonic-clock assertions passed"
+        echo "self-test: all allocate_evenly, benchmark-flag-validation, helper-executability, post-signal-probe-classification, phase-b-batch-sizing, hey-request-snapping, request-conservation, request-conservation-fairness, launch_hey_jobs-barrier-timing, monotonic-clock, and progress-bar assertions passed"
         return 0
     fi
     echo "self-test: $failures assertion(s) failed" >&2
@@ -2449,6 +2529,40 @@ log_line() {
     local logfile="$1"
     shift
     printf '[%s] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" >>"$logfile"
+}
+
+# print_progress_bar CURRENT TOTAL LABEL ELAPSED_SECONDS
+#
+# Renders CURRENT/TOTAL progress on stdout so a long blocking setup loop
+# (e.g. benchmark-resident sequentially booting hundreds/thousands of
+# resident apps -- see run_benchmark_resident) is visibly advancing, not
+# hung, even though log_line only writes to run.log. When stdout is a
+# terminal this draws an in-place "[####------] 12/50 (24%, 3s)" bar via
+# a bare \r (no trailing newline until CURRENT == TOTAL, which also
+# prints the final newline). When stdout is NOT a terminal (piped or
+# redirected, e.g. captured into a file) an in-place \r bar would just
+# look like line noise, so this instead prints one plain line every
+# ~1/40th of TOTAL steps (always including the first and last step) so
+# large runs still show periodic, greppable progress there too.
+print_progress_bar() {
+    local current="$1" total="$2" label="$3" elapsed="$4"
+    ((total > 0)) || total=1
+    local pct=$((current * 100 / total))
+    if [[ -t 1 ]]; then
+        local width=30
+        local filled=$((current * width / total))
+        ((filled > width)) && filled=$width
+        local bar
+        bar="$(printf '%*s' "$filled" '' | tr ' ' '#')$(printf '%*s' $((width - filled)) '')"
+        printf '\r  %s [%s] %d/%d (%d%%, %ds)' "$label" "$bar" "$current" "$total" "$pct" "$elapsed"
+        ((current >= total)) && printf '\n'
+    else
+        local step=$(((total + 39) / 40))
+        ((step < 1)) && step=1
+        if ((current % step == 0 || current >= total)); then
+            printf '  %s: %d/%d (%d%%, %ds)\n' "$label" "$current" "$total" "$pct" "$elapsed"
+        fi
+    fi
 }
 
 # make_phase_timing SETUP_SECONDS LOAD_SECONDS TEARDOWN_SECONDS TOTAL_SECONDS
@@ -3223,6 +3337,31 @@ run_benchmark_resident() {
     log_line "$run_log" "request allocation: eff_conc=$(IFS=,; echo "${eff_conc[*]}")" \
         "reqs=$(IFS=,; echo "${reqs_alloc_final[*]}") conservation_remainder=$conservation_remainder"
 
+    # Every app below boots the exact same bundle under the same shared
+    # rootfs/executor/capability-policy, so one prewarmed snapshot covers
+    # all of them: pay the boot+init cost once here, then every app
+    # below restores from it (load -> init -> snapshot -> restore x N),
+    # instead of each of the $benchmark_apps processes repeating its own
+    # ~2s boot+init. This is what collapses the multi-minute setup phase
+    # at large --benchmark-apps counts down to one prewarm plus N fast
+    # restores.
+    local bench_bundle="$root/examples/workerd-bundles/workerd-pool-benchmark.json"
+    local snapshot_dir="$dir/prewarm-snapshot"
+    rm -rf "$snapshot_dir"
+    printf 'preparing: building reusable resident-app snapshot (one-time boot+init)...\n'
+    prewarm_shared_snapshot "$run_log" "$bench_bundle" "$snapshot_dir" || return 1
+
+    # Starting each resident app is still a blocking, sequential step
+    # (fork its own `hluk workerd-host` process, then poll
+    # /__hyperlight/readyz) before the next app's setup even begins --
+    # see start_workerd_host_extra/wait_for_workerd_host_ready. Each
+    # process itself now restores from $snapshot_dir instead of
+    # fresh-booting, but at large --benchmark-apps counts this
+    # per-process fork/exec/restore/ready-poll loop still takes a
+    # while, and log_line only writes to run.log, not stdout, so a live
+    # run prints nothing and looks hung even though it is steadily
+    # making progress. print_progress_bar below renders this on stdout
+    # so it is visibly not stuck.
     local -a reqs concs urls hosts timeouts outfiles statuses status_files
     for ((i = 0; i < benchmark_apps; i++)); do
         local app_dir="$dir/app-$i"
@@ -3237,7 +3376,7 @@ run_benchmark_resident() {
             '{kind:"resident", capacity:$capacity, queue_capacity:$qc, max_requests_per_vm:null, max_lifetime_secs:null}')"
         local apps_json
         apps_json="$(jq -n --argjson app "$(app_config "bench-$i" bench.resident.test \
-            "$root/examples/workerd-bundles/workerd-pool-benchmark.json" "$pool")" '[$app]')"
+            "$bench_bundle" "$pool" none "$snapshot_dir")" '[$app]')"
         write_host_config "$app_dir/config.json" "$apps_json"
         log_line "$run_log" "app bench-$i config generated: pool=resident capacity=$conc" \
             "queue_capacity=$queue_capacity bind=$bind requests=${req_alloc[i]}"
@@ -3253,6 +3392,8 @@ run_benchmark_resident() {
         log_line "$run_log" "app bench-$i launched: pid=$app_pid bind=$bind" \
             "server_log=$app_dir/server.log"
         log_line "$run_log" "app bench-$i ready: elapsed=$(seconds_between "$app_t0" "$app_t1")s"
+        print_progress_bar "$((i + 1))" "$benchmark_apps" "setup: resident apps ready" \
+            "$(printf '%.0f' "$(seconds_between "$t_start" "$app_t1")")"
         reqs[i]="${reqs_alloc_final[i]}"
         concs[i]="$conc"
         urls[i]="http://$bind/sync"
