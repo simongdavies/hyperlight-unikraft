@@ -1088,6 +1088,37 @@ require_runtime() {
             exit 2
         }
     done
+    require_helper_scripts_executable
+}
+
+# Scripts this file invokes directly by path (e.g. "$root/tools/foo.sh" ...,
+# not "bash $root/tools/foo.sh" or "sh $root/tools/foo.sh"). Direct invocation
+# relies on the kernel honoring the file's executable permission bit, which
+# git tracks per-blob (100755 vs 100644). A fresh clone on a filesystem that
+# respects git's mode bits will fail with "Permission denied" at the shell's
+# exec() call if the tracked mode is 100644, even though the file's contents
+# are a valid, syntactically correct script. Keep this list in sync with the
+# direct "$root/tools/*.sh" call sites below.
+helper_scripts_invoked_directly=(
+    tools/run-workerd-vfs-demo.sh
+    tools/run-workerd-storage-policy-demo.sh
+    tools/run-wintertc-demo.sh
+    tools/run-workerd-fetch-policy-demo.sh
+)
+
+require_helper_scripts_executable() {
+    local helper
+    for helper in "${helper_scripts_invoked_directly[@]}"; do
+        local path="$root/$helper"
+        if [[ ! -e "$path" ]]; then
+            echo "missing $helper; run tools/setup-workerd-demo.sh first" >&2
+            exit 2
+        fi
+        if [[ ! -x "$path" ]]; then
+            echo "$helper is not executable (tracked without the executable bit, or permissions were lost on checkout/copy); run: chmod +x $path" >&2
+            exit 2
+        fi
+    done
 }
 
 wait_for_server() {
@@ -1441,8 +1472,49 @@ self_test() {
         100 10 2 32 32768 fail
     unset -f assert_benchmark_validation
 
+    # Regression guard: tools/hyperlight-demo invokes several tools/*.sh
+    # helpers directly by path (e.g. "$root/tools/run-workerd-vfs-demo.sh"),
+    # which relies on the shell honoring the file's executable permission
+    # bit. git tracks that bit per-blob (100755 vs 100644) independently of
+    # file content, so a helper can be syntactically perfect yet still fail
+    # with "Permission denied" on a fresh clone if it was ever committed, or
+    # re-added, without the executable bit. Catch that offline, without
+    # launching any demo process, by checking every script this file is
+    # known to invoke directly (helper_scripts_invoked_directly) both on
+    # disk and (when git metadata is available) in the index/HEAD tree.
+    assert_helper_executable() {
+        local helper="$1"
+        local path="$root/$helper"
+        if [[ ! -e "$path" ]]; then
+            printf 'FAIL helper executability %s: file does not exist at %s\n' \
+                "$helper" "$path" >&2
+            failures=$((failures + 1))
+            return
+        fi
+        if [[ ! -x "$path" ]]; then
+            printf 'FAIL helper executability %s: not executable on disk (chmod +x %s)\n' \
+                "$helper" "$path" >&2
+            failures=$((failures + 1))
+        fi
+        if command -v git >/dev/null && git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+            local tracked_mode
+            tracked_mode="$(git -C "$root" ls-files -s -- "$helper" 2>/dev/null | awk '{print $1}')"
+            if [[ -n "$tracked_mode" && "$tracked_mode" != "100755" ]]; then
+                printf 'FAIL helper executability %s: git-tracked mode is %s, not 100755\n' \
+                    "$helper" "$tracked_mode" >&2
+                failures=$((failures + 1))
+            fi
+        fi
+    }
+
+    local helper
+    for helper in "${helper_scripts_invoked_directly[@]}"; do
+        assert_helper_executable "$helper"
+    done
+    unset -f assert_helper_executable
+
     if ((failures == 0)); then
-        echo "self-test: all allocate_evenly and benchmark-flag-validation assertions passed"
+        echo "self-test: all allocate_evenly, benchmark-flag-validation, and helper-executability assertions passed"
         return 0
     fi
     echo "self-test: $failures assertion(s) failed" >&2
