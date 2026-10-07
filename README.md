@@ -67,6 +67,9 @@ Larger, self-contained demos live under `demos/`, each with its own `Justfile` a
 
 More details are in [`docs/`](docs/): projects, the manifest and the published images ([`manifest.md`](docs/manifest.md)), how a guest is driven and the ways to run one ([`execution.md`](docs/execution.md)), the contract between a runtime driver and the kernel ([`driver.md`](docs/driver.md)), the host filesystem sandbox ([`fs.md`](docs/fs.md)), guest networking ([`net.md`](docs/net.md)), guest concurrency and snapshot restore ([`concurrency.md`](docs/concurrency.md)), the guest's clocks ([`clock.md`](docs/clock.md)), its random source ([`random.md`](docs/random.md)) and where a sandbox's time goes ([`profiling.md`](docs/profiling.md)).
 
+The experimental VM-per-process fork design and its deliberately limited
+prototype contract are in [`snapshot-fork.md`](docs/snapshot-fork.md).
+
 ## Development
 
 ```bash

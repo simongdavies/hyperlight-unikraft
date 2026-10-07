@@ -173,6 +173,7 @@ pub type HostFunction =
 
 /// The host functions a sandbox offers, by name.
 type HostFunctionTable = Arc<std::collections::BTreeMap<String, HostFunction>>;
+type StdoutHandler = Arc<dyn Fn(&[u8]) -> std::io::Result<()> + Send + Sync + 'static>;
 
 /// What `HostCall` answers: a tag byte, then the result or the error
 /// message.  The drivers read it back (`hl_driver.h`'s `hl_host_call`).
@@ -889,6 +890,8 @@ pub(crate) struct GuestConfig {
     mounts: Vec<Mount>,
     /// Captured guest stdout — accumulated by the HostWrite callback.
     output: Arc<Mutex<GuestOutput>>,
+    /// Optional embedder-owned sink for the exact bytes written to stdout.
+    stdout_handler: Option<StdoutHandler>,
     /// NUL-separated KEY=VALUE pairs for guest env vars.
     env_str: Arc<Mutex<String>>,
     /// The guest's `/etc/resolv.conf`, written by the kernel at boot and on
@@ -926,6 +929,7 @@ impl GuestConfig {
         mounts: Vec<Mount>,
         network: Option<NetworkPolicy>,
         listen_ports: Option<ListenPorts>,
+        stdout_handler: Option<StdoutHandler>,
     ) -> Self {
         // Networking is opt-in: no policy, no host sockets and nothing for
         // the inter-step wait to watch (the `net_*` functions still exist,
@@ -938,6 +942,7 @@ impl GuestConfig {
             initrd_size,
             mounts,
             output: Arc::new(Mutex::new(GuestOutput::default())),
+            stdout_handler,
             env_str: Arc::new(Mutex::new(String::new())),
             resolv_conf: Arc::new(Mutex::new(String::new())),
             net,
@@ -1034,6 +1039,7 @@ impl GuestConfig {
         // HostPrint wraps it in green ANSI) with `print!`, which a test
         // harness captures, and kept for programmatic access.
         let output = self.output.clone();
+        let stdout_handler = self.stdout_handler.clone();
         let prof = self.profile.clone();
         target.register_host_function(
             "HostWrite",
@@ -1045,6 +1051,11 @@ impl GuestConfig {
                 let text = output.lock().unwrap().push(&bytes);
                 print!("{text}");
                 let _ = std::io::stdout().flush();
+                if let Some(handler) = &stdout_handler {
+                    handler(&bytes).map_err(|e| {
+                        hyperlight_host::new_error!("guest stdout handler failed: {}", e)
+                    })?;
+                }
                 Ok(bytes.len() as i32)
             },
         )?;
@@ -1669,6 +1680,7 @@ fn assemble_sandbox(
     network: Option<NetworkPolicy>,
     listen_ports: Option<ListenPorts>,
     host_functions: HostFunctionTable,
+    stdout_handler: Option<StdoutHandler>,
 ) -> Result<(UninitializedSandbox, GuestConfig)> {
     let scratch_size = scratch_mb * 1024 * 1024;
     info!(scratch_mb, "guest memory");
@@ -1738,6 +1750,7 @@ fn assemble_sandbox(
         mounts,
         network,
         listen_ports,
+        stdout_handler,
     )
     .with_host_functions(host_functions);
 
@@ -1787,6 +1800,7 @@ pub struct SandboxBuilder {
     env_vars: Vec<(String, String)>,
     resolv_conf: Option<String>,
     host_functions: std::collections::BTreeMap<String, HostFunction>,
+    stdout_handler: Option<StdoutHandler>,
     profile: Option<bool>,
 }
 
@@ -1805,6 +1819,7 @@ impl SandboxBuilder {
             env_vars: Vec::new(),
             resolv_conf: None,
             host_functions: std::collections::BTreeMap::new(),
+            stdout_handler: None,
             profile: None,
         }
     }
@@ -1969,6 +1984,25 @@ impl SandboxBuilder {
         self
     }
 
+    /// Copy each byte sequence written to guest stdout into an
+    /// embedder-owned sink.
+    ///
+    /// Output is still captured for [`AppSandbox::drain_output`] and printed
+    /// to the host process. The handler runs synchronously in the `HostWrite`
+    /// host call, so a bounded channel provides backpressure. Returning an
+    /// error makes that guest write fail instead of silently dropping bytes.
+    ///
+    /// The handler belongs to the sandbox, not its snapshot. A sandbox
+    /// restored from the same snapshot can therefore connect stdout to a
+    /// different pipe.
+    pub fn stdout_handler<F>(mut self, handler: F) -> Self
+    where
+        F: Fn(&[u8]) -> std::io::Result<()> + Send + Sync + 'static,
+    {
+        self.stdout_handler = Some(Arc::new(handler));
+        self
+    }
+
     /// Register the host functions, bring the guest to a running state, and
     /// return it as a [`AppSandbox`].
     ///
@@ -1988,6 +2022,7 @@ impl SandboxBuilder {
             env_vars,
             resolv_conf,
             host_functions,
+            stdout_handler,
             profile,
         } = self;
         // The empty name asks for the list of functions, one per line, so
@@ -2018,8 +2053,14 @@ impl SandboxBuilder {
         let (sandbox, cfg) = match snapshot {
             Some(snapshot) => {
                 let started = Instant::now();
-                let (sandbox, cfg) =
-                    restore_snapshot(snapshot, mounts, network, listen_ports, host_functions)?;
+                let (sandbox, cfg) = restore_snapshot(
+                    snapshot,
+                    mounts,
+                    network,
+                    listen_ports,
+                    host_functions,
+                    stdout_handler,
+                )?;
                 if let Some(on) = profile {
                     cfg.profile.set_enabled(on);
                 }
@@ -2069,6 +2110,7 @@ impl SandboxBuilder {
                     network,
                     listen_ports,
                     host_functions,
+                    stdout_handler,
                 )?;
                 // Before the boot: the kernel fetches the environment once
                 // on its way to main(), so an entry-point program starts
@@ -2610,6 +2652,7 @@ fn restore_snapshot(
     network: Option<NetworkPolicy>,
     listen_ports: Option<ListenPorts>,
     host_functions: HostFunctionTable,
+    stdout_handler: Option<StdoutHandler>,
 ) -> Result<(Sandbox, GuestConfig)> {
     let config = GuestConfig::new(
         String::new(),
@@ -2619,6 +2662,7 @@ fn restore_snapshot(
         mounts,
         network,
         listen_ports,
+        stdout_handler,
     )
     .with_host_functions(host_functions);
     let mut hf = HostFunctions::default();
@@ -2727,6 +2771,7 @@ mod tests {
             0,
             0,
             Vec::new(),
+            None,
             None,
             None,
         );
