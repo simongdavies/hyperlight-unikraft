@@ -2,6 +2,7 @@
   "protocol_version": 1,
   "worker_version": "fetch-policy-demo-v1",
   "compatibility_date": "2025-12-31",
+  "compatibility_flags": [],
   "main_module": "worker.js",
   "modules": [
     {
