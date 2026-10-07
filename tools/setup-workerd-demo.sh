@@ -10,6 +10,12 @@ JUST_VERSION=1.58.0
 BAZELISK_VERSION=1.28.1
 BAZELISK_SHA256=22e7d3a188699982f661cf4687137ee52d1f24fec1ec893d91a6c4d791a75de8
 LLVM_VERSION=22
+# Ubuntu jammy's golang-go package is 1.18, too old for vegeta's go.mod
+# (requires go 1.22+). Pin a newer toolchain, downloaded on demand, used
+# only for the hey/vegeta `go install`s below; the system golang-go stays
+# untouched.
+GO_TOOLCHAIN_VERSION=1.27.1
+GO_TOOLCHAIN_LINUX_AMD64_SHA256=63d339f0da5ab53635a56f2490a7984dfe12dfcff22ad749f63edaf590168445
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cache_root="${XDG_CACHE_HOME:-$HOME/.cache}/hyperlight-workerd"
@@ -104,6 +110,29 @@ installed_docker_ce_packages() {
             printf '%s\n' "$package"
         fi
     done
+}
+
+pinned_go=""
+ensure_pinned_go() {
+    local go_root="$cache_root/go-$GO_TOOLCHAIN_VERSION"
+    local tarball
+
+    [[ -n "$pinned_go" ]] && return
+    if [[ ! -x "$go_root/bin/go" ]]; then
+        step "Installing a pinned Go $GO_TOOLCHAIN_VERSION toolchain"
+        tarball="$(mktemp)"
+        curl --proto '=https' --tlsv1.2 --fail --show-error --silent \
+            -o "$tarball" \
+            "https://go.dev/dl/go$GO_TOOLCHAIN_VERSION.linux-amd64.tar.gz"
+        echo "$GO_TOOLCHAIN_LINUX_AMD64_SHA256  $tarball" |
+            sha256sum -c - ||
+            fail "downloaded Go toolchain failed checksum verification"
+        rm -rf -- "$go_root"
+        mkdir -p "$go_root"
+        tar -xzf "$tarball" -C "$go_root" --strip-components=1
+        rm -f -- "$tarball"
+    fi
+    pinned_go="$go_root/bin/go"
 }
 
 [[ "$(uname -s)" == Linux ]] || fail "this setup script requires Linux"
@@ -204,14 +233,17 @@ if ! command -v just >/dev/null; then
     cargo +"$RUST_VERSION" install just --version "$JUST_VERSION" --locked
 fi
 if ! command -v hey >/dev/null; then
-    go install github.com/rakyll/hey@v0.1.4
+    ensure_pinned_go
+    "$pinned_go" install github.com/rakyll/hey@v0.1.4
 fi
 # Only required by tools/hyperlight-demo's benchmark-resident
 # --benchmark-load-driver vegeta (default remains "hey"; see its
 # require_runtime/launch_vegeta_load for the json schemas this version
-# was validated against).
+# was validated against). vegeta's go.mod requires go 1.22+, hence the
+# pinned toolchain from ensure_pinned_go rather than the system `go`.
 if ! command -v vegeta >/dev/null; then
-    go install github.com/tsenart/vegeta/v12@v12.13.0
+    ensure_pinned_go
+    "$pinned_go" install github.com/tsenart/vegeta/v12@v12.13.0
 fi
 if ! command -v wasm-tools >/dev/null ||
     [[ "$(wasm-tools --version)" != "wasm-tools 1.252.0" ]]; then
