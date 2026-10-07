@@ -2397,6 +2397,27 @@ launch_hey_jobs() {
     # phase looks just as hung as the setup phase did before it gained
     # its own progress bar.
     local t_start="$(now_seconds)"
+    # Count of hey jobs that have exited so far, across all waves; drives
+    # the progress bar per-job (see below) instead of once per whole
+    # wave. With the common single-wave case (hey_max_parallel_jobs
+    # defaults to the app count), a once-per-wave update would print
+    # nothing at all until every job in the only wave had finished --
+    # indistinguishable from the setup phase looking hung before it
+    # gained a progress bar.
+    local completed=0
+    # print_progress_bar's elapsed argument costs a handful of real
+    # subprocess forks (now_seconds -> date, seconds_between -> awk, plus
+    # the command-substitution subshells wrapping each), not pure bash:
+    # calling it on every single job completion is fine at tens of jobs
+    # but measurably expensive at thousands (confirmed: this inflated
+    # wave_active_seconds enough to fail self-test's barrier-timing
+    # assertions, and matches a live ~130ms/job overhead reported running
+    # 2048 apps). Throttling to at most ~100 updates total regardless of
+    # n keeps the bar responsive while bounding that cost; always still
+    # updates every completion when n is small enough that step==1 (the
+    # self-test's 1/2-app cases), matching prior exact output there.
+    local progress_step=$(((n + 99) / 100))
+    ((progress_step < 1)) && progress_step=1
     while ((i < n)); do
         wave=$((wave + 1))
         local -a batch_pids=() batch_indexes=()
@@ -2432,6 +2453,11 @@ launch_hey_jobs() {
             batch_pids+=("$!")
             batch_indexes+=("$j")
         done
+        # Zero-request apps above never get spawned/waited (skipped via
+        # the `continue` above), so they would otherwise never be
+        # counted towards the progress bar's total below, leaving it
+        # permanently short of $n at the end of the last wave.
+        completed=$((completed + (batch_end - i - ${#batch_pids[@]})))
         # Self-test-only hook: see this function's docstring. Sleeps
         # AFTER forking but BEFORE the barrier timestamp/release, proving
         # that slow spawning never leaks into the reported active/wall
@@ -2460,6 +2486,11 @@ launch_hey_jobs() {
             _lhj_statuses[idx]="$status"
             [[ -n "$_lhj_logfile" ]] && log_line "$_lhj_logfile" \
                 "hey app #$idx finished: exit=$status output=${_lhj_outfiles[idx]}"
+            completed=$((completed + 1))
+            if ((completed % progress_step == 0 || completed >= n)); then
+                print_progress_bar "$completed" "$n" "load: hey apps completed" \
+                    "$(printf '%.0f' "$(seconds_between "$t_start" "$(now_seconds)")")"
+            fi
         done
         rm -f "$gate_file" 2>/dev/null
         wave_t1="$(now_monotonic_seconds)"
@@ -2469,8 +2500,6 @@ launch_hey_jobs() {
         [[ -n "$_lhj_logfile" ]] && log_line "$_lhj_logfile" \
             "hey wave $wave finish: elapsed=$(seconds_between "$wave_t0" "$wave_t1")s" \
             "(barrier-release to wave-finish; excludes this wave's own pre-release forking cost)"
-        print_progress_bar "$batch_end" "$n" "load: hey apps completed" \
-            "$(printf '%.0f' "$(seconds_between "$t_start" "$(now_seconds)")")"
         i="$batch_end"
     done
     [[ -n "$_lhj_active_var" ]] && printf -v "$_lhj_active_var" '%s' "$total_active"
@@ -2727,11 +2756,23 @@ make_phase_timing() {
 write_benchmark_summary() {
     local scenario="$1" per_app_json="$2" timing_json="${3:-null}"
     local max_parallel="${4:-0}" output="$5"
+    # per_app_json scales with app count (one object per app): at
+    # thousands of apps it can be several MB, which blows past the
+    # kernel's execve() ARG_MAX if passed as a --argjson command-line
+    # argument -- bash's own "Argument list too long", not a jq error,
+    # since ARG_MAX bounds total argv+envp bytes regardless of whether
+    # the oversized value is logically "one argument". Routing it
+    # through a temp file + --slurpfile instead has no such limit, since
+    # jq reads the file's bytes directly rather than via argv.
+    local apps_tmpfile
+    apps_tmpfile="$(mktemp "${TMPDIR:-/tmp}/hyperlight-demo-apps.XXXXXX")"
+    printf '%s' "$per_app_json" >"$apps_tmpfile"
     jq -n \
         --arg scenario "$scenario" \
-        --argjson apps "$per_app_json" \
+        --slurpfile apps_file "$apps_tmpfile" \
         --argjson timing "$timing_json" \
         --argjson max_parallel "$max_parallel" '
+        ($apps_file[0]) as $apps |
         ($apps | map(.requests) | add) as $total_requests |
         {
             scenario: $scenario,
@@ -2763,6 +2804,7 @@ write_benchmark_summary() {
                 barrier_scope: (if $max_parallel > 0 then "per_wave" else null end)
             }
         }' >"$output"
+    rm -f "$apps_tmpfile"
 }
 
 # host_http_get BIND HOST_HEADER PATH -> prints "STATUS\tBODY"
@@ -3540,7 +3582,20 @@ run_benchmark_resident() {
         "wave_active_seconds=${wave_active_seconds}s load_wall_seconds=${load_wall_seconds}s"
 
     local -a app_ids cmds
-    local app_summaries="[]"
+    # Collected as a plain bash array of JSON object strings, not folded
+    # into a growing JSON array one jq invocation at a time: folding would
+    # re-parse and re-serialize an array that grows up to $benchmark_apps
+    # elements on every single iteration (O(n^2) jq work, plus one extra
+    # process fork per app), which is needless at the thousands-of-apps
+    # scale this loop is meant to handle. Joined into one real JSON array
+    # via a single `jq -cs` slurp after the loop instead (see below).
+    local -a app_summary_list=()
+    local t_results_start="$(now_seconds)"
+    # See the identical throttling comment in launch_hey_jobs: computing
+    # elapsed seconds costs real subprocess forks, so cap this loop's
+    # progress updates to ~100 total regardless of benchmark_apps.
+    local results_progress_step=$(((benchmark_apps + 99) / 100))
+    ((results_progress_step < 1)) && results_progress_step=1
     for ((i = 0; i < benchmark_apps; i++)); do
         # These used to be bare `[[ ]]`/`grep -Eq` relying on `set -e` to
         # abort: that prints nothing to stdout/stderr, so run_one's
@@ -3570,9 +3625,17 @@ run_benchmark_resident() {
         log_line "$run_log" "app bench-$i pool status: $(jq -c . "${status_files[i]}")"
         local one
         one="$(build_app_summary "bench-$i" "${reqs[i]}" "${concs[i]}" "${outfiles[i]}")"
-        app_summaries="$(jq -c --argjson one "$one" '. + [$one]' <<<"$app_summaries")"
+        app_summary_list+=("$one")
         app_ids[i]="bench-$i"
         cmds[i]="hey -n ${reqs[i]} -c ${concs[i]} -t ${timeouts[i]} -host ${hosts[i]} ${urls[i]}"
+        # This loop does a real curl round-trip plus two jq subprocess
+        # invocations per app, which is otherwise as silent as the setup
+        # and load phases were before they gained progress bars (compiling
+        # results for hundreds/thousands of apps is not instant).
+        if (((i + 1) % results_progress_step == 0 || i + 1 >= benchmark_apps)); then
+            print_progress_bar "$((i + 1))" "$benchmark_apps" "results: apps compiled" \
+                "$(printf '%.0f' "$(seconds_between "$t_results_start" "$(now_seconds)")")"
+        fi
     done
 
     if ((conservation_remainder > 0)); then
@@ -3594,11 +3657,14 @@ run_benchmark_resident() {
         fi
         local remainder_one
         remainder_one="$(build_app_summary "bench-0-remainder" "$conservation_remainder" 1 "${outfiles[remainder_idx]}")"
-        app_summaries="$(jq -c --argjson one "$remainder_one" '. + [$one]' <<<"$app_summaries")"
+        app_summary_list+=("$remainder_one")
         app_ids[remainder_idx]="bench-0-remainder"
         cmds[remainder_idx]="hey -n ${reqs[remainder_idx]} -c ${concs[remainder_idx]} -t ${timeouts[remainder_idx]} -host ${hosts[remainder_idx]} ${urls[remainder_idx]}"
         log_line "$run_log" "conservation remainder covered: bench-0-remainder reported ${conservation_remainder} 200 responses"
     fi
+
+    local app_summaries
+    app_summaries="$(printf '%s\n' "${app_summary_list[@]}" | jq -cs '.')"
 
     write_collected_hey_report "$dir/hey.txt" app_ids urls cmds outfiles
     jq -s '.' "$dir"/app-*/status.json >"$dir/status.json"
@@ -3721,7 +3787,7 @@ run_benchmark_multi_app() {
         "wave_active_seconds=${wave_active_seconds}s load_wall_seconds=${load_wall_seconds}s"
 
     local -a app_ids addrs cmds
-    local app_summaries="[]"
+    local -a app_summary_list=()
     for ((i = 0; i < benchmark_apps; i++)); do
         # See the identical comment in run_benchmark_resident: a bare
         # `[[ ]]`/`grep -Eq` assertion here prints nothing on failure, so
@@ -3745,7 +3811,7 @@ run_benchmark_multi_app() {
         fi
         local one
         one="$(build_app_summary "app-$i" "${reqs[i]}" "${concs[i]}" "${outfiles[i]}")"
-        app_summaries="$(jq -c --argjson one "$one" '. + [$one]' <<<"$app_summaries")"
+        app_summary_list+=("$one")
         app_ids[i]="app-$i"
         addrs[i]="${urls[i]} (Host: ${hosts[i]})"
         cmds[i]="hey -n ${reqs[i]} -c ${concs[i]} -t ${timeouts[i]} -host ${hosts[i]} ${urls[i]}"
@@ -3770,12 +3836,15 @@ run_benchmark_multi_app() {
         fi
         local remainder_one
         remainder_one="$(build_app_summary "app-0-remainder" "$conservation_remainder" 1 "${outfiles[remainder_idx]}")"
-        app_summaries="$(jq -c --argjson one "$remainder_one" '. + [$one]' <<<"$app_summaries")"
+        app_summary_list+=("$remainder_one")
         app_ids[remainder_idx]="app-0-remainder"
         addrs[remainder_idx]="${urls[remainder_idx]} (Host: ${hosts[remainder_idx]})"
         cmds[remainder_idx]="hey -n ${reqs[remainder_idx]} -c ${concs[remainder_idx]} -t ${timeouts[remainder_idx]} -host ${hosts[remainder_idx]} ${urls[remainder_idx]}"
         log_line "$run_log" "conservation remainder covered: app-0-remainder reported ${conservation_remainder} 200 responses"
     fi
+
+    local app_summaries
+    app_summaries="$(printf '%s\n' "${app_summary_list[@]}" | jq -cs '.')"
 
     curl --fail-with-body --silent --show-error \
         --header "Host: app-0.bench" \
@@ -3927,7 +3996,7 @@ run_benchmark_orchestrator_contract() {
     done
     launch_hey_jobs a_reqs a_concs a_urls a_hosts a_timeouts a_outfiles a_statuses
 
-    local pre_apps="[]"
+    local -a pre_apps_list=()
     for ((i = 0; i < benchmark_apps; i++)); do
         # Every assertion in this function used to be a bare `[[ ]]`/
         # `grep -Eq`/`jq -e` relying on `set -e` to abort on failure: none
@@ -3950,8 +4019,10 @@ run_benchmark_orchestrator_contract() {
         fi
         local one
         one="$(build_app_summary "drain-$i" "${a_reqs[i]}" "${a_concs[i]}" "${a_outfiles[i]}")"
-        pre_apps="$(jq -c --argjson one "$one" '. + [$one]' <<<"$pre_apps")"
+        pre_apps_list+=("$one")
     done
+    local pre_apps
+    pre_apps="$(printf '%s\n' "${pre_apps_list[@]}" | jq -cs '.')"
     write_benchmark_summary "pre-drain" "$pre_apps" null 0 "$dir/pre-drain-summary.json"
 
     curl --fail-with-body --silent --show-error \
@@ -4090,7 +4161,7 @@ run_benchmark_orchestrator_contract() {
     done
     rm -f "$b_gate" 2>/dev/null
 
-    local during_apps="[]"
+    local -a during_apps_list=()
     for ((i = 0; i < benchmark_apps; i++)); do
         if [[ "${b_statuses[i]}" != 0 ]]; then
             printf 'phase B (drain): app %d hey exited %s (see %s)\n' \
@@ -4106,8 +4177,10 @@ run_benchmark_orchestrator_contract() {
         fi
         local one
         one="$(build_app_summary "drain-$i" "${b_reqs[i]}" "${b_concs[i]}" "${b_outfiles[i]}")"
-        during_apps="$(jq -c --argjson one "$one" '. + [$one]' <<<"$during_apps")"
+        during_apps_list+=("$one")
     done
+    local during_apps
+    during_apps="$(printf '%s\n' "${during_apps_list[@]}" | jq -cs '.')"
     write_benchmark_summary "during-drain" "$during_apps" null 0 "$dir/during-drain-summary.json"
 
     # Bounded poll for process exit (drain-timeout-ms 5000 + buffer), not a
