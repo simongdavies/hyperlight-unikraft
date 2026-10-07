@@ -396,6 +396,16 @@ only functional checks, to back the `resident`, `multi-app`, and
   no response within 1s (expected during drain; curl exit N)` line. Any
   other outcome (a real HTTP response, or a curl failure outside that
   documented set) is reported as a `FAIL` with the diagnostic preserved.
+  The in-flight-at-signal share sent right before `SIGTERM` is always
+  exactly one synchronized wave of `conc` requests per app (never a larger
+  share of the total load): every request in that wave is proven admitted
+  by the admit-wait poll before the signal fires, so all of it drains
+  deterministically regardless of `--benchmark-apps`/
+  `--benchmark-concurrency` scale. Every internal assertion in this demo
+  (hey exit status, response-count checks, the admit-wait poll, and the
+  final process-exit check) now prints a diagnostic and the relevant
+  artifact path to the log before failing, so a `FAIL` never leaves the
+  raw log empty.
 
 ```bash
 tools/hyperlight-demo \

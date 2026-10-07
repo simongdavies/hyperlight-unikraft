@@ -1536,8 +1536,40 @@ self_test() {
     assert_post_signal_probe "unrelated curl failure (e.g. DNS)" 6 "000" unexpected_error
     unset -f assert_post_signal_probe
 
+    # Regression guard for the benchmark-orchestrator-contract phase-B
+    # over-queueing bug: reqs must always equal conc (never a larger
+    # phase_b_alloc share), including at the default scale where
+    # benchmark_apps == benchmark_concurrency drives conc_alloc[i] down to
+    # 1 while phase_b_alloc[i] is in the hundreds -- that combination is
+    # exactly what let the old floor(phase_b_alloc/conc)*conc formula send
+    # hundreds of requests when only the first could ever be in flight at
+    # signal time.
+    assert_phase_b_batch() {
+        local label="$1" conc_alloc_for_app="$2" phase_b_alloc_for_app="$3" \
+            expected_conc="$4" expected_reqs="$5"
+        local got_conc got_reqs
+        read -r got_conc got_reqs < <(resolve_phase_b_batch \
+            "$conc_alloc_for_app" "$phase_b_alloc_for_app")
+        if [[ "$got_conc" != "$expected_conc" || "$got_reqs" != "$expected_reqs" ]]; then
+            printf 'FAIL resolve_phase_b_batch %s: expected conc=%s reqs=%s got conc=%s reqs=%s\n' \
+                "$label" "$expected_conc" "$expected_reqs" "$got_conc" "$got_reqs" >&2
+            failures=$((failures + 1))
+        fi
+    }
+
+    assert_phase_b_batch \
+        "default scale (apps == concurrency, conc_alloc 1, phase_b_alloc 250)" \
+        1 250 1 1
+    assert_phase_b_batch \
+        "higher per-app concurrency (conc_alloc 3, phase_b_alloc 250)" \
+        3 250 3 3
+    assert_phase_b_batch \
+        "tiny total caps conc below conc_alloc (conc_alloc 4, phase_b_alloc 2)" \
+        4 2 2 2
+    unset -f assert_phase_b_batch
+
     if ((failures == 0)); then
-        echo "self-test: all allocate_evenly, benchmark-flag-validation, helper-executability, and post-signal-probe-classification assertions passed"
+        echo "self-test: all allocate_evenly, benchmark-flag-validation, helper-executability, post-signal-probe-classification, and phase-b-batch-sizing assertions passed"
         return 0
     fi
     echo "self-test: $failures assertion(s) failed" >&2
@@ -2699,6 +2731,25 @@ classify_post_signal_probe() {
     esac
 }
 
+# Resolves phase B's (concurrency, request-count) pair for one app of
+# run_benchmark_orchestrator_contract's drain benchmark, given that app's
+# share of total --benchmark-concurrency (conc_alloc_for_app) and its share
+# of the phase-B ~25% load split (phase_b_alloc_for_app). conc is capped to
+# phase_b_alloc_for_app (an app with a tiny total shouldn't claim more
+# concurrency than it has work allocated), floored to 1. reqs is *always*
+# set equal to that capped conc, never to phase_b_alloc_for_app: phase B
+# must be exactly one synchronized wave of `conc` requests that all become
+# in-flight before SIGTERM (see the admit-wait loop below), not a longer
+# queue where only the first wave is in flight when the signal fires and
+# the rest race a listener that is about to close. Printed as "conc reqs"
+# so callers can `read -r conc reqs < <(...)`.
+resolve_phase_b_batch() {
+    local conc_alloc_for_app="$1" phase_b_alloc_for_app="$2"
+    local conc=$((conc_alloc_for_app < phase_b_alloc_for_app ? conc_alloc_for_app : phase_b_alloc_for_app))
+    ((conc > 0)) || conc=1
+    printf '%s %s\n' "$conc" "$conc"
+}
+
 run_benchmark_orchestrator_contract() {
     local dir="$output_dir/benchmark-orchestrator-contract"
     mkdir -p "$dir"
@@ -2764,9 +2815,24 @@ run_benchmark_orchestrator_contract() {
 
     local pre_apps="[]"
     for ((i = 0; i < benchmark_apps; i++)); do
-        [[ "${a_statuses[i]}" == 0 ]]
-        if ((a_reqs[i] > 0)); then
-            grep -Eq "\\[200\\][[:space:]]+${a_reqs[i]} responses" "${a_outfiles[i]}"
+        # Every assertion in this function used to be a bare `[[ ]]`/
+        # `grep -Eq`/`jq -e` relying on `set -e` to abort on failure: none
+        # of those print anything, so a failure here left the demo's raw
+        # log completely empty and the presenter's "FAIL + LAST 30 LOG
+        # LINES" had nothing to show. Printing a diagnostic immediately
+        # before each explicit `return 1` below ensures the log always
+        # captures which app/phase/assertion failed and why.
+        if [[ "${a_statuses[i]}" != 0 ]]; then
+            printf 'phase A: app %d hey exited %s (see %s)\n' \
+                "$i" "${a_statuses[i]}" "${a_outfiles[i]}" >&2
+            return 1
+        fi
+        if ((a_reqs[i] > 0)) &&
+            ! grep -Eq "\\[200\\][[:space:]]+${a_reqs[i]} responses" "${a_outfiles[i]}"; then
+            printf 'phase A: app %d did not report [200] %s responses (see %s)\n' \
+                "$i" "${a_reqs[i]}" "${a_outfiles[i]}" >&2
+            tail -n 10 "${a_outfiles[i]}" | sed 's/^/  /' >&2
+            return 1
         fi
         local one
         one="$(build_app_summary "drain-$i" "${a_reqs[i]}" "${a_concs[i]}" "${a_outfiles[i]}")"
@@ -2814,12 +2880,19 @@ run_benchmark_orchestrator_contract() {
     b_gate="$(mktemp -u "${TMPDIR:-/tmp}/hyperlight-demo-hey-gate.XXXXXX")"
     rm -f "$b_gate" 2>/dev/null
     for ((i = 0; i < benchmark_apps; i++)); do
-        local conc=$((conc_alloc[i] < phase_b_alloc[i] ? conc_alloc[i] : phase_b_alloc[i]))
-        ((conc > 0)) || conc=1
-        # Same floor(n/c)*c snapping as phase A above: keep the asserted
-        # count honest with what hey will actually send.
-        local reqs=$(((phase_b_alloc[i] / conc) * conc))
-        ((reqs > 0)) || reqs="$conc"
+        # See resolve_phase_b_batch above: reqs is always set equal to
+        # conc (never to phase_b_alloc[i]'s full share of the load), so
+        # that every phase-B request is part of the single
+        # admitted-and-signaled wave the admit-wait loop below proves,
+        # rather than racing a listener that is about to close. At the
+        # default scale (benchmark_apps == benchmark_concurrency, so
+        # conc_alloc[i] == 1 while phase_b_alloc[i] is in the hundreds)
+        # the old reqs = floor(phase_b_alloc[i]/conc)*conc formula sent
+        # hundreds of requests per app when only the first could ever be
+        # in flight at signal time, and the grep assertion below failed
+        # non-deterministically.
+        local conc reqs
+        read -r conc reqs < <(resolve_phase_b_batch "${conc_alloc[i]}" "${phase_b_alloc[i]}")
         b_reqs[i]="$reqs"
         b_concs[i]="$conc"
         b_outfiles[i]="$dir/app-$i-phase-b.txt"
@@ -2864,6 +2937,11 @@ run_benchmark_orchestrator_contract() {
         ((SECONDS < admit_deadline)) || break
         sleep 0.01
     done
+    if ((all_admitted != 1)); then
+        printf 'admit-wait: not every app reached in_flight >= concurrency within the deadline (last status: %s)\n' \
+            "$admitted_status" >&2
+        return 1
+    fi
 
     local shutdown_start
     shutdown_start="$(date +%s%3N)"
@@ -2900,9 +2978,17 @@ run_benchmark_orchestrator_contract() {
 
     local during_apps="[]"
     for ((i = 0; i < benchmark_apps; i++)); do
-        [[ "${b_statuses[i]}" == 0 ]]
-        if ((b_reqs[i] > 0)); then
-            grep -Eq "\\[200\\][[:space:]]+${b_reqs[i]} responses" "${b_outfiles[i]}"
+        if [[ "${b_statuses[i]}" != 0 ]]; then
+            printf 'phase B (drain): app %d hey exited %s (see %s)\n' \
+                "$i" "${b_statuses[i]}" "${b_outfiles[i]}" >&2
+            return 1
+        fi
+        if ((b_reqs[i] > 0)) &&
+            ! grep -Eq "\\[200\\][[:space:]]+${b_reqs[i]} responses" "${b_outfiles[i]}"; then
+            printf 'phase B (drain): app %d did not report [200] %s responses (see %s)\n' \
+                "$i" "${b_reqs[i]}" "${b_outfiles[i]}" >&2
+            tail -n 10 "${b_outfiles[i]}" | sed 's/^/  /' >&2
+            return 1
         fi
         local one
         one="$(build_app_summary "drain-$i" "${b_reqs[i]}" "${b_concs[i]}" "${b_outfiles[i]}")"
@@ -2950,7 +3036,12 @@ run_benchmark_orchestrator_contract() {
             exit_code: $exit_code
         }' >"$dir/summary.json"
 
-    [[ "$exit_code" == 0 ]]
+    if [[ "$exit_code" != 0 ]]; then
+        printf 'workerd-host exited %s instead of 0 after drain (see %s)\n' \
+            "$exit_code" "$dir/server.log" >&2
+        tail -n 10 "$dir/server.log" | sed 's/^/  /' >&2
+        return 1
+    fi
     echo "$exit_code" >"$dir/exit-code.txt"
     echo "SIGTERM mid-flight drained admitted requests (post-signal probe: $post_signal_probe) and exited $exit_code within the drain timeout ($shutdown_duration_ms ms)."
 }
