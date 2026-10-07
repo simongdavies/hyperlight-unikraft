@@ -2189,9 +2189,13 @@ FAKE_HEY
     # here -- it must still emit periodic plain-line progress, always
     # including the very first and last step, and must not error on
     # TOTAL=0 (guards the division-by-zero edge case).
+    # _LHJ_TEST_NO_TTY_ESCAPE forces print_progress_bar's fd-1 fallback
+    # even when self-test happens to run in a real terminal, since
+    # otherwise it would escape to /dev/tty (see print_progress_bar) and
+    # bypass this `$(...)` capture entirely, making $out empty.
     assert_progress_bar() {
         local out
-        out="$(for ((i = 1; i <= 100; i++)); do print_progress_bar "$i" 100 "test" "$i"; done)"
+        out="$(export _LHJ_TEST_NO_TTY_ESCAPE=1; for ((i = 1; i <= 100; i++)); do print_progress_bar "$i" 100 "test" "$i"; done)"
         if ! grep -q '1/100' <<<"$out"; then
             printf 'FAIL print_progress_bar: first step (1/100) not printed\n' >&2
             failures=$((failures + 1))
@@ -2207,7 +2211,7 @@ FAKE_HEY
             failures=$((failures + 1))
         fi
         local zero_out
-        if ! zero_out="$(print_progress_bar 0 0 "edge" 0 2>&1)"; then
+        if ! zero_out="$(_LHJ_TEST_NO_TTY_ESCAPE=1 print_progress_bar 0 0 "edge" 0 2>&1)"; then
             printf 'FAIL print_progress_bar: TOTAL=0 should not error, got: %s\n' "$zero_out" >&2
             failures=$((failures + 1))
         fi
@@ -2533,36 +2537,56 @@ log_line() {
 
 # print_progress_bar CURRENT TOTAL LABEL ELAPSED_SECONDS
 #
-# Renders CURRENT/TOTAL progress on stdout so a long blocking setup loop
-# (e.g. benchmark-resident sequentially booting hundreds/thousands of
-# resident apps -- see run_benchmark_resident) is visibly advancing, not
-# hung, even though log_line only writes to run.log. When stdout is a
-# terminal this draws an in-place "[####------] 12/50 (24%, 3s)" bar via
-# a bare \r (no trailing newline until CURRENT == TOTAL, which also
-# prints the final newline). When stdout is NOT a terminal (piped or
-# redirected, e.g. captured into a file) an in-place \r bar would just
-# look like line noise, so this instead prints one plain line every
-# ~1/40th of TOTAL steps (always including the first and last step) so
-# large runs still show periodic, greppable progress there too.
+# Renders CURRENT/TOTAL progress so a long blocking setup loop (e.g.
+# benchmark-resident sequentially booting hundreds/thousands of resident
+# apps -- see run_benchmark_resident) is visibly advancing, not hung,
+# even though log_line only writes to run.log. run_one's non-verbose
+# mode (the default) redirects the whole demo subshell's stdout+stderr
+# into that same run.log, so writing this to fd 1 alone would make the
+# bar invisible on a live terminal in the common case -- defeating this
+# function's entire purpose. To escape that redirection, this writes
+# straight to the controlling terminal (/dev/tty) when one exists,
+# falling back to fd 1 (the log, in non-verbose mode; the terminal
+# itself in --verbose/an interactive self-test) when there is none (a
+# detached/nohup/cron/CI run with no controlling tty -- the common case
+# the self-test's `$(...)` capture also relies on, since command
+# substitution always makes fd 1 a pipe regardless of /dev/tty).
+# _LHJ_TEST_NO_TTY_ESCAPE lets the self-test force the fd-1 fallback
+# deterministically even when it happens to run in a real terminal.
+# Chooses between an in-place "[####------] 12/50 (24%, 3s)" \r bar (a
+# real terminal) and one plain line every ~1/40th of TOTAL steps, always
+# including the first and last step (no terminal, where a \r bar would
+# just look like line noise), based on whether the chosen destination is
+# itself a terminal.
 print_progress_bar() {
     local current="$1" total="$2" label="$3" elapsed="$4"
     ((total > 0)) || total=1
     local pct=$((current * 100 / total))
-    if [[ -t 1 ]]; then
+    local out_fd=1
+    if [[ -z "${_LHJ_TEST_NO_TTY_ESCAPE:-}" ]] && { exec 3>/dev/tty; } 2>/dev/null; then
+        out_fd=3
+    fi
+    if [[ -t "$out_fd" ]]; then
         local width=30
         local filled=$((current * width / total))
         ((filled > width)) && filled=$width
         local bar
         bar="$(printf '%*s' "$filled" '' | tr ' ' '#')$(printf '%*s' $((width - filled)) '')"
-        printf '\r  %s [%s] %d/%d (%d%%, %ds)' "$label" "$bar" "$current" "$total" "$pct" "$elapsed"
-        ((current >= total)) && printf '\n'
+        printf '\r  %s [%s] %d/%d (%d%%, %ds)' "$label" "$bar" "$current" "$total" "$pct" "$elapsed" >&"$out_fd"
+        if ((current >= total)); then
+            printf '\n' >&"$out_fd"
+        fi
     else
         local step=$(((total + 39) / 40))
         ((step < 1)) && step=1
         if ((current % step == 0 || current >= total)); then
-            printf '  %s: %d/%d (%d%%, %ds)\n' "$label" "$current" "$total" "$pct" "$elapsed"
+            printf '  %s: %d/%d (%d%%, %ds)\n' "$label" "$current" "$total" "$pct" "$elapsed" >&"$out_fd"
         fi
     fi
+    if ((out_fd == 3)); then
+        exec 3>&-
+    fi
+    return 0
 }
 
 # make_phase_timing SETUP_SECONDS LOAD_SECONDS TEARDOWN_SECONDS TOTAL_SECONDS
@@ -3347,6 +3371,12 @@ run_benchmark_resident() {
     # restores.
     local bench_bundle="$root/examples/workerd-bundles/workerd-pool-benchmark.json"
     local snapshot_dir="$dir/prewarm-snapshot"
+    # A prior run's snapshot directory is sealed read-only (every file and
+    # directory under it, see WorkerdSnapshot::seal_or_check) so integrity
+    # checks can verify it was not tampered with after saving. Plain `rm -rf`
+    # cannot unlink entries from a read-only directory, so restore write
+    # permission first; `|| true` tolerates a directory that does not exist yet.
+    chmod -R u+w "$snapshot_dir" 2>/dev/null || true
     rm -rf "$snapshot_dir"
     printf 'preparing: building reusable resident-app snapshot (one-time boot+init)...\n'
     prewarm_shared_snapshot "$run_log" "$bench_bundle" "$snapshot_dir" || return 1
