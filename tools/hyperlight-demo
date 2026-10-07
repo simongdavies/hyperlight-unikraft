@@ -908,7 +908,21 @@ print_demo_evidence() {
             evidence_row "Apps" "$benchmark_apps apps under load"
             evidence_row "Pre-drain throughput" "$(jq -r '.pre_drain.aggregate.aggregate_requests_per_sec' "$dir/summary.json") req/s"
             evidence_row "During-drain requests" "$(jq -r '.during_drain.aggregate.total_requests' "$dir/summary.json") completed after SIGTERM"
-            evidence_row "Post-signal probe" "$(jq -r '.post_signal_probe' "$dir/summary.json")"
+            local psp_outcome psp_exit psp_http psp_message
+            psp_outcome="$(jq -r '.post_signal_probe' "$dir/summary.json")"
+            psp_exit="$(jq -r '.post_signal_probe_detail.curl_exit_code' "$dir/summary.json")"
+            psp_http="$(jq -r '.post_signal_probe_detail.http_code' "$dir/summary.json")"
+            case "$psp_outcome" in
+                no_response)
+                    psp_message="PASS post-signal new connection: no response within 1s (expected during drain; curl exit $psp_exit)" ;;
+                unexpected_200)
+                    psp_message="FAIL post-signal new connection unexpectedly got HTTP 200 (admitted after SIGTERM)" ;;
+                unexpected_error)
+                    psp_message="FAIL post-signal probe hit an unexpected curl error (exit $psp_exit); see $dir/post-signal-probe-stderr.txt" ;;
+                *)
+                    psp_message="FAIL post-signal probe got unexpected HTTP $psp_http (curl exit $psp_exit)" ;;
+            esac
+            evidence_row "Post-signal probe" "$psp_message"
             evidence_row "Shutdown duration" "$(jq -r '.shutdown_duration_ms' "$dir/summary.json") ms"
             evidence_row "Exit code" "$(jq -r '.exit_code' "$dir/summary.json") (0 = clean shutdown)"
             printf '\n%bSUMMARY JSON%b\n\n' "$c_bold$c_green" "$c_reset"
@@ -1493,8 +1507,37 @@ self_test() {
     done
     unset -f assert_helper_executable
 
+    # Regression guard for the benchmark-orchestrator-contract post-signal
+    # probe bug fix: curl exit 28 (and the other reproduced "no new
+    # connection admitted" exit codes, 7/52/56) must classify as the
+    # expected no_response outcome ONLY via this narrow, purpose-built
+    # helper -- not via some broad "ignore all curl timeouts" rule. Any
+    # curl exit not in that documented set, and any exit-0 response other
+    # than a plain 200, must still be classified as a genuine, surfaced
+    # failure so an unrelated/unexpected curl error is never silently
+    # swallowed as "expected during drain".
+    assert_post_signal_probe() {
+        local label="$1" curl_exit="$2" http_code="$3" expected="$4"
+        local got
+        got="$(classify_post_signal_probe "$curl_exit" "$http_code")"
+        if [[ "$got" != "$expected" ]]; then
+            printf 'FAIL classify_post_signal_probe %s: expected %s got %s\n' \
+                "$label" "$expected" "$got" >&2
+            failures=$((failures + 1))
+        fi
+    }
+
+    assert_post_signal_probe "timeout (28) during drain" 28 "000" no_response
+    assert_post_signal_probe "connection refused (7) during drain" 7 "000" no_response
+    assert_post_signal_probe "empty reply (52) during drain" 52 "000" no_response
+    assert_post_signal_probe "connection reset (56) during drain" 56 "000" no_response
+    assert_post_signal_probe "still answering 200 after SIGTERM" 0 200 unexpected_200
+    assert_post_signal_probe "answering non-200 after SIGTERM" 0 503 unexpected_http_503
+    assert_post_signal_probe "unrelated curl failure (e.g. DNS)" 6 "000" unexpected_error
+    unset -f assert_post_signal_probe
+
     if ((failures == 0)); then
-        echo "self-test: all allocate_evenly, benchmark-flag-validation, and helper-executability assertions passed"
+        echo "self-test: all allocate_evenly, benchmark-flag-validation, helper-executability, and post-signal-probe-classification assertions passed"
         return 0
     fi
     echo "self-test: $failures assertion(s) failed" >&2
@@ -2612,6 +2655,50 @@ run_benchmark_multi_app() {
     echo "All $benchmark_load_requests requests across $benchmark_apps routed apps succeeded, one process and port; see $dir/summary.json, $dir/hey.txt, and $run_log"
 }
 
+# classify_post_signal_probe CURL_EXIT HTTP_CODE
+#
+# Pure classification for the post-SIGTERM readyz probe in
+# run_benchmark_orchestrator_contract, below. workerd-host's accept loop
+# checks its shutting-down flag before each accept() and never admits a
+# new connection once SIGTERM is observed, so a connection attempted
+# after the signal gets no live HTTP response at all until the process
+# actually exits and the OS drops the listening socket. Depending on the
+# exact race between the probe's connect() and the process's exit, curl
+# can observe that as a timeout (28), connection refused (7), an empty
+# reply (52), or a reset (56) -- all four have been reproduced live in
+# this exact probe and all four are equally "no new connection was
+# admitted", so all four classify as the expected "no_response" outcome.
+# Only an actual HTTP response (exit 0) is a genuine contract violation:
+# 200 means a new connection was admitted after SIGTERM; any other status
+# means readyz answered when the contract says it must not respond at
+# all. Any other curl exit code (DNS failure, TLS error, malformed URL,
+# etc.) is not one of the documented "no admission" failure modes and is
+# classified as unexpected_error so it surfaces loudly instead of being
+# silently folded into the expected outcome. This narrow, single-purpose
+# helper is the only place that treats curl exit 28 (or 7/52/56) as
+# expected; the pure validate_benchmark_flags above and the nearby
+# admitted_status probe (which deliberately keeps its own unrelated
+# `2>/dev/null || echo '[]'` fallback) are untouched, so a curl timeout
+# elsewhere in this script is never silently ignored by this change.
+classify_post_signal_probe() {
+    local curl_exit="$1" http_code="$2"
+    case "$curl_exit" in
+        0)
+            if [[ "$http_code" == 200 ]]; then
+                echo "unexpected_200"
+            else
+                echo "unexpected_http_$http_code"
+            fi
+            ;;
+        7 | 28 | 52 | 56)
+            echo "no_response"
+            ;;
+        *)
+            echo "unexpected_error"
+            ;;
+    esac
+}
+
 run_benchmark_orchestrator_contract() {
     local dir="$output_dir/benchmark-orchestrator-contract"
     mkdir -p "$dir"
@@ -2782,12 +2869,24 @@ run_benchmark_orchestrator_contract() {
     shutdown_start="$(date +%s%3N)"
     kill -TERM "$demo_pid"
 
-    local post_signal_probe="no_response"
+    # Capture the probe's stderr to a file instead of letting it leak to
+    # the terminal/log raw: curl's --show-error prints an error line on
+    # any failure (e.g. "curl: (28) Operation timed out...") even with
+    # --silent, and that failure is the *expected*, documented outcome
+    # here (see classify_post_signal_probe above), not an unexplained
+    # error. The file is kept for diagnosis if the outcome ever is
+    # genuinely unexpected.
+    local probe_err_file="$dir/post-signal-probe-stderr.txt"
     local probe_body probe_exit=0
     probe_body="$(curl --silent --show-error --max-time 1 --output /dev/null \
-        --write-out '%{http_code}' "http://$bind/__hyperlight/readyz")" || probe_exit=$?
-    if ((probe_exit == 0)) && [[ "$probe_body" == 200 ]]; then
-        post_signal_probe="unexpected_200"
+        --write-out '%{http_code}' "http://$bind/__hyperlight/readyz" \
+        2>"$probe_err_file")" || probe_exit=$?
+    local post_signal_probe
+    post_signal_probe="$(classify_post_signal_probe "$probe_exit" "$probe_body")"
+    if [[ "$post_signal_probe" != no_response ]]; then
+        printf 'post-signal probe: unexpected result %s (curl exit %s, http %s)\n' \
+            "$post_signal_probe" "$probe_exit" "$probe_body" >&2
+        sed 's/^/  /' "$probe_err_file" >&2
     fi
     [[ "$post_signal_probe" == no_response ]]
 
@@ -2834,6 +2933,8 @@ run_benchmark_orchestrator_contract() {
         --slurpfile pre_drain "$dir/pre-drain-summary.json" \
         --slurpfile during_drain "$dir/during-drain-summary.json" \
         --arg post_signal_probe "$post_signal_probe" \
+        --argjson post_signal_probe_curl_exit "$probe_exit" \
+        --arg post_signal_probe_http_code "$probe_body" \
         --argjson shutdown_duration_ms "$shutdown_duration_ms" \
         --argjson exit_code "$exit_code" \
         '{
@@ -2841,6 +2942,10 @@ run_benchmark_orchestrator_contract() {
             pre_drain: $pre_drain[0],
             during_drain: $during_drain[0],
             post_signal_probe: $post_signal_probe,
+            post_signal_probe_detail: {
+                curl_exit_code: $post_signal_probe_curl_exit,
+                http_code: $post_signal_probe_http_code
+            },
             shutdown_duration_ms: $shutdown_duration_ms,
             exit_code: $exit_code
         }' >"$dir/summary.json"

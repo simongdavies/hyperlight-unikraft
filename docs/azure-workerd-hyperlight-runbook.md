@@ -387,7 +387,15 @@ only functional checks, to back the `resident`, `multi-app`, and
   reference load, then sends `SIGTERM` while a further share of requests is
   still in flight. It proves readiness goes false, new connections receive
   no response, already-admitted requests still drain successfully, and the
-  process exits within its configured drain timeout.
+  process exits within its configured drain timeout. The post-`SIGTERM`
+  readiness probe is expected to fail to connect (curl observes a timeout,
+  connection-refused, empty-reply, or reset, depending on the exact race
+  with process exit); the demo captures that probe's raw `curl` diagnostics
+  to `post-signal-probe-stderr.txt` instead of printing them unexplained,
+  and the presenter reports an explicit `PASS post-signal new connection:
+  no response within 1s (expected during drain; curl exit N)` line. Any
+  other outcome (a real HTTP response, or a curl failure outside that
+  documented set) is reported as a `FAIL` with the diagnostic preserved.
 
 ```bash
 tools/hyperlight-demo \
