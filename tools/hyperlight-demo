@@ -129,6 +129,16 @@ hey_max_parallel_jobs_explicit=false
 hey_ramp_ms="${HYPERLIGHT_BENCHMARK_HEY_RAMP_MS:-}"
 hey_ramp_ms_explicit=false
 [[ -n "$hey_ramp_ms" ]] && hey_ramp_ms_explicit=true
+# benchmark-resident's setup loop forks each app's own `hluk workerd-host`
+# process (which restores from the shared prewarm snapshot) and polls it
+# for readiness; this bounds how many of those independent forks/restores
+# are in flight at once. Left unset here (HYPERLIGHT_BENCHMARK_SETUP_PARALLEL/
+# --benchmark-setup-parallel not given): defaults to physical_cores once
+# parsing finishes, so restores spread across available cores instead of
+# running one at a time (the original behavior, equivalent to passing 1).
+benchmark_setup_parallel="${HYPERLIGHT_BENCHMARK_SETUP_PARALLEL:-}"
+benchmark_setup_parallel_explicit=false
+[[ -n "$benchmark_setup_parallel" ]] && benchmark_setup_parallel_explicit=true
 go_bin="${GOBIN:-}"
 if [[ -z "$go_bin" ]] && command -v go >/dev/null; then
     go_bin="$(go env GOBIN 2>/dev/null || true)"
@@ -238,6 +248,14 @@ Options:
                     demand/benchmark-prewarmed, and the orchestrator-contract
                     drain test); costs roughly (batch_size - 1) x N ms of
                     extra wall-clock per wave
+  --benchmark-setup-parallel N
+                    Max resident app processes forked/restored at once
+                    during benchmark-resident's setup loop (each forks its
+                    own hluk workerd-host restoring from the shared prewarm
+                    snapshot, then polls for readiness); benchmark-multi-app
+                    and benchmark-orchestrator-contract ignore this (default:
+                    physical cores). Set to 1 to restore the original fully
+                    serial one-at-a-time behavior
   --verbose         Stream raw command output as well as saving it
   -h, --help        Show this help
 EOF
@@ -1269,6 +1287,22 @@ wait_for_workerd_host_ready() {
 # start_workerd_host SERVER_LOG CONFIG_PATH [BIND] [EXTRA_ARGS...]
 start_workerd_host() {
     local server_log="$1"
+    local bind="${3:-127.0.0.1:8080}"
+    start_workerd_host_nowait "$@"
+    wait_for_workerd_host_ready "$server_log" "$bind"
+}
+
+# start_workerd_host_nowait SERVER_LOG CONFIG_PATH [BIND] [EXTRA_ARGS...]
+#
+# Same fork as start_workerd_host, but returns immediately without
+# polling for readiness (demo_pid is still set). Lets a caller fork
+# several independent processes back-to-back (see benchmark-resident's
+# setup loop) so their restores proceed concurrently across available
+# cores instead of each one's full restore+ready-poll finishing before
+# the next is even forked; the caller is responsible for calling
+# wait_for_workerd_host_ready itself once it is ready to block.
+start_workerd_host_nowait() {
+    local server_log="$1"
     local config="$2"
     local bind="${3:-127.0.0.1:8080}"
     local shift_count=$#
@@ -1281,7 +1315,6 @@ start_workerd_host() {
         "$@" \
         >"$server_log" 2>&1 &
     demo_pid=$!
-    wait_for_workerd_host_ready "$server_log" "$bind"
 }
 
 # start_workerd_host_extra SERVER_LOG CONFIG_PATH BIND [EXTRA_ARGS...]
@@ -1292,6 +1325,17 @@ start_workerd_host() {
 # tracks its PID in extra_pids so stop_processes cleans it up alongside the
 # primary process.
 start_workerd_host_extra() {
+    local server_log="$1" bind="$3"
+    start_workerd_host_extra_nowait "$@"
+    wait_for_workerd_host_ready "$server_log" "$bind" "${extra_pids[-1]}"
+}
+
+# start_workerd_host_extra_nowait SERVER_LOG CONFIG_PATH BIND [EXTRA_ARGS...]
+#
+# Same fork as start_workerd_host_extra (PID still tracked in extra_pids),
+# but returns immediately without polling for readiness; see
+# start_workerd_host_nowait's docstring for why.
+start_workerd_host_extra_nowait() {
     local server_log="$1" config="$2" bind="$3"
     local shift_count=$#
     ((shift_count > 3)) && shift_count=3
@@ -1303,7 +1347,6 @@ start_workerd_host_extra() {
         >"$server_log" 2>&1 &
     local pid=$!
     extra_pids+=("$pid")
-    wait_for_workerd_host_ready "$server_log" "$bind" "$pid"
 }
 
 # allocate_evenly TOTAL PARTS ARRNAME
@@ -2347,6 +2390,13 @@ launch_hey_jobs() {
     local i=0
     local wave=0
     local total_active="0" first_release="" last_finish=""
+    # Wall-clock start used only for the progress bar below (see
+    # print_progress_bar's docstring): this is a long, otherwise-silent
+    # phase in non-verbose mode (log_line above only writes to
+    # _lhj_logfile, never stdout), so without this a multi-wave load
+    # phase looks just as hung as the setup phase did before it gained
+    # its own progress bar.
+    local t_start="$(now_seconds)"
     while ((i < n)); do
         wave=$((wave + 1))
         local -a batch_pids=() batch_indexes=()
@@ -2419,6 +2469,8 @@ launch_hey_jobs() {
         [[ -n "$_lhj_logfile" ]] && log_line "$_lhj_logfile" \
             "hey wave $wave finish: elapsed=$(seconds_between "$wave_t0" "$wave_t1")s" \
             "(barrier-release to wave-finish; excludes this wave's own pre-release forking cost)"
+        print_progress_bar "$batch_end" "$n" "load: hey apps completed" \
+            "$(printf '%.0f' "$(seconds_between "$t_start" "$(now_seconds)")")"
         i="$batch_end"
     done
     [[ -n "$_lhj_active_var" ]] && printf -v "$_lhj_active_var" '%s' "$total_active"
@@ -3332,7 +3384,8 @@ run_benchmark_resident() {
     : >"$run_log"
     log_line "$run_log" "benchmark-resident start: apps=$benchmark_apps" \
         "load_requests=$benchmark_load_requests concurrency=$benchmark_concurrency" \
-        "hey_max_parallel_jobs=$hey_max_parallel_jobs hey_ramp_ms=$hey_ramp_ms max_requests_per_vm=unset(unbounded)" \
+        "hey_max_parallel_jobs=$hey_max_parallel_jobs hey_ramp_ms=$hey_ramp_ms" \
+        "benchmark_setup_parallel=$benchmark_setup_parallel max_requests_per_vm=unset(unbounded)" \
         "max_lifetime_secs=unset(unbounded)"
 
     local -a req_alloc conc_alloc
@@ -3381,56 +3434,78 @@ run_benchmark_resident() {
     printf 'preparing: building reusable resident-app snapshot (one-time boot+init)...\n'
     prewarm_shared_snapshot "$run_log" "$bench_bundle" "$snapshot_dir" || return 1
 
-    # Starting each resident app is still a blocking, sequential step
-    # (fork its own `hluk workerd-host` process, then poll
-    # /__hyperlight/readyz) before the next app's setup even begins --
-    # see start_workerd_host_extra/wait_for_workerd_host_ready. Each
-    # process itself now restores from $snapshot_dir instead of
-    # fresh-booting, but at large --benchmark-apps counts this
-    # per-process fork/exec/restore/ready-poll loop still takes a
-    # while, and log_line only writes to run.log, not stdout, so a live
-    # run prints nothing and looks hung even though it is steadily
-    # making progress. print_progress_bar below renders this on stdout
-    # so it is visibly not stuck.
+    # Starting each resident app forks its own `hluk workerd-host`
+    # process (restoring from the shared $snapshot_dir instead of
+    # fresh-booting) and polls it for readiness. Up to
+    # $benchmark_setup_parallel of these are forked together before any
+    # of them are waited on, so independent restores proceed concurrently
+    # across available cores instead of serializing one app's full
+    # fork/restore/ready-poll behind the next's (set
+    # --benchmark-setup-parallel 1 to restore the original fully serial
+    # behavior). log_line only writes to run.log, not stdout, so a live
+    # run otherwise prints nothing and looks hung even while it is
+    # steadily making progress; print_progress_bar below renders this on
+    # stdout so it is visibly not stuck.
     local -a reqs concs urls hosts timeouts outfiles statuses status_files
-    for ((i = 0; i < benchmark_apps; i++)); do
-        local app_dir="$dir/app-$i"
-        mkdir -p "$app_dir"
-        local port=$((8320 + i))
-        local bind="127.0.0.1:$port"
-        local conc="${eff_conc[i]}"
-        local queue_capacity=64
-        ((conc * 4 > queue_capacity)) && queue_capacity=$((conc * 4))
-        local pool
-        pool="$(jq -n --argjson capacity "$conc" --argjson qc "$queue_capacity" \
-            '{kind:"resident", capacity:$capacity, queue_capacity:$qc, max_requests_per_vm:null, max_lifetime_secs:null}')"
-        local apps_json
-        apps_json="$(jq -n --argjson app "$(app_config "bench-$i" bench.resident.test \
-            "$bench_bundle" "$pool" none "$snapshot_dir")" '[$app]')"
-        write_host_config "$app_dir/config.json" "$apps_json"
-        log_line "$run_log" "app bench-$i config generated: pool=resident capacity=$conc" \
-            "queue_capacity=$queue_capacity bind=$bind requests=${req_alloc[i]}"
-        local app_t0 app_t1
-        app_t0="$(now_seconds)"
-        if ((i == 0)); then
-            start_workerd_host "$app_dir/server.log" "$app_dir/config.json" "$bind"
-        else
-            start_workerd_host_extra "$app_dir/server.log" "$app_dir/config.json" "$bind"
-        fi
-        app_t1="$(now_seconds)"
-        local app_pid=$((i == 0 ? demo_pid : extra_pids[-1]))
-        log_line "$run_log" "app bench-$i launched: pid=$app_pid bind=$bind" \
-            "server_log=$app_dir/server.log"
-        log_line "$run_log" "app bench-$i ready: elapsed=$(seconds_between "$app_t0" "$app_t1")s"
-        print_progress_bar "$((i + 1))" "$benchmark_apps" "setup: resident apps ready" \
-            "$(printf '%.0f' "$(seconds_between "$t_start" "$app_t1")")"
-        reqs[i]="${reqs_alloc_final[i]}"
-        concs[i]="$conc"
-        urls[i]="http://$bind/sync"
-        hosts[i]="bench.resident.test"
-        timeouts[i]=30
-        outfiles[i]="$app_dir/hey.txt"
-        status_files[i]="$app_dir/status.json"
+    local -a app_dirs app_binds app_t0s
+    local batch_start batch_end
+    for ((batch_start = 0; batch_start < benchmark_apps; batch_start += benchmark_setup_parallel)); do
+        batch_end=$((batch_start + benchmark_setup_parallel))
+        ((batch_end <= benchmark_apps)) || batch_end="$benchmark_apps"
+
+        # Phase 1: build each app's config and fork its process without
+        # waiting for readiness.
+        for ((i = batch_start; i < batch_end; i++)); do
+            local app_dir="$dir/app-$i"
+            mkdir -p "$app_dir"
+            local port=$((8320 + i))
+            local bind="127.0.0.1:$port"
+            local conc="${eff_conc[i]}"
+            local queue_capacity=64
+            ((conc * 4 > queue_capacity)) && queue_capacity=$((conc * 4))
+            local pool
+            pool="$(jq -n --argjson capacity "$conc" --argjson qc "$queue_capacity" \
+                '{kind:"resident", capacity:$capacity, queue_capacity:$qc, max_requests_per_vm:null, max_lifetime_secs:null}')"
+            local apps_json
+            apps_json="$(jq -n --argjson app "$(app_config "bench-$i" bench.resident.test \
+                "$bench_bundle" "$pool" none "$snapshot_dir")" '[$app]')"
+            write_host_config "$app_dir/config.json" "$apps_json"
+            log_line "$run_log" "app bench-$i config generated: pool=resident capacity=$conc" \
+                "queue_capacity=$queue_capacity bind=$bind requests=${req_alloc[i]}"
+            app_dirs[i]="$app_dir"
+            app_binds[i]="$bind"
+            app_t0s[i]="$(now_seconds)"
+            if ((i == 0)); then
+                start_workerd_host_nowait "$app_dir/server.log" "$app_dir/config.json" "$bind"
+            else
+                start_workerd_host_extra_nowait "$app_dir/server.log" "$app_dir/config.json" "$bind"
+            fi
+            reqs[i]="${reqs_alloc_final[i]}"
+            concs[i]="$conc"
+            urls[i]="http://$bind/sync"
+            hosts[i]="bench.resident.test"
+            timeouts[i]=30
+            outfiles[i]="$app_dir/hey.txt"
+            status_files[i]="$app_dir/status.json"
+        done
+
+        # Phase 2: wait for each app forked above to report ready. Apps
+        # in this batch were all forked together, so by the time this
+        # reaches app k its restore has typically already converged in
+        # parallel with app 0's -- only the first app in each batch
+        # usually pays the full poll.
+        for ((i = batch_start; i < batch_end; i++)); do
+            local app_dir="${app_dirs[i]}" bind="${app_binds[i]}"
+            local app_pid=$((i == 0 ? demo_pid : extra_pids[i - 1]))
+            wait_for_workerd_host_ready "$app_dir/server.log" "$bind" "$app_pid"
+            local app_t1
+            app_t1="$(now_seconds)"
+            log_line "$run_log" "app bench-$i launched: pid=$app_pid bind=$bind" \
+                "server_log=$app_dir/server.log"
+            log_line "$run_log" "app bench-$i ready: elapsed=$(seconds_between "${app_t0s[i]}" "$app_t1")s"
+            print_progress_bar "$((i + 1))" "$benchmark_apps" "setup: resident apps ready" \
+                "$(printf '%.0f' "$(seconds_between "$t_start" "$app_t1")")"
+        done
     done
 
     # If the per-app concurrency values could not express the full
@@ -4287,6 +4362,15 @@ while (($#)); do
             hey_ramp_ms_explicit=true
             shift 2
             ;;
+        --benchmark-setup-parallel)
+            (($# >= 2)) || {
+                echo "--benchmark-setup-parallel requires a value" >&2
+                exit 2
+            }
+            benchmark_setup_parallel="$2"
+            benchmark_setup_parallel_explicit=true
+            shift 2
+            ;;
         --verbose)
             verbose=true
             shift
@@ -4318,6 +4402,9 @@ fi
 if [[ "$hey_ramp_ms_explicit" != true ]]; then
     hey_ramp_ms=10
 fi
+if [[ "$benchmark_setup_parallel_explicit" != true ]]; then
+    benchmark_setup_parallel="$physical_cores"
+fi
 
 for benchmark_value in \
     benchmark_requests \
@@ -4326,7 +4413,8 @@ for benchmark_value in \
     benchmark_pool_vms \
     benchmark_apps \
     benchmark_load_requests \
-    hey_max_parallel_jobs; do
+    hey_max_parallel_jobs \
+    benchmark_setup_parallel; do
     if [[ ! "${!benchmark_value}" =~ ^[1-9][0-9]*$ ]]; then
         printf '%s must be a positive integer, got %q\n' \
             "$benchmark_value" "${!benchmark_value}" >&2
