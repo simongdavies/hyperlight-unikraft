@@ -441,6 +441,75 @@ benchmarks; both still accept the same `--benchmark-concurrency`,
 `--benchmark-concurrency` must be at least `--benchmark-apps`, and
 `--benchmark-apps` cannot exceed `--benchmark-load-requests`.
 
+### Concurrent resident app startup
+
+`--benchmark-setup-parallel N` (or
+`HYPERLIGHT_BENCHMARK_SETUP_PARALLEL`) controls how many independent
+`benchmark-resident` app hosts are started and awaited concurrently.
+It defaults to physical cores, not logical CPUs. This is independent
+of `--benchmark-concurrency` (load workers) and `--benchmark-hey-parallel`
+(hey client processes). For example:
+
+```bash
+tools/hyperlight-demo \
+  --benchmark-apps 512 --benchmark-setup-parallel 128 \
+  --benchmark-load-requests 51200 --benchmark-concurrency 512 \
+  --benchmark-load-driver vegeta --demo benchmark-resident
+```
+
+Use `1` for serial startup or `512` to start all 512 apps concurrently;
+increasing this can help but can also increase RAM pressure and CPU
+contention. The same limit bounds parallel post-load HTTP status transfers.
+Configs are generated together from the standard host-config template,
+rather than invoking several JSON-generation processes for each app.
+The parallelism limit applies to outstanding host restores and their
+concurrent readiness polls. Increasing it will not necessarily shorten
+setup if host restore work, config/file I/O, or resource contention dominates.
+
+### Resident timing: load versus post-load collection
+
+`startup: hey clients queued (wave N)` tracks preparing paused hey client
+jobs before releasing a load wave; its elapsed time covers that wave's
+client launch loop, not request execution or post-load processing.
+Vegeta instead announces one shared client with its workers, targets,
+and total request count; it does not start a hey process per app.
+
+Post-load collection means collecting each host's status, checking
+response counts, and generating per-app report data. It does **not**
+compile code or send benchmark requests. Its progress is explicitly
+labelled `post-load: host status/reports collected`, separate from hey
+client startup progress, rather than `results: apps compiled`.
+This runs after the load. Host status probes use bounded parallel HTTP
+transfers, and Vegeta per-app summaries are generated together rather than
+launching report-parsing subprocesses for every app.
+Captured response bodies and headers are dropped from intermediate
+decoded metrics before reporting/grouping; byte counts, timings, status
+codes, request errors, and target URLs remain intact. This avoids
+reprocessing hundreds of megabytes of response payload just to compute
+metrics. The native aggregate report still covers every request.
+
+For `benchmark-resident`, `timing.results_seconds` measures this
+collection/reporting phase; `teardown_seconds` now measures only process
+shutdown. Older output included both in `teardown_seconds`.
+`load_seconds` wraps the entire load driver, including target generation,
+result decoding, aggregation, and compatibility-report generation.
+It is not Vegeta's native request duration. `load_wall_seconds` and
+`wave_active_seconds` measure the shared Vegeta command's elapsed time,
+while Vegeta's native `Duration [total, attack, wait]` measures HTTP load:
+`attack` is the first-to-last request-start span, and `wait` covers final
+response completion. Thus a roughly four-second load can coexist with
+roughly 29 seconds in the load-driver phase and 40 seconds of post-load
+collection. Headline Vegeta throughput and latency use its native
+metrics, not setup, collection, or shutdown time.
+Phase announcements remain visible in non-verbose terminal runs during
+Vegeta target preparation, load execution, result decoding, per-app
+grouping, and resident shutdown. These are harness phases, not additional
+HTTP load.
+Long Vegeta decoding/report/grouping commands emit a `still working`
+elapsed-time update every five seconds, followed by completion or an
+explicit failure. Post-load collection retains its aggregate progress
+bar; detailed app data remains on disk.
+
 When requests or concurrency do not divide evenly across apps, the
 presenter allocates the remainder deterministically (earlier apps receive
 one extra unit each) so the same inputs always produce the same

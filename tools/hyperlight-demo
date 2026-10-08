@@ -1308,6 +1308,36 @@ app_config() {
         } + (if $snapshot_dir == "" then {} else {snapshot_dir: $snapshot_dir} end)'
 }
 
+write_resident_benchmark_configs() {
+    local dir="$1" bundle="$2" snapshot="$3"
+    local -n capacities="$4"
+    local template
+    template="$(app_config bench-0 bench.resident.test "$bundle" \
+        '{"kind":"resident","capacity":1,"queue_capacity":64,"max_requests_per_vm":null,"max_lifetime_secs":null}' \
+        none "$snapshot")"
+    write_host_config "$dir/config-template.json" "[$template]"
+    python3 - "$dir" "${capacities[@]}" <<'PY'
+import copy
+import json
+import pathlib
+import sys
+
+directory = pathlib.Path(sys.argv[1])
+template = json.loads((directory / "config-template.json").read_text())
+for index, value in enumerate(sys.argv[2:]):
+    config = copy.deepcopy(template)
+    app = config["apps"][0]
+    app["route"]["app_id"] = f"bench-{index}"
+    capacity = int(value)
+    app["pool"]["capacity"] = capacity
+    app["pool"]["queue_capacity"] = max(64, capacity * 4)
+    app_dir = directory / f"app-{index}"
+    app_dir.mkdir(parents=True, exist_ok=True)
+    (app_dir / "config.json").write_text(json.dumps(config) + "\n")
+PY
+    rm -f "$dir/config-template.json"
+}
+
 # prewarm_shared_snapshot RUN_LOG BUNDLE_PATH SNAPSHOT_DIR
 #
 # Runs `hluk workerd-prewarm-snapshot` once to produce a verified,
@@ -1830,15 +1860,40 @@ self_test() {
     local request_records
     request_records="$(filter_vegeta_request_results <<'JSON'
 {"code":0,"method":"","url":"","error":"no targets to attack"}
-{"code":200,"method":"GET","url":"http://example.test/","error":""}
+{"code":200,"method":"GET","url":"http://example.test/","error":"","body":"b2s=","headers":{"Content-Length":["2"]},"bytes_in":2,"latency":123}
 {"code":0,"method":"GET","url":"http://example.test/","error":"connection refused"}
 JSON
 )"
-    if ! jq -s -e 'length == 2 and .[0].code == 200 and .[1].error == "connection refused"' \
+    if ! jq -s -e 'length == 2 and .[0].code == 200 and .[1].error == "connection refused"
+        and .[0].bytes_in == 2 and .[0].latency == 123
+        and (.[0] | has("body") or has("headers") | not)' \
         <<<"$request_records" >/dev/null; then
         echo "FAIL vegeta EOF filtering: real request successes/errors must remain" >&2
         failures=$((failures + 1))
     fi
+
+    local config_test_dir config_index config_capacity config_pool config_app
+    local -a config_capacities=(1 2 20)
+    config_test_dir="$(mktemp -d)"
+    write_resident_benchmark_configs "$config_test_dir" "bundle.json" "snapshot-dir" config_capacities
+    for config_index in 0 1 2; do
+        config_capacity="${config_capacities[config_index]}"
+        config_pool="$(jq -n --argjson c "$config_capacity" \
+            '{kind:"resident",capacity:$c,queue_capacity:([64,($c*4)]|max),
+              max_requests_per_vm:null,max_lifetime_secs:null}')"
+        config_app="$(app_config "bench-$config_index" bench.resident.test \
+            bundle.json "$config_pool" none snapshot-dir)"
+        write_host_config "$config_test_dir/expected.json" "[$config_app]"
+        if ! diff <(jq -S . "$config_test_dir/expected.json") \
+            <(jq -S . "$config_test_dir/app-$config_index/config.json") >/dev/null; then
+            echo "FAIL batched resident config differs from standard config helpers" >&2
+            failures=$((failures + 1))
+        fi
+        rm -f "$config_test_dir/app-$config_index/config.json"
+        rmdir "$config_test_dir/app-$config_index"
+    done
+    rm -f "$config_test_dir/expected.json"
+    rmdir "$config_test_dir"
 
     # Regression guard for run_one's fail-fast fix: bash disables errexit
     # for a compound command (and everything nested inside it, including
@@ -2537,6 +2592,8 @@ launch_hey_jobs() {
             "hey wave $wave queue: apps $i-$((batch_end - 1)) of $n" \
             "${hey_ramp_ms:+ramp=${hey_ramp_ms}ms per job on release}"
         local wave_t0 wave_t1
+        local launch_start
+        launch_start="$(now_seconds)"
         local j
         for ((j = i; j < batch_end; j++)); do
             if ((_lhj_reqs[j] <= 0)); then
@@ -2559,6 +2616,11 @@ launch_hey_jobs() {
                 "${host_args[@]}" "${_lhj_urls[j]}"
             batch_pids+=("$!")
             batch_indexes+=("$j")
+            if (((j - i + 1) % progress_step == 0 || j + 1 >= batch_end)); then
+                print_progress_bar "$((j - i + 1))" "$((batch_end - i))" \
+                    "startup: hey clients queued (wave $wave)" \
+                    "$(printf '%.0f' "$(seconds_between "$launch_start" "$(now_seconds)")")"
+            fi
         done
         # Zero-request apps above never get spawned/waited (skipped via
         # the `continue` above), so they would otherwise never be
@@ -2663,7 +2725,12 @@ launch_hey_jobs() {
 # single app's failure from another's).
 filter_vegeta_request_results() {
     jq -c 'select((.error == "no targets to attack" and
-        .url == "" and .method == "" and .code == 0) | not)'
+        .url == "" and .method == "" and .code == 0) | not)
+        | del(.body, .headers)'
+}
+
+decode_vegeta_request_results() {
+    vegeta encode -to=json "$1" | filter_vegeta_request_results
 }
 
 launch_vegeta_load() {
@@ -2680,6 +2747,7 @@ launch_vegeta_load() {
     local report_json="$_lvl_workdir/vegeta-report.json"
     local records_json="$_lvl_workdir/vegeta-records.jsonl"
     local per_app_stats_tsv="$_lvl_workdir/vegeta-per-app-stats.tsv"
+    phase_message "load preparation: generating Vegeta targets for $n apps"
 
     # Built with plain `printf` (a bash builtin, no fork) rather than `jq
     # -R`/`jq -n` per index: safe because url/host are both entirely
@@ -2689,8 +2757,8 @@ launch_vegeta_load() {
     : >"$apps_list_file"
     local i total_requests=0
     for ((i = 0; i < n; i++)); do
-        printf '{"idx":%d,"url":"%s","host":"%s","reqs":%d}\n' \
-            "$i" "${_lvl_urls[i]}" "${_lvl_hosts[i]}" "${_lvl_reqs[i]}" >>"$apps_list_file"
+        printf '{"idx":%d,"url":"%s","host":"%s","reqs":%d,"concurrency":%d}\n' \
+            "$i" "${_lvl_urls[i]}" "${_lvl_hosts[i]}" "${_lvl_reqs[i]}" "${_lvl_concs[i]}" >>"$apps_list_file"
         total_requests=$((total_requests + _lvl_reqs[i]))
     done
 
@@ -2706,7 +2774,7 @@ launch_vegeta_load() {
         {
             url = $0; sub(/^.*"url":"/, "", url); sub(/".*$/, "", url)
             host = $0; sub(/^.*"host":"/, "", host); sub(/".*$/, "", host)
-            reqs = $0; sub(/^.*"reqs":/, "", reqs); sub(/}.*$/, "", reqs)
+            reqs = $0; sub(/^.*"reqs":/, "", reqs); sub(/[,}].*$/, "", reqs)
             n++; urls[n] = url; hosts[n] = host; reqs_arr[n] = reqs + 0
             if (reqs + 0 > maxreqs) maxreqs = reqs + 0
         }
@@ -2728,7 +2796,8 @@ launch_vegeta_load() {
     local t0 t1 attack_status=0
     t0="$(now_monotonic_seconds)"
     if ((total_requests > 0)); then
-        vegeta attack -targets="$targets_file" -lazy -duration=0 -rate=0 \
+        phase_message "load: starting one shared Vegeta client ($_lvl_total_conc workers, $n targets, $total_requests requests)"
+        run_with_progress "Vegeta HTTP load" vegeta attack -targets="$targets_file" -lazy -duration=0 -rate=0 \
             -workers="$_lvl_total_conc" -max-workers="$_lvl_total_conc" -timeout=30s \
             >"$results_bin" 2>"$_lvl_workdir/vegeta-attack.stderr" || attack_status=$?
     else
@@ -2756,12 +2825,12 @@ launch_vegeta_load() {
     fi
 
     if ((total_requests > 0)); then
+        phase_message "load finished (${elapsed}s): decoding Vegeta results and generating native reports"
         # Lazy target exhaustion produces a synthetic result, not an HTTP
         # request. Keep real request errors, excluding only this EOF marker.
-        vegeta encode -to=json "$results_bin" |
-            filter_vegeta_request_results >"$records_json"
-        vegeta report -type=json "$records_json" >"$report_json"
-        vegeta report "$records_json" >"$_lvl_workdir/vegeta.txt"
+        run_with_progress "Vegeta result decoding" decode_vegeta_request_results "$results_bin" >"$records_json"
+        run_with_progress "Vegeta JSON report" vegeta report -type=json "$records_json" >"$report_json"
+        run_with_progress "Vegeta text report" vegeta report "$records_json" >"$_lvl_workdir/vegeta.txt"
         if ! jq -e --argjson expected "$total_requests" '.requests == $expected' "$report_json" >/dev/null; then
             printf 'FAILURE: Vegeta reported %s requests; expected %s (see %s)\n' \
                 "$(jq -r '.requests' "$report_json")" "$total_requests" "$report_json" >&2
@@ -2780,7 +2849,9 @@ launch_vegeta_load() {
     # idx/successes/mean_latency_s/rps -- so the loop below can write
     # every synthesized report with pure bash builtins (no per-app jq
     # fork) even at thousands of apps.
-    jq -n -r \
+    phase_message "report processing: grouping Vegeta records across $n apps"
+    # shellcheck disable=SC2016 # These variables belong to jq, not bash.
+    run_with_progress "Vegeta per-app grouping" jq -n -r \
         --argjson duration_s "$overall_duration_s" \
         --slurpfile apps_arr "$apps_list_file" \
         --slurpfile records "$records_json" '
@@ -2794,13 +2865,24 @@ launch_vegeta_load() {
         $apps_arr[] |
         . as $app |
         ($by_url[$app.url] // {successes: 0, mean_latency_s: 0}) as $g |
-        "\($app.idx)\t\($g.successes)\t\($g.mean_latency_s)\t" +
-        (if $duration_s > 0 then ($g.successes / $duration_s) else 0 end | tostring)
+        {
+            app_id: ("bench-" + ($app.idx | tostring)),
+            requests: $app.reqs, concurrency: $app.concurrency,
+            successful_responses: $g.successes,
+            average_latency_ms: ($g.mean_latency_s * 1000),
+            hey_total_seconds: $duration_s,
+            requests_per_sec: (if $duration_s > 0 then ($g.successes / $duration_s) else 0 end)
+        } | tojson
     ' >"$per_app_stats_tsv"
+    mv "$per_app_stats_tsv" "$_lvl_workdir/vegeta-app-summaries.jsonl"
+    jq -r '[(.app_id | ltrimstr("bench-")), .successful_responses,
+        (.average_latency_ms / 1000), .requests_per_sec] | @tsv' \
+        "$_lvl_workdir/vegeta-app-summaries.jsonl" >"$per_app_stats_tsv"
 
     local idx successes mean_latency_s rps
     while IFS=$'\t' read -r idx successes mean_latency_s rps; do
         _lvl_statuses[idx]=0
+        ((successes == _lvl_reqs[idx])) || _lvl_statuses[idx]=1
         {
             printf '\nSummary:\n'
             printf '  Total:        %s secs\n' "$overall_duration_s"
@@ -2812,6 +2894,7 @@ launch_vegeta_load() {
     done <"$per_app_stats_tsv"
 
     rm -f "$apps_list_file" "$targets_file" "$results_bin" "$records_json" "$per_app_stats_tsv"
+    phase_message "Vegeta reports ready; collecting resident host status"
 }
 
 # write_collected_hey_report OUTPUT APP_IDS_ARRNAME ADDR_ARRNAME CMD_ARRNAME
@@ -2845,7 +2928,10 @@ write_collected_hey_report() {
             echo "address: ${_wchr_addrs[i]}"
             echo "command: ${_wchr_cmds[i]}"
             echo
-            cat "${_wchr_files[i]}"
+            local report_line
+            while IFS= read -r report_line || [[ -n "$report_line" ]]; do
+                printf '%s\n' "$report_line"
+            done <"${_wchr_files[i]}"
         done
     } >"$output"
 }
@@ -2950,6 +3036,40 @@ log_line() {
     printf '[%(%Y-%m-%dT%H:%M:%S%z)T] %s\n' -1 "$*" >>"$logfile"
 }
 
+phase_message() {
+    printf '%s\n' "$*"
+    # shellcheck disable=SC2031 # The self-test override is intentionally subshell-local.
+    if [[ ! -t 1 && -z "${_LHJ_TEST_NO_TTY_ESCAPE:-}" ]] &&
+        { exec 3>/dev/tty; } 2>/dev/null; then
+        printf '%s\n' "$*" >&3
+        exec 3>&-
+    fi
+}
+
+run_with_progress() {
+    local label="$1"
+    shift
+    local started="$SECONDS" last_update="$SECONDS" pid status=0 tracked_index
+    "$@" &
+    pid=$!
+    tracked_index="${#extra_pids[@]}"
+    extra_pids+=("$pid")
+    while kill -0 "$pid" 2>/dev/null; do
+        sleep 0.1
+        if ((SECONDS - last_update >= 5)); then
+            phase_message "$label: still working ($((SECONDS - started))s)" >&2
+            last_update="$SECONDS"
+        fi
+    done
+    wait "$pid" || status=$?
+    unset "extra_pids[$tracked_index]"
+    if ((status != 0)); then
+        phase_message "$label failed (exit $status, $((SECONDS - started))s)" >&2
+        return "$status"
+    fi
+    phase_message "$label complete ($((SECONDS - started))s)" >&2
+}
+
 # print_progress_bar CURRENT TOTAL LABEL ELAPSED_SECONDS
 #
 # Renders CURRENT/TOTAL progress so a long blocking setup loop (e.g.
@@ -3005,7 +3125,7 @@ print_progress_bar() {
 }
 
 # make_phase_timing SETUP_SECONDS LOAD_SECONDS TEARDOWN_SECONDS TOTAL_SECONDS
-#                    WAVE_ACTIVE_SECONDS LOAD_WALL_SECONDS
+#                    WAVE_ACTIVE_SECONDS LOAD_WALL_SECONDS [RESULTS_SECONDS]
 # -> prints the shared {setup_seconds, load_seconds, teardown_seconds,
 #    total_seconds, wave_active_seconds, load_wall_seconds} JSON object
 #    used by benchmark-resident/benchmark-multi-app's summary.json.
@@ -3014,7 +3134,8 @@ print_progress_bar() {
 #    the caller-measured wall-clock span around the entire
 #    launch_hey_jobs call (includes the first wave's pre-release forking
 #    cost, since the caller's clock starts before calling in); teardown_
-#    seconds covers post-load status collection and process shutdown;
+#    seconds covers process shutdown when RESULTS_SECONDS is supplied;
+#    otherwise it includes post-load status collection for compatibility.
 #    total_seconds is the full run_benchmark_* function duration (may
 #    exceed the sum of the other three by a small amount spent on
 #    bookkeeping between phases).
@@ -3040,7 +3161,9 @@ make_phase_timing() {
         --argjson total_seconds "$4" \
         --argjson wave_active_seconds "${5:-0}" \
         --argjson load_wall_seconds "${6:-0}" \
-        '{setup_seconds: $setup_seconds, load_seconds: $load_seconds, teardown_seconds: $teardown_seconds, total_seconds: $total_seconds, wave_active_seconds: $wave_active_seconds, load_wall_seconds: $load_wall_seconds}'
+        --argjson results_seconds "${7:-null}" \
+        '{setup_seconds: $setup_seconds, load_seconds: $load_seconds, teardown_seconds: $teardown_seconds, total_seconds: $total_seconds, wave_active_seconds: $wave_active_seconds, load_wall_seconds: $load_wall_seconds}
+        + (if $results_seconds != null then {results_seconds: $results_seconds} else {} end)'
 }
 
 # write_benchmark_summary SCENARIO PER_APP_ARRAY_JSON TIMING_JSON MAX_PARALLEL
@@ -3791,7 +3914,7 @@ run_benchmark_resident() {
     local dir="$output_dir/benchmark-resident"
     mkdir -p "$dir"
     LC_ALL=C lscpu | grep -E '^(CPU\(s\)|Socket|Core|Thread)' >"$dir/lscpu.txt"
-    local t_start t_setup_done t_load_done t_end
+    local t_start t_setup_done t_load_done t_results_done t_end
     local wave_active_seconds load_wall_seconds
     t_start="$(now_seconds)"
     local run_log="$dir/run.log"
@@ -3858,6 +3981,9 @@ run_benchmark_resident() {
     rm -rf "$snapshot_dir"
     printf 'preparing: building reusable resident-app snapshot (one-time boot+init)...\n'
     prewarm_shared_snapshot "$run_log" "$bench_bundle" "$snapshot_dir" || return 1
+    phase_message "setup: generating $benchmark_apps configs in one batch (startup parallelism=$benchmark_setup_parallel)"
+    write_resident_benchmark_configs "$dir" "$bench_bundle" "$snapshot_dir" eff_conc
+    phase_message "setup: starting resident hosts (up to $benchmark_setup_parallel concurrent restores)"
 
     # Starting each resident app forks its own `hluk workerd-host`
     # process (restoring from the shared $snapshot_dir instead of
@@ -3873,6 +3999,8 @@ run_benchmark_resident() {
     # stdout so it is visibly not stuck.
     local -a reqs concs urls hosts timeouts outfiles statuses status_files
     local -a app_dirs app_binds app_t0s
+    local launch_elapsed_start="$SECONDS"
+    local launch_progress_step=$(((benchmark_apps + 39) / 40))
     local batch_start batch_end
     for ((batch_start = 0; batch_start < benchmark_apps; batch_start += benchmark_setup_parallel)); do
         batch_end=$((batch_start + benchmark_setup_parallel))
@@ -3882,19 +4010,11 @@ run_benchmark_resident() {
         # waiting for readiness.
         for ((i = batch_start; i < batch_end; i++)); do
             local app_dir="$dir/app-$i"
-            mkdir -p "$app_dir"
             local port=$((8320 + i))
             local bind="127.0.0.1:$port"
             local conc="${eff_conc[i]}"
             local queue_capacity=64
             ((conc * 4 > queue_capacity)) && queue_capacity=$((conc * 4))
-            local pool
-            pool="$(jq -n --argjson capacity "$conc" --argjson qc "$queue_capacity" \
-                '{kind:"resident", capacity:$capacity, queue_capacity:$qc, max_requests_per_vm:null, max_lifetime_secs:null}')"
-            local apps_json
-            apps_json="$(jq -n --argjson app "$(app_config "bench-$i" bench.resident.test \
-                "$bench_bundle" "$pool" none "$snapshot_dir")" '[$app]')"
-            write_host_config "$app_dir/config.json" "$apps_json"
             log_line "$run_log" "app bench-$i config generated: pool=resident capacity=$conc" \
                 "queue_capacity=$queue_capacity bind=$bind requests=${req_alloc[i]}"
             app_dirs[i]="$app_dir"
@@ -3912,17 +4032,28 @@ run_benchmark_resident() {
             timeouts[i]=30
             outfiles[i]="$app_dir/hey.txt"
             status_files[i]="$app_dir/status.json"
+            if (((i + 1) % launch_progress_step == 0 || i + 1 == benchmark_apps)); then
+                print_progress_bar "$((i + 1))" "$benchmark_apps" "setup: resident hosts launched" \
+                    "$((SECONDS - launch_elapsed_start))"
+            fi
         done
 
-        # Phase 2: wait for each app forked above to report ready. Apps
-        # in this batch were all forked together, so by the time this
-        # reaches app k its restore has typically already converged in
-        # parallel with app 0's -- only the first app in each batch
-        # usually pays the full poll.
+        # Poll every host in this batch concurrently, retaining each
+        # poller's PID so failure/interrupt cleanup still owns it.
+        local -a ready_pids=() ready_tracks=()
+        for ((i = batch_start; i < batch_end; i++)); do
+            local app_pid=$((i == 0 ? demo_pid : extra_pids[i - 1]))
+            wait_for_workerd_host_ready "${app_dirs[i]}/server.log" "${app_binds[i]}" "$app_pid" &
+            ready_pids+=("$!")
+        done
+        for app_pid in "${ready_pids[@]}"; do
+            ready_tracks+=("${#extra_pids[@]}")
+            extra_pids+=("$app_pid")
+        done
         for ((i = batch_start; i < batch_end; i++)); do
             local app_dir="${app_dirs[i]}" bind="${app_binds[i]}"
             local app_pid=$((i == 0 ? demo_pid : extra_pids[i - 1]))
-            wait_for_workerd_host_ready "$app_dir/server.log" "$bind" "$app_pid"
+            wait "${ready_pids[i - batch_start]}"
             local app_t1
             app_t1="$(now_seconds)"
             log_line "$run_log" "app bench-$i launched: pid=$app_pid bind=$bind" \
@@ -3931,6 +4062,8 @@ run_benchmark_resident() {
             print_progress_bar "$((i + 1))" "$benchmark_apps" "setup: resident apps ready" \
                 "$(printf '%.0f' "$(seconds_between "$t_start" "$app_t1")")"
         done
+        for app_pid in "${ready_tracks[@]}"; do unset "extra_pids[$app_pid]"; done
+        extra_pids=("${extra_pids[@]}")
     done
 
     # If the per-app concurrency values could not express the full
@@ -3979,12 +4112,19 @@ run_benchmark_resident() {
     # scale this loop is meant to handle. Joined into one real JSON array
     # via a single `jq -cs` slurp after the loop instead (see below).
     local -a app_summary_list=()
-    local t_results_start="$(now_seconds)"
-    # See the identical throttling comment in launch_hey_jobs: computing
-    # elapsed seconds costs real subprocess forks, so cap this loop's
-    # progress updates to ~100 total regardless of benchmark_apps.
-    local results_progress_step=$(((benchmark_apps + 99) / 100))
-    ((results_progress_step < 1)) && results_progress_step=1
+    local -a vegeta_summaries=() status_args=()
+    if [[ "$benchmark_load_driver" == vegeta ]]; then
+        mapfile -t vegeta_summaries <"$dir/vegeta-app-summaries.jsonl"
+    fi
+    for ((i = 0; i < benchmark_apps; i++)); do
+        ((i == 0)) || status_args+=(--next)
+        status_args+=(--fail-with-body --silent --show-error --max-time 30
+            --output "${status_files[i]}" "http://127.0.0.1:$((8320 + i))/__hyperlight/status")
+    done
+    run_with_progress "post-load: parallel host status collection" \
+        curl --parallel --parallel-max "$benchmark_setup_parallel" "${status_args[@]}"
+    local results_start="$SECONDS"
+    local results_progress_step=$(((benchmark_apps + 39) / 40))
     for ((i = 0; i < benchmark_apps; i++)); do
         # These used to be bare `[[ ]]`/`grep -Eq` relying on `set -e` to
         # abort: that prints nothing to stdout/stderr, so run_one's
@@ -3999,7 +4139,7 @@ run_benchmark_resident() {
                 "$i" "$benchmark_load_driver" "${statuses[i]}" "${outfiles[i]}" "$dir/app-$i/server.log" >&2
             return 1
         fi
-        if ((reqs[i] > 0)) &&
+        if [[ "$benchmark_load_driver" == hey ]] && ((reqs[i] > 0)) &&
             ! grep -Eq "\\[200\\][[:space:]]+${reqs[i]} responses" "${outfiles[i]}"; then
             log_line "$run_log" "FAILURE: app bench-$i did not report ${reqs[i]} 200 responses" \
                 "see ${outfiles[i]} and $dir/app-$i/server.log"
@@ -4008,12 +4148,12 @@ run_benchmark_resident() {
             tail -n 10 "${outfiles[i]}" | sed 's/^/  /' >&2
             return 1
         fi
-        local port=$((8320 + i))
-        curl --fail-with-body --silent --show-error \
-            "http://127.0.0.1:$port/__hyperlight/status" >"${status_files[i]}"
-        log_line "$run_log" "app bench-$i pool status: $(jq -c . "${status_files[i]}")"
         local one
-        one="$(build_app_summary "bench-$i" "${reqs[i]}" "${concs[i]}" "${outfiles[i]}")"
+        if [[ "$benchmark_load_driver" == vegeta ]]; then
+            one="${vegeta_summaries[i]}"
+        else
+            one="$(build_app_summary "bench-$i" "${reqs[i]}" "${concs[i]}" "${outfiles[i]}")"
+        fi
         app_summary_list+=("$one")
         app_ids[i]="bench-$i"
         if [[ "$benchmark_load_driver" == vegeta ]]; then
@@ -4021,13 +4161,9 @@ run_benchmark_resident() {
         else
             cmds[i]="hey -n ${reqs[i]} -c ${concs[i]} -t ${timeouts[i]} -host ${hosts[i]} ${urls[i]}"
         fi
-        # This loop does a real curl round-trip plus two jq subprocess
-        # invocations per app, which is otherwise as silent as the setup
-        # and load phases were before they gained progress bars (compiling
-        # results for hundreds/thousands of apps is not instant).
-        if (((i + 1) % results_progress_step == 0 || i + 1 >= benchmark_apps)); then
-            print_progress_bar "$((i + 1))" "$benchmark_apps" "results: apps compiled" \
-                "$(printf '%.0f' "$(seconds_between "$t_results_start" "$(now_seconds)")")"
+        if (((i + 1) % results_progress_step == 0 || i + 1 == benchmark_apps)); then
+            print_progress_bar "$((i + 1))" "$benchmark_apps" \
+                "post-load: host status/reports collected" "$((SECONDS - results_start))"
         fi
     done
 
@@ -4061,17 +4197,22 @@ run_benchmark_resident() {
 
     write_collected_hey_report "$dir/hey.txt" app_ids urls cmds outfiles "$benchmark_load_driver"
     jq -s '.' "$dir"/app-*/status.json >"$dir/status.json"
+    jq -c '.[]' "$dir/status.json" >>"$run_log"
+    t_results_done="$(now_seconds)"
+    log_line "$run_log" "post-load results collection complete: elapsed=$(seconds_between "$t_load_done" "$t_results_done")s"
     log_line "$run_log" "shutdown start"
+    phase_message "shutdown: stopping $benchmark_apps resident hosts"
     stop_processes
     t_end="$(now_seconds)"
-    log_line "$run_log" "shutdown complete: elapsed=$(seconds_between "$t_load_done" "$t_end")s"
+    log_line "$run_log" "shutdown complete: elapsed=$(seconds_between "$t_results_done" "$t_end")s"
     local timing_json
     timing_json="$(make_phase_timing \
         "$(seconds_between "$t_start" "$t_setup_done")" \
         "$(seconds_between "$t_setup_done" "$t_load_done")" \
-        "$(seconds_between "$t_load_done" "$t_end")" \
+        "$(seconds_between "$t_results_done" "$t_end")" \
         "$(seconds_between "$t_start" "$t_end")" \
-        "$wave_active_seconds" "$load_wall_seconds")"
+        "$wave_active_seconds" "$load_wall_seconds" \
+        "$(seconds_between "$t_load_done" "$t_results_done")")"
     local effective_max_parallel="$hey_max_parallel_jobs"
     [[ "$benchmark_load_driver" == vegeta ]] && effective_max_parallel=0
     write_benchmark_summary "benchmark-resident" "$app_summaries" "$timing_json" \
