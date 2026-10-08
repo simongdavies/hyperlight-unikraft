@@ -243,6 +243,14 @@ impl std::error::Error for BrokerHostError {}
 
 /// Host protocol implementation injected beneath policy and quota enforcement.
 pub trait BrokerExecutor {
+    fn checkpoint_next_handle(&self) -> Option<u64> {
+        None
+    }
+    fn restore_next_handle(&mut self, _next: u64) -> Result<(), BrokerHostError> {
+        Err(BrokerHostError::new("handle_reconstruction_unsupported"))
+    }
+    /// Concrete transports clamp blocking operations to the admitted deadline.
+    fn set_deadline(&mut self, _deadline: std::time::Instant) {}
     /// Execute one already-authorized and already-charged operation.
     fn execute(&mut self, operation: &BrokerOperation) -> Result<BrokerExecution, BrokerHostError>;
 
@@ -268,6 +276,19 @@ pub struct BrokerAdapter<E> {
 }
 
 impl<E: BrokerExecutor> BrokerAdapter<E> {
+    pub(crate) fn checkpoint_next_handle(&self) -> Option<u64> {
+        self.executor.checkpoint_next_handle()
+    }
+    pub(crate) fn restore_next_handle(&mut self, next: u64) -> Result<(), BrokerHostError> {
+        self.executor.restore_next_handle(next)
+    }
+    pub(crate) fn set_deadline(&mut self, deadline: std::time::Instant) {
+        self.executor.set_deadline(deadline);
+    }
+    pub(crate) fn checkpoint_quiescent(&self) -> bool {
+        self.handles.is_empty() && !self.poisoned
+    }
+
     /// Construct an adapter with explicit policy and finite limits.
     pub fn new(
         policy: BrokerPolicy,

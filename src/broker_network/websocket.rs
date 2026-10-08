@@ -1,21 +1,48 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 The Hyperlight Authors.
 
-use super::{NetworkExecutor, NetworkResource};
+use super::{DeadlineTcpStream, NetworkExecutor, NetworkResource};
 use crate::broker::{BrokerEndpoint, EndpointHost, WebSocketProfile};
 use crate::broker_adapter::{BrokerExecution, BrokerHostError};
 use rustls::pki_types::ServerName;
 use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::sync::Arc;
 use tungstenite::Message;
 use tungstenite::client::IntoClientRequest;
 use tungstenite::http::HeaderValue;
 use tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL;
 
-pub(super) enum WebSocketTransport {
-    Tcp(TcpStream),
-    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+pub(crate) enum WebSocketTransport {
+    Tcp(DeadlineTcpStream),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, DeadlineTcpStream>>),
+}
+
+impl WebSocketTransport {
+    pub(crate) fn set_deadline(&mut self, deadline: std::time::Instant) -> std::io::Result<()> {
+        let state = match self {
+            Self::Tcp(stream) => &stream.deadline,
+            Self::Tls(stream) => &stream.sock.deadline,
+        };
+        *state
+            .lock()
+            .map_err(|_| std::io::Error::other("network deadline state poisoned"))? =
+            Some(deadline);
+        Ok(())
+    }
+
+    pub(crate) fn tcp(&self) -> &std::net::TcpStream {
+        match self {
+            Self::Tcp(stream) => &stream.inner,
+            Self::Tls(stream) => &stream.sock.inner,
+        }
+    }
+
+    pub(crate) fn polling(&mut self, timeout: std::time::Duration) {
+        match self {
+            Self::Tcp(stream) => stream.io_timeout = timeout,
+            Self::Tls(stream) => stream.sock.io_timeout = timeout,
+        }
+    }
 }
 
 impl Read for WebSocketTransport {
@@ -154,11 +181,11 @@ pub(super) fn receive(
     Err(BrokerHostError::new("websocket_control_limit"))
 }
 
-fn tls(
+pub(super) fn tls(
     executor: &NetworkExecutor,
     endpoint: &BrokerEndpoint,
-    stream: TcpStream,
-) -> Result<rustls::StreamOwned<rustls::ClientConnection, TcpStream>, BrokerHostError> {
+    stream: DeadlineTcpStream,
+) -> Result<rustls::StreamOwned<rustls::ClientConnection, DeadlineTcpStream>, BrokerHostError> {
     let config = rustls::ClientConfig::builder_with_protocol_versions(&[
         &rustls::version::TLS13,
         &rustls::version::TLS12,

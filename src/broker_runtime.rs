@@ -4,7 +4,7 @@ use crate::broker::{BrokerRequestId, RequestIdentity};
 use crate::broker_adapter::{BrokerAdapter, BrokerAuditEvent, BrokerExecutor, BrokerHostError};
 use crate::broker_wire::{BrokerWireResponse, BrokerWireResult, BrokerWireStatus, encode_response};
 use std::collections::{HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -15,8 +15,21 @@ pub const NETWORK_BROKER_HOST_FUNCTION: &str = "__hl_broker_v1";
 pub const LOGICAL_BROKER_HOST_FUNCTION: &str = "WorkerdLogicalServiceV1Invoke";
 
 const MAX_NETWORK_AUDIT_EVENTS: usize = 1024;
+static NEXT_OPAQUE_AUTHORITY: AtomicU64 = AtomicU64::new(1);
+
+fn opaque_authority() -> u64 {
+    NEXT_OPAQUE_AUTHORITY
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| {
+            next.checked_add(1)
+        })
+        .expect("process cannot construct u64::MAX broker authorities")
+}
 
 trait NetworkWireService: Send {
+    fn checkpoint_next_handle(&self) -> Option<u64>;
+    fn restore_next_handle(&mut self, next: u64) -> Result<(), BrokerHostError>;
+    fn set_deadline(&mut self, deadline: Instant);
+    fn checkpoint_quiescent(&self) -> bool;
     fn dispatch(
         &mut self,
         identity: &RequestIdentity,
@@ -31,6 +44,18 @@ struct NetworkAdapterService<E> {
 }
 
 impl<E: BrokerExecutor + Send> NetworkWireService for NetworkAdapterService<E> {
+    fn checkpoint_next_handle(&self) -> Option<u64> {
+        self.adapter.checkpoint_next_handle()
+    }
+    fn restore_next_handle(&mut self, next: u64) -> Result<(), BrokerHostError> {
+        self.adapter.restore_next_handle(next)
+    }
+    fn set_deadline(&mut self, deadline: Instant) {
+        self.adapter.set_deadline(deadline);
+    }
+    fn checkpoint_quiescent(&self) -> bool {
+        self.adapter.checkpoint_quiescent()
+    }
     fn dispatch(
         &mut self,
         identity: &RequestIdentity,
@@ -98,6 +123,9 @@ pub enum LogicalRuntimeStatus {
 ///
 /// The implementation owns canonical JSON parsing and response serialization.
 pub trait LogicalWireService: Send {
+    /// Bound cooperative host work by the admitted remaining deadline.
+    /// Services without long-running work may retain their fixed finite limits.
+    fn set_deadline(&mut self, _deadline: Instant) {}
     /// Inspect version and binding without invoking the service adapter.
     fn inspect(&self, payload: &[u8]) -> Result<LogicalInvocation, LogicalWireError>;
 
@@ -173,6 +201,11 @@ impl Default for LogicalServiceRouter {
 }
 
 impl LogicalWireService for LogicalServiceRouter {
+    fn set_deadline(&mut self, deadline: Instant) {
+        for service in self.services.values_mut() {
+            service.set_deadline(deadline);
+        }
+    }
     fn inspect(&self, payload: &[u8]) -> Result<LogicalInvocation, LogicalWireError> {
         let (binding, _) = Self::request(payload)?;
         LogicalInvocation::new(binding)
@@ -212,21 +245,105 @@ pub struct BrokerRuntime {
     identity: RequestIdentity,
     network: Option<Arc<Mutex<Box<dyn NetworkWireService>>>>,
     logical: Option<Arc<Mutex<Box<dyn LogicalWireService>>>>,
+    provider_websockets: Option<Arc<crate::workerd::provider_websocket::ProviderWebSockets>>,
     logical_bindings: Arc<HashSet<String>>,
     network_audit: Arc<Mutex<VecDeque<BrokerAuditEvent>>>,
     poisoned: Arc<AtomicBool>,
+    opaque_authority: u64,
 }
 
 impl BrokerRuntime {
+    pub(crate) fn checkpoint_next_handle(&self) -> Result<Option<u64>, BrokerHostError> {
+        let network = match &self.network {
+            Some(network) => network
+                .lock()
+                .map_err(|_| BrokerHostError::new("runtime_poisoned"))?
+                .checkpoint_next_handle()
+                .map(Some)
+                .ok_or_else(|| BrokerHostError::new("handle_reconstruction_unsupported")),
+            None => Ok(None),
+        }?;
+        let provider = self
+            .provider_websockets
+            .as_ref()
+            .map(|provider| {
+                provider
+                    .next_handle()
+                    .map_err(|_| BrokerHostError::new("provider_state_failed"))
+            })
+            .transpose()?;
+        Ok(network.into_iter().chain(provider).max())
+    }
+    pub(crate) fn restore_next_handle(&self, next: Option<u64>) -> Result<(), BrokerHostError> {
+        if let Some(provider) = &self.provider_websockets {
+            provider
+                .restore_next_handle(
+                    next.ok_or_else(|| BrokerHostError::new("checkpoint_handle_binding_mismatch"))?,
+                )
+                .map_err(|_| BrokerHostError::new("provider_state_failed"))?;
+        }
+        match (&self.network, next) {
+            (Some(network), Some(next)) => network
+                .lock()
+                .map_err(|_| BrokerHostError::new("runtime_poisoned"))?
+                .restore_next_handle(next),
+            (None, None) => Ok(()),
+            (None, Some(_)) if self.provider_websockets.is_some() => Ok(()),
+            _ => Err(BrokerHostError::new("checkpoint_handle_binding_mismatch")),
+        }
+    }
+    pub(crate) fn set_deadline(&self, deadline: Instant) -> Result<(), BrokerHostError> {
+        if let Some(provider) = &self.provider_websockets {
+            provider
+                .set_deadline(deadline)
+                .map_err(|_| BrokerHostError::new("provider_deadline_failed"))?;
+        }
+        if let Some(network) = &self.network {
+            network
+                .lock()
+                .map_err(|_| BrokerHostError::new("runtime_poisoned"))?
+                .set_deadline(deadline);
+        }
+        if let Some(logical) = &self.logical {
+            logical
+                .lock()
+                .map_err(|_| BrokerHostError::new("runtime_poisoned"))?
+                .set_deadline(deadline);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn checkpoint_quiescent(&self) -> Result<bool, BrokerHostError> {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        if let Some(provider) = &self.provider_websockets
+            && !provider
+                .is_quiescent()
+                .map_err(|_| BrokerHostError::new("provider_state_failed"))?
+        {
+            return Ok(false);
+        }
+        if let Some(network) = &self.network {
+            return network
+                .lock()
+                .map(|network| network.checkpoint_quiescent())
+                .map_err(|_| BrokerHostError::new("runtime_poisoned"));
+        }
+        Ok(true)
+    }
+
     /// Create a deny-by-default runtime with no registered capability.
     pub fn deny_all(identity: RequestIdentity) -> Self {
         Self {
             identity,
             network: None,
             logical: None,
+            provider_websockets: None,
             logical_bindings: Arc::new(HashSet::new()),
             network_audit: Arc::new(Mutex::new(VecDeque::new())),
             poisoned: Arc::new(AtomicBool::new(false)),
+            opaque_authority: opaque_authority(),
         }
     }
 
@@ -235,6 +352,7 @@ impl BrokerRuntime {
     where
         E: BrokerExecutor + Send + 'static,
     {
+        self.opaque_authority = opaque_authority();
         self.network = Some(Arc::new(Mutex::new(Box::new(NetworkAdapterService {
             adapter,
             started: Instant::now(),
@@ -259,6 +377,7 @@ impl BrokerRuntime {
             .map(|invocation| invocation.binding)
             .collect();
         self.logical = Some(Arc::new(Mutex::new(Box::new(service))));
+        self.opaque_authority = opaque_authority();
         self.logical_bindings = Arc::new(bindings);
         Ok(self)
     }
@@ -266,6 +385,18 @@ impl BrokerRuntime {
     /// Host identity captured by both registered functions.
     pub fn identity(&self) -> &RequestIdentity {
         &self.identity
+    }
+
+    pub(crate) fn opaque_authority_identity(&self) -> String {
+        let mut bindings: Vec<_> = self.logical_bindings.iter().collect();
+        bindings.sort();
+        format!(
+            "process:{};authority:{};identity:{:?};network:{};logical:{bindings:?}",
+            std::process::id(),
+            self.opaque_authority,
+            self.identity,
+            self.has_network()
+        )
     }
 
     /// Whether the raw network host function should be registered.
@@ -276,6 +407,40 @@ impl BrokerRuntime {
     /// Whether the logical-service host function should be registered.
     pub fn has_logical(&self) -> bool {
         self.logical.is_some()
+    }
+
+    pub(crate) fn with_provider_websockets(
+        mut self,
+        config: &[crate::workerd::ProviderWebSocketConfig],
+    ) -> crate::workerd::Result<Self> {
+        if !config.is_empty() {
+            self.provider_websockets = Some(Arc::new(
+                crate::workerd::provider_websocket::ProviderWebSockets::new(config)?,
+            ));
+        }
+        Ok(self)
+    }
+
+    pub(crate) fn has_provider_websockets(&self) -> bool {
+        self.provider_websockets.is_some()
+    }
+
+    pub(crate) fn dispatch_provider_websocket(
+        &self,
+        function: &str,
+        payload: &str,
+    ) -> crate::workerd::Result<String> {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(crate::workerd::Error::State(
+                "provider runtime poisoned".into(),
+            ));
+        }
+        self.provider_websockets
+            .as_ref()
+            .ok_or_else(|| {
+                crate::workerd::Error::State("provider WebSocket capability is not admitted".into())
+            })?
+            .dispatch(function, payload)
     }
 
     /// Dispatch using the runtime's captured trusted identity.
@@ -364,6 +529,13 @@ impl BrokerRuntime {
     pub fn reset_for_fresh_vm(&self) -> Result<(), BrokerHostError> {
         if self.poisoned.load(Ordering::Acquire) {
             return Err(BrokerHostError::new("runtime_poisoned"));
+        }
+        if let Some(provider) = &self.provider_websockets
+            && !provider
+                .is_quiescent()
+                .map_err(|_| BrokerHostError::new("provider_state_failed"))?
+        {
+            return Err(BrokerHostError::new("provider_handles_active"));
         }
         if let Some(network) = &self.network {
             let Ok(mut network) = network.lock() else {

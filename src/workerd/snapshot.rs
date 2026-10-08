@@ -11,16 +11,20 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 
-const SCHEMA_VERSION: u16 = 6;
-const METADATA_FILE: &str = "worker.json";
+const SCHEMA_VERSION: u16 = 9;
+pub(super) const METADATA_FILE: &str = "worker.json";
+pub(super) const MAX_METADATA_BYTES: usize = 16 * 1024;
 const CAPABILITIES: &[u8] = b"stdout:ndjson-response:v1;console:bounded;stdin:denied;\
 hostfs:named-policy:v1;workerd-init:bindings-v3;hostsock:none;\
-fetch:hcall:v1,v2;timer:hcall:v1;logical-service:hcall:v1;ingress:scheduled-v1,queue-v1";
+fetch:hcall:v1,v2;timer:hcall:v1;logical-service:hcall:v1;ingress:scheduled-v1,queue-v1;\
+bundle:immutable-chunks-v4;bundle-read:hcall:v1;ingress-stream:hcall:v1";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SnapshotBinding {
     worker_version: WorkerVersionId,
+    bundle_protocol_version: u16,
+    target_compatibility_sha256: String,
     bundle_sha256: String,
     kernel_sha256: String,
     rootfs_sha256: String,
@@ -61,6 +65,8 @@ impl SnapshotBinding {
         let kernel = kernel_for_rootfs(rootfs.as_ref())?;
         Ok(Self {
             worker_version: bundle.worker_version.clone(),
+            bundle_protocol_version: bundle.protocol_version,
+            target_compatibility_sha256: target_compatibility_sha256()?,
             bundle_sha256: bundle.sha256()?,
             kernel_sha256: sha256(kernel),
             rootfs_sha256: sha256_file(rootfs.as_ref())?,
@@ -75,6 +81,10 @@ impl SnapshotBinding {
         &self.worker_version
     }
 
+    pub(super) fn bundle_protocol_version(&self) -> u16 {
+        self.bundle_protocol_version
+    }
+
     pub fn bundle_sha256(&self) -> &str {
         &self.bundle_sha256
     }
@@ -84,6 +94,18 @@ impl SnapshotBinding {
     }
 
     fn validate(&self) -> Result<()> {
+        if !matches!(
+            self.bundle_protocol_version,
+            super::PROTOCOL_VERSION | super::PACKAGE_PROTOCOL_VERSION
+        ) {
+            return Err(Error::Snapshot("unsupported bound package protocol".into()));
+        }
+        if self.target_compatibility_sha256 != target_compatibility_sha256()? {
+            return Err(Error::Snapshot(
+                "checkpoint host OS, architecture, backend or CPU feature compatibility mismatch"
+                    .into(),
+            ));
+        }
         for digest in [
             &self.kernel_sha256,
             &self.bundle_sha256,
@@ -92,6 +114,7 @@ impl SnapshotBinding {
             &self.dependency_closure_sha256,
             &self.capability_set_sha256,
             &self.capability_policy_sha256,
+            &self.target_compatibility_sha256,
         ] {
             if digest.len() != 64
                 || !digest
@@ -113,6 +136,52 @@ impl SnapshotBinding {
     }
 }
 
+fn target_compatibility_sha256() -> Result<String> {
+    #[cfg(target_arch = "x86_64")]
+    let cpu = [
+        ("sse2", std::is_x86_feature_detected!("sse2")),
+        ("sse3", std::is_x86_feature_detected!("sse3")),
+        ("ssse3", std::is_x86_feature_detected!("ssse3")),
+        ("sse4.1", std::is_x86_feature_detected!("sse4.1")),
+        ("sse4.2", std::is_x86_feature_detected!("sse4.2")),
+        ("avx", std::is_x86_feature_detected!("avx")),
+        ("avx2", std::is_x86_feature_detected!("avx2")),
+        ("fma", std::is_x86_feature_detected!("fma")),
+        ("f16c", std::is_x86_feature_detected!("f16c")),
+        ("bmi1", std::is_x86_feature_detected!("bmi1")),
+        ("bmi2", std::is_x86_feature_detected!("bmi2")),
+        ("lzcnt", std::is_x86_feature_detected!("lzcnt")),
+        ("popcnt", std::is_x86_feature_detected!("popcnt")),
+        ("aes", std::is_x86_feature_detected!("aes")),
+        ("pclmulqdq", std::is_x86_feature_detected!("pclmulqdq")),
+        ("avx512f", std::is_x86_feature_detected!("avx512f")),
+        ("avx512bw", std::is_x86_feature_detected!("avx512bw")),
+        ("avx512dq", std::is_x86_feature_detected!("avx512dq")),
+        ("avx512vl", std::is_x86_feature_detected!("avx512vl")),
+    ]
+    .to_vec();
+    #[cfg(not(target_arch = "x86_64"))]
+    let cpu: Vec<(&str, bool)> = Vec::new();
+    let backend = if cfg!(target_os = "linux") {
+        if cfg!(feature = "mshv") {
+            "linux-kvm-mshv"
+        } else {
+            "linux-kvm"
+        }
+    } else if cfg!(target_os = "windows") {
+        "whp"
+    } else {
+        "hvf"
+    };
+    Ok(sha256(&serde_json::to_vec(&(
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        backend,
+        cpu,
+    ))?))
+}
+
 pub(super) fn kernel_for_rootfs(rootfs: &Path) -> Result<&'static [u8]> {
     let mut magic = [0; 4];
     File::open(rootfs)?.read_exact(&mut magic)?;
@@ -131,6 +200,27 @@ struct Metadata {
     host_version: String,
     manifest_digest: String,
     binding: SnapshotBinding,
+    purpose: SnapshotPurpose,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum SnapshotPurpose {
+    Template,
+    Instance {
+        identity: super::InstanceIdentity,
+        host_state: HostCheckpointState,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct HostCheckpointState {
+    pub fetch_next_id: u64,
+    pub fetch_v2_next_id: u64,
+    pub timer_next_id: u64,
+    pub requests_served: u64,
+    pub network_next_id: Option<u64>,
 }
 
 impl Metadata {
@@ -152,6 +242,29 @@ impl Metadata {
     }
 }
 
+pub(super) fn instance_requests_served(
+    bytes: &[u8],
+    expected: &SnapshotBinding,
+    identity: &super::InstanceIdentity,
+) -> Result<u64> {
+    if bytes.len() > MAX_METADATA_BYTES {
+        return Err(Error::Snapshot(
+            "snapshot metadata exceeds size limit".into(),
+        ));
+    }
+    let metadata: Metadata = serde_json::from_slice(bytes)?;
+    metadata.validate(expected)?;
+    match metadata.purpose {
+        SnapshotPurpose::Instance {
+            identity: captured,
+            host_state,
+        } if &captured == identity => Ok(host_state.requests_served),
+        _ => Err(Error::Snapshot(
+            "checkpoint counter metadata instance identity mismatch".into(),
+        )),
+    }
+}
+
 /// An initialized, version- and canonical-bundle-bound snapshot.
 ///
 /// Persisted layouts must be trusted and remain immutable for the lifetime
@@ -162,11 +275,32 @@ impl Metadata {
 pub struct VerifiedSnapshot {
     pub(super) snapshot: Arc<Snapshot>,
     binding: SnapshotBinding,
+    pub(super) purpose: SnapshotPurpose,
 }
 
 impl VerifiedSnapshot {
     pub(super) fn initialized(snapshot: Arc<Snapshot>, binding: SnapshotBinding) -> Self {
-        Self { snapshot, binding }
+        Self {
+            snapshot,
+            binding,
+            purpose: SnapshotPurpose::Template,
+        }
+    }
+
+    pub(super) fn changed_instance(
+        snapshot: Arc<Snapshot>,
+        binding: SnapshotBinding,
+        identity: super::InstanceIdentity,
+        host_state: HostCheckpointState,
+    ) -> Self {
+        Self {
+            snapshot,
+            binding,
+            purpose: SnapshotPurpose::Instance {
+                identity,
+                host_state,
+            },
+        }
     }
 
     pub fn binding(&self) -> &SnapshotBinding {
@@ -185,6 +319,7 @@ impl VerifiedSnapshot {
             host_version: env!("CARGO_PKG_VERSION").into(),
             manifest_digest: digest.to_string(),
             binding: self.binding.clone(),
+            purpose: self.purpose.clone(),
         };
         let mut file = OpenOptions::new()
             .write(true)
@@ -203,7 +338,7 @@ impl VerifiedSnapshot {
         seal_or_check(directory, false)?;
         let mut bytes = Vec::new();
         File::open(directory.join(METADATA_FILE))?
-            .take(16 * 1024 + 1)
+            .take(MAX_METADATA_BYTES as u64 + 1)
             .read_to_end(&mut bytes)?;
         if bytes.len() > 16 * 1024 {
             return Err(Error::Snapshot(
@@ -216,11 +351,12 @@ impl VerifiedSnapshot {
         Ok(Self {
             snapshot,
             binding: metadata.binding,
+            purpose: metadata.purpose,
         })
     }
 }
 
-fn seal_or_check(path: &Path, seal: bool) -> Result<()> {
+pub(super) fn seal_or_check(path: &Path, seal: bool) -> Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() {
         return Err(Error::Snapshot("snapshot layout contains a symlink".into()));
@@ -335,6 +471,7 @@ mod tests {
             host_version: env!("CARGO_PKG_VERSION").into(),
             manifest_digest: format!("sha256:{}", "1".repeat(64)),
             binding: binding.clone(),
+            purpose: SnapshotPurpose::Template,
         };
         metadata.validate(&binding).unwrap();
         for field in [

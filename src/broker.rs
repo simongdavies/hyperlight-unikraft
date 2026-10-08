@@ -13,7 +13,8 @@ use std::time::Duration;
 const MAX_IDENTITY_COMPONENT_LEN: usize = 128;
 
 /// Network protocol exposed through the host broker.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BrokerProtocol {
     /// Host-brokered TCP stream.
     Tcp,
@@ -218,6 +219,10 @@ impl DnsPolicy {
 pub struct BrokerPolicy {
     egress: Vec<EgressRule>,
     dns: DnsPolicy,
+    address_ranges: Option<Vec<ipnet::IpNet>>,
+    allow_loopback: bool,
+    allow_private: bool,
+    allow_metadata: bool,
 }
 
 impl BrokerPolicy {
@@ -226,12 +231,23 @@ impl BrokerPolicy {
         Self {
             egress: Vec::new(),
             dns: DnsPolicy::Deny,
+            address_ranges: None,
+            allow_loopback: false,
+            allow_private: true,
+            allow_metadata: false,
         }
     }
 
     /// Create a policy from explicit allow rules and a separate DNS policy.
     pub fn new(egress: Vec<EgressRule>, dns: DnsPolicy) -> Self {
-        Self { egress, dns }
+        Self {
+            egress,
+            dns,
+            address_ranges: None,
+            allow_loopback: false,
+            allow_private: true,
+            allow_metadata: false,
+        }
     }
 
     /// Authorize one endpoint request.
@@ -240,7 +256,10 @@ impl BrokerPolicy {
         protocol: BrokerProtocol,
         endpoint: &BrokerEndpoint,
     ) -> Result<(), BrokerDenied> {
-        if is_host_local(endpoint.host()) {
+        if match endpoint.host() {
+            EndpointHost::Ip(ip) => !self.address_class_allowed(*ip),
+            EndpointHost::Dns(name) => name.as_str() == "localhost" && !self.allow_loopback,
+        } {
             return Err(BrokerDenied::HostLocalAddress);
         }
         if self
@@ -258,22 +277,62 @@ impl BrokerPolicy {
     pub fn dns(&self) -> &DnsPolicy {
         &self.dns
     }
-}
 
-fn is_host_local(host: &EndpointHost) -> bool {
-    match host {
-        EndpointHost::Ip(ip) => is_host_local_ip(*ip),
-        EndpointHost::Dns(name) => name.as_str() == "localhost",
-    }
-}
-
-pub(crate) fn is_host_local_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ip) => ip.is_loopback() || ip.is_link_local() || ip.is_unspecified(),
-        IpAddr::V6(ip) => {
-            let first = ip.segments()[0];
-            ip.is_loopback() || ip.is_unspecified() || (first & 0xffc0) == 0xfe80
+    pub fn with_address_policy(
+        mut self,
+        ranges: Vec<ipnet::IpNet>,
+        loopback: bool,
+        private: bool,
+        metadata: bool,
+    ) -> Result<Self, BrokerContractError> {
+        if ranges.is_empty() {
+            return Err(BrokerContractError::EmptyAddressRanges);
         }
+        self.address_ranges = Some(ranges);
+        self.allow_loopback = loopback;
+        self.allow_private = private;
+        self.allow_metadata = metadata;
+        Ok(self)
+    }
+
+    pub(crate) fn address_allowed(&self, ip: IpAddr) -> bool {
+        let ip = match ip {
+            IpAddr::V6(ip) => ip
+                .to_ipv4_mapped()
+                .map(IpAddr::V4)
+                .unwrap_or(IpAddr::V6(ip)),
+            ip => ip,
+        };
+        self.address_class_allowed(ip)
+            && self
+                .address_ranges
+                .as_ref()
+                .is_none_or(|ranges| ranges.iter().any(|range| range.contains(&ip)))
+    }
+
+    fn address_class_allowed(&self, ip: IpAddr) -> bool {
+        let ip = match ip {
+            IpAddr::V6(ip) => ip
+                .to_ipv4_mapped()
+                .map(IpAddr::V4)
+                .unwrap_or(IpAddr::V6(ip)),
+            ip => ip,
+        };
+        if ip.is_unspecified() || (ip.is_loopback() && !self.allow_loopback) {
+            return false;
+        }
+        let (private, metadata) = match ip {
+            IpAddr::V4(ip) => (ip.is_private(), ip.is_link_local()),
+            IpAddr::V6(ip) => (
+                ip.is_unique_local(),
+                ip.is_unicast_link_local()
+                    || ip
+                        == "fd00:ec2::254"
+                            .parse::<std::net::Ipv6Addr>()
+                            .expect("constant metadata IPv6"),
+            ),
+        };
+        (!private || self.allow_private) && (!metadata || self.allow_metadata)
     }
 }
 
@@ -592,7 +651,8 @@ fn validate_payload(payload: &[u8], max_payload_bytes: u64) -> Result<(), Broker
 }
 
 /// Complete per-request budget set. Every field is host-selected and finite.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BrokerLimits {
     /// Simultaneously open connected transports.
     pub max_connections: u32,
@@ -960,6 +1020,7 @@ pub enum BrokerContractError {
     InvalidPortRange { start: u16, end: u16 },
     EmptyRulePorts,
     EmptyRuleProtocols,
+    EmptyAddressRanges,
     InvalidIdentity { field: &'static str },
     InvalidAlpn,
     InvalidWebSocketSubprotocol,

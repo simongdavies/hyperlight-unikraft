@@ -29,7 +29,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.37", features = ["bundled", "hooks", "limits"] }
+ring = "0.17"
+ipnet = { version = "2", features = ["serde"] }
+http-body-util = "0.1"
+tempfile = "3"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
@@ -41,7 +45,7 @@ tungstenite = { version = "0.28", default-features = false, features = ["handsha
 # speaks POSIX sockets one syscall per host call, and rustix is the safe,
 # cross-platform (Linux, Windows) wrapper over exactly that API.
 cap-std = "4"
-rustix = { version = "1", features = ["net", "event"] }
+rustix = { version = "1", features = ["net", "event", "fs"] }
 
 # Optional — CLI only.
 clap = { version = "4", features = ["derive"], optional = true }
@@ -77,6 +81,5 @@ hyperlight-host = "0.17"
 windows-sys = { version = "0.61", features = ["Win32_System_ProcessStatus", "Win32_System_Threading"] }
 
 [dev-dependencies]
-tempfile = "3"
 flatbuffers = "25"
 rcgen = "0.14"

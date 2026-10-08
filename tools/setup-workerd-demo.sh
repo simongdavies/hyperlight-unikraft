@@ -4,7 +4,7 @@
 set -euo pipefail
 
 HYPERLIGHT_COMMIT=c0564669d7cc7cfd42f33d28e4a0f69261f3dca6
-WORKERD_COMMIT=9c698099ccbad54609901a2107aa12a55fe415db
+WORKERD_COMMIT=27d537f458c6a74b99957e114ccbe6f16d6323b0
 RUST_VERSION=1.98.0
 JUST_VERSION=1.58.0
 BAZELISK_VERSION=1.28.1
@@ -17,6 +17,8 @@ GO_TOOLCHAIN_VERSION=1.27.1
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cache_root="${XDG_CACHE_HOME:-$HOME/.cache}/hyperlight-workerd"
+shared_bazel_cache="${WORKERD_BAZEL_SHARED_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/bazel/_bazel_$(id -un)/cache}"
+shared_repository_cache="${WORKERD_BAZEL_REPOSITORY_CACHE:-$shared_bazel_cache/repos/v1}"
 workerd_dir="${WORKERD_DIR:-$cache_root/workerd}"
 install_deps=false
 
@@ -36,6 +38,8 @@ Environment:
   RUSTUP_HOME            Rustup home (must be user-writable; default: ~/.rustup)
   CARGO_BUILD_JOBS       Cargo parallelism (default: 8)
   WORKERD_BAZEL_JOBS    Bazel parallelism (default: nproc)
+  WORKERD_BAZEL_SHARED_CACHE     Shared Bazel ac/cas content cache
+  WORKERD_BAZEL_REPOSITORY_CACHE Shared Bazel repository/download cache
 
 The script must run on x86-64 Linux with Docker and KVM available. It checks
 out the exact Hyperlight and Workerd fork revisions used by this demo, builds
@@ -194,13 +198,13 @@ trap cleanup EXIT
 step "Checking out the Workerd fork revision"
 if [[ ! -d "$workerd_dir/.git" ]]; then
     git clone \
-        --branch simongdavies-workerd-ingress-bindings \
+        --branch feature/hyperloom-executor \
         --single-branch \
         https://github.com/simongdavies/workerd.git \
         "$workerd_dir"
 fi
 git -C "$workerd_dir" fetch origin \
-    refs/heads/simongdavies-workerd-ingress-bindings
+    refs/heads/feature/hyperloom-executor
 git -C "$workerd_dir" checkout --detach "$WORKERD_COMMIT"
 git -C "$workerd_dir" submodule update --init --recursive
 [[ "$(git -C "$workerd_dir" rev-parse HEAD)" == "$WORKERD_COMMIT" ]] ||
@@ -281,7 +285,7 @@ docker build \
     "$workerd_dir/.devcontainer"
 
 builder_image_id="$(
-    docker image inspect --format '{{.Id}}' workerd-hyperlight-builder
+    docker image inspect --format '{{.Id}}' workerd-hyperlight-builde
 )"
 builder_cache_key="${builder_image_id#sha256:}"
 [[ "$builder_cache_key" =~ ^[0-9a-f]{64}$ ]] ||
@@ -294,43 +298,39 @@ executor_stamp="$executor_dir/build.stamp"
 expected_executor_stamp="$(
     printf 'workerd=%s\nbuilder=%s\n' "$WORKERD_COMMIT" "$builder_image_id"
 )"
-stamped_workerd=""
 mkdir -p \
     "$builder_cache_root" \
-    "$cache_root/bazel/repository-cache" \
+    "$shared_bazel_cache" \
+    "$shared_repository_cache" \
     "$executor_dir"
 if [[ ! -x "$executor_path" ]] && [[ -x "$packaged_executor_path" ]]; then
     step "Restoring the packaged Workerd executor"
     install -m 0755 "$packaged_executor_path" "$executor_path"
 fi
 if [[ -x "$executor_path" ]] && [[ ! -e "$executor_stamp" ]]; then
-    step "Validating the existing Workerd executor"
-    "$executor_path" --self-test
-    printf '%s\n' "$expected_executor_stamp" >"$executor_stamp.tmp"
-    mv "$executor_stamp.tmp" "$executor_stamp"
-fi
-if [[ -f "$executor_stamp" ]]; then
-    stamped_workerd="$(
-        sed -n 's/^workerd=//p' "$executor_stamp" |
-            head -n 1
-    )"
+    step "Rebuilding the unstamped executor; self-tests alone do not establish source/build provenance"
 fi
 if [[ -x "$executor_path" ]] &&
-    [[ "$stamped_workerd" == "$WORKERD_COMMIT" ]]; then
+    [[ -f "$executor_stamp" ]] &&
+    [[ "$(cat "$executor_stamp")" == "$expected_executor_stamp" ]]; then
     step "Reusing the validated Workerd executor"
 else
     step "Building the Workerd executor"
     jobs="${WORKERD_BAZEL_JOBS:-$(nproc)}"
     docker run --rm \
+        --user "$(id -u):$(id -g)" \
+        --env HOME=/tmp/workerd-builder-home \
         --env "WORKERD_BAZEL_JOBS=$jobs" \
         --mount "type=bind,src=$workerd_dir,dst=/workspace" \
-        --mount "type=bind,src=$builder_cache_root,dst=/root/.cache/bazel/builder" \
-        --mount "type=bind,src=$cache_root/bazel/repository-cache,dst=/root/.cache/bazel/repository-cache" \
+        --mount "type=bind,src=$builder_cache_root,dst=/cache/builder" \
+        --mount "type=bind,src=$shared_bazel_cache,dst=/cache/shared" \
+        --mount "type=bind,src=$shared_repository_cache,dst=/cache/repository" \
         --mount "type=bind,src=$executor_dir,dst=/output" \
         --workdir /workspace \
         workerd-hyperlight-builder \
         bash -c '
             set -euo pipefail
+            mkdir -p "$HOME"
             export CC=/usr/lib/llvm-22/bin/clang
             export CXX=/usr/lib/llvm-22/bin/clang++
             clang_major="$("$CXX" --version |
@@ -351,15 +351,15 @@ else
                 -L/opt/libcxx22 -Wl,-rpath,/opt/libcxx22 \
                 /tmp/libcxx-check.cc -o /tmp/libcxx-check
             LD_LIBRARY_PATH=/opt/libcxx22 /tmp/libcxx-check
-            executor=bazel-bin/src/workerd/server/workerd-sandbox-executor
-            bazel --output_base=/root/.cache/bazel/builder/output \
+            executor=bazel-bin/src/workerd/server/workerd-sandbox-executo
+            bazel --output_base=/cache/builder/output \
                 build //src/workerd/server:workerd-sandbox-executor \
                 --config=opt \
                 --strip=always \
                 --//:io_backend=cxx \
                 --jobs="$WORKERD_BAZEL_JOBS" \
-                --disk_cache=/root/.cache/bazel/builder/action-cache \
-                --repository_cache=/root/.cache/bazel/repository-cache \
+                --disk_cache=/cache/shared \
+                --repository_cache=/cache/repository \
                 --repo_env=CC="$CC" \
                 --repo_env=CXX="$CXX" \
                 --host_linkopt=-L/opt/libcxx22 \
@@ -368,7 +368,7 @@ else
                 --host_action_env=LD_LIBRARY_PATH=/opt/libcxx22
             "$executor" --self-test
             llvm-strip "$executor"
-            install -m 0755 "$executor" /output/workerd-sandbox-executor
+            install -m 0755 "$executor" /output/workerd-sandbox-executo
         '
     printf '%s\n' "$expected_executor_stamp" >"$executor_stamp.tmp"
     mv "$executor_stamp.tmp" "$executor_stamp"
@@ -379,7 +379,7 @@ cd "$root"
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-8}"
 just build-workerd-kernel
 bash examples/workerd-executor/build-rootfs.sh \
-    build-elfloader/workerd-executor/workerd-sandbox-executor
+    build-elfloader/workerd-executor/workerd-sandbox-executo
 
 step "Building the Hyperlight demo"
 cargo +"$RUST_VERSION" build --release --locked --example workerd-demo
@@ -411,7 +411,7 @@ git diff --exit-code -- experiments/workerd-component-model
 
 step "Checking the packaged executor"
 build-elfloader/workerd-executor/executor --self-test
-file build-elfloader/workerd-executor/executor
+file build-elfloader/workerd-executor/executo
 if readelf -l build-elfloader/workerd-executor/executor | grep -q INTERP; then
     fail "the packaged executor is not static"
 fi
@@ -424,7 +424,7 @@ Demo binary:
   $root/target/release/examples/workerd-demo
 
 Packaged executor:
-  $root/build-elfloader/workerd-executor/executor
+  $root/build-elfloader/workerd-executor/executo
 
 Next:
   docs/azure-workerd-hyperlight-runbook.md

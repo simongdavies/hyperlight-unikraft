@@ -76,6 +76,8 @@ fn disposable_app(app_id: &str, hostname: &str, bundle_path: PathBuf) -> AppConf
         }),
         connection_affinity: ConnectionAffinity::None,
         snapshot_dir: None,
+        instance_home: None,
+        streaming: false,
     }
 }
 
@@ -113,6 +115,8 @@ fn resident_app(app_id: &str, hostname: &str, bundle_path: PathBuf) -> AppConfig
         }),
         connection_affinity: ConnectionAffinity::None,
         snapshot_dir: None,
+        instance_home: None,
+        streaming: false,
     }
 }
 
@@ -159,6 +163,19 @@ fn routes_mixed_resident_and_disposable_apps_in_isolation() {
     let registry = AppRegistry::from_host_config(config).unwrap();
     assert_eq!(registry.len(), 2);
     assert!(registry.route(Some("unknown.test"), "/").is_none());
+    for app in ["hello", "streams"] {
+        let capabilities = &registry.app(app).unwrap().identity().capabilities;
+        assert!(
+            capabilities
+                .iter()
+                .any(|capability| capability == "tracked-work-drain")
+        );
+        assert!(
+            !capabilities
+                .iter()
+                .any(|capability| capability == "secure-entropy-v1")
+        );
+    }
 
     let hello = submit_and_wait(&registry, "hello.test", "/", "hello-1").unwrap();
     assert_eq!(hello.status, 200);

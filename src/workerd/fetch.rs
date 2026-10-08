@@ -19,7 +19,8 @@ use tokio_stream::wrappers::ReceiverStream;
 
 pub const FETCH_PROTOCOL_VERSION: u32 = 1;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct FetchLimits {
     pub connect_timeout: Duration,
     pub total_timeout: Duration,
@@ -54,6 +55,11 @@ pub struct FetchPolicy {
     schemes: HashSet<String>,
     ports: HashSet<u16>,
     address_opt_ins: AddressClassOptIns,
+    methods: Option<HashSet<String>>,
+    ip_ranges: Vec<ipnet::IpNet>,
+    paths: Option<HashSet<String>>,
+    query_parameters: Option<std::collections::BTreeMap<String, Vec<String>>>,
+    body_policy: Option<super::FetchBodyPolicy>,
 }
 
 impl FetchPolicy {
@@ -65,6 +71,11 @@ impl FetchPolicy {
             schemes: HashSet::new(),
             ports: HashSet::new(),
             address_opt_ins: AddressClassOptIns::default(),
+            methods: Some(HashSet::new()),
+            ip_ranges: Vec::new(),
+            paths: Some(HashSet::new()),
+            query_parameters: Some(Default::default()),
+            body_policy: None,
         }
     }
 
@@ -78,12 +89,74 @@ impl FetchPolicy {
             schemes: schemes.into_iter().map(Into::into).collect(),
             ports: ports.into_iter().collect(),
             address_opt_ins: AddressClassOptIns::default(),
+            methods: None,
+            ip_ranges: Vec::new(),
+            paths: None,
+            query_parameters: None,
+            body_policy: None,
         }
     }
 
     pub fn allow_loopback(mut self, allow: bool) -> Self {
         self.address_opt_ins.loopback = allow;
         self
+    }
+
+    pub fn with_methods(mut self, methods: impl IntoIterator<Item = String>) -> Result<Self> {
+        let methods = methods.into_iter().collect::<HashSet<_>>();
+        for method in &methods {
+            let parsed = Method::from_bytes(method.as_bytes())
+                .map_err(|_| Error::State("invalid allowed HTTP method".into()))?;
+            if parsed == Method::CONNECT
+                || parsed == Method::TRACE
+                || method != &method.to_ascii_uppercase()
+            {
+                return Err(Error::State(
+                    "allowed HTTP methods must be uppercase and cannot be CONNECT/TRACE".into(),
+                ));
+            }
+        }
+        self.methods = Some(methods);
+        Ok(self)
+    }
+
+    pub fn with_ip_ranges(mut self, ranges: Vec<ipnet::IpNet>) -> Self {
+        self.ip_ranges = ranges;
+        self
+    }
+
+    pub fn with_resource_scope(
+        mut self,
+        paths: Vec<String>,
+        query: std::collections::BTreeMap<String, Vec<String>>,
+        body_policy: Option<super::FetchBodyPolicy>,
+    ) -> Result<Self> {
+        if paths.iter().any(|path| {
+            !path.starts_with('/')
+                || path.contains(['%', '\\', '?', '#'])
+                || path.contains("//")
+                || path.split('/').any(|segment| matches!(segment, "." | ".."))
+                || path.bytes().any(|byte| byte.is_ascii_control())
+        }) {
+            return Err(Error::State(
+                "fetch resource paths must be exact normalized absolute URL paths".into(),
+            ));
+        }
+        if query
+            .iter()
+            .any(|(name, values)| name.is_empty() || values.is_empty() || values.len() > 32)
+        {
+            return Err(Error::State(
+                "query parameter grants require nonempty names and bounded values".into(),
+            ));
+        }
+        if let Some(body_policy) = &body_policy {
+            body_policy.validate()?;
+        }
+        self.paths = Some(paths.into_iter().collect());
+        self.query_parameters = Some(query);
+        self.body_policy = body_policy;
+        Ok(self)
     }
 
     pub fn allow_private(mut self, allow: bool) -> Self {
@@ -96,7 +169,10 @@ impl FetchPolicy {
         self
     }
 
-    fn authorize_url(&self, url: &Url) -> std::result::Result<(String, u16), FetchFailure> {
+    pub(super) fn authorize_url(
+        &self,
+        url: &Url,
+    ) -> std::result::Result<(String, u16), FetchFailure> {
         if !self.schemes.contains(url.scheme()) {
             return Err(FetchFailure::policy("URL scheme is not allowed"));
         }
@@ -105,6 +181,27 @@ impl FetchPolicy {
         }
         if url.fragment().is_some() {
             return Err(FetchFailure::invalid("URL fragments are not allowed"));
+        }
+        if self
+            .paths
+            .as_ref()
+            .is_some_and(|paths| !paths.contains(url.path()))
+        {
+            return Err(FetchFailure::policy("URL resource path is not allowed"));
+        }
+        if let Some(allowed) = &self.query_parameters {
+            let mut seen = HashSet::new();
+            for (name, value) in url.query_pairs() {
+                if !seen.insert(name.to_string())
+                    || !allowed
+                        .get(name.as_ref())
+                        .is_some_and(|values| values.iter().any(|allowed| allowed == &value))
+                {
+                    return Err(FetchFailure::policy(
+                        "URL query parameter is not admitted for this resource",
+                    ));
+                }
+            }
         }
         let host = url
             .host_str()
@@ -122,7 +219,7 @@ impl FetchPolicy {
         Ok((host, port))
     }
 
-    fn authorize_addresses(
+    pub(super) fn authorize_addresses(
         &self,
         addresses: &[SocketAddr],
     ) -> std::result::Result<(), FetchFailure> {
@@ -130,15 +227,133 @@ impl FetchPolicy {
             return Err(FetchFailure::dns("host resolved to no addresses"));
         }
         if addresses.iter().any(|address| {
-            !self
-                .network
-                .allows_with(address, false, self.address_opt_ins)
+            canonical_ip(address.ip()).is_unspecified()
+                || !self
+                    .network
+                    .allows_with(address, false, self.address_opt_ins)
+                || (!self.ip_ranges.is_empty()
+                    && !self
+                        .ip_ranges
+                        .iter()
+                        .any(|range| range.contains(&canonical_ip(address.ip()))))
         }) {
             return Err(FetchFailure::policy(
                 "one or more resolved addresses are not allowed",
             ));
         }
         Ok(())
+    }
+}
+
+/// An operator-admitted host-only secret reference, scoped to one app's
+/// fetch broker and one exact destination. Values are read per request so
+/// rotation is observed after resident resume without guest secret state.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FetchCredential {
+    pub reference: String,
+    pub value_file: std::path::PathBuf,
+    pub header: String,
+    pub scheme: String,
+    pub host: String,
+    pub port: u16,
+}
+
+impl std::fmt::Debug for FetchCredential {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FetchCredential")
+            .field("reference", &self.reference)
+            .field("header", &self.header)
+            .field("scheme", &self.scheme)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .finish_non_exhaustive()
+    }
+}
+
+impl FetchCredential {
+    pub(super) fn validate(&self) -> Result<()> {
+        if self.reference.is_empty()
+            || self.reference.len() > 128
+            || !self
+                .reference
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+            || self.port == 0
+            || self.host.is_empty()
+            || self.host != self.host.to_ascii_lowercase()
+            || !self.value_file.is_absolute()
+            || !matches!(self.scheme.as_str(), "http" | "https")
+            || (self.scheme == "http"
+                && !self.host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback()))
+        {
+            return Err(Error::State("invalid destination-bound credential reference; plaintext HTTP is permitted only to explicit loopback".into()));
+        }
+        let header = HeaderName::from_str(&self.header)
+            .map_err(|_| Error::State("invalid credential injection header".into()))?;
+        if matches!(
+            header.as_str(),
+            "host"
+                | "connection"
+                | "content-length"
+                | "transfer-encoding"
+                | "upgrade"
+                | "proxy-authorization"
+                | "cookie"
+                | "set-cookie"
+        ) {
+            return Err(Error::State(
+                "credential injection into routing/framing/cookie headers is forbidden".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn inject(
+        &self,
+        url: &Url,
+        headers: &mut HeaderMap,
+    ) -> std::result::Result<(), FetchFailure> {
+        if url.scheme() != self.scheme
+            || url.host_str() != Some(&self.host)
+            || url.port_or_known_default() != Some(self.port)
+        {
+            return Err(FetchFailure::policy(
+                "credential reference is not authorized for this destination",
+            ));
+        }
+        let header = HeaderName::from_str(&self.header)
+            .map_err(|_| FetchFailure::policy("invalid credential header policy"))?;
+        if headers.contains_key(&header)
+            || headers.contains_key(reqwest::header::AUTHORIZATION)
+            || headers.contains_key(reqwest::header::PROXY_AUTHORIZATION)
+            || headers.contains_key(reqwest::header::COOKIE)
+            || headers.contains_key("api-key")
+            || headers.contains_key("x-api-key")
+        {
+            return Err(FetchFailure::policy(
+                "guest supplied conflicting authentication headers",
+            ));
+        }
+        let mut bytes = super::secret::read_private_secret(&self.value_file)
+            .map_err(|_| FetchFailure::credential())?;
+        let value = HeaderValue::from_bytes(&bytes).map_err(|_| FetchFailure::credential());
+        bytes.fill(0);
+        let mut value = value?;
+        value.set_sensitive(true);
+        headers.insert(header, value);
+        Ok(())
+    }
+}
+
+fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(ip) => ip
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(ip)),
+        ip => ip,
     }
 }
 
@@ -167,6 +382,7 @@ struct FetchBrokerInner {
     active: AtomicUsize,
     dns_active: AtomicUsize,
     resolver: Arc<dyn Resolver>,
+    credential: Option<FetchCredential>,
 }
 
 trait Resolver: Send + Sync {
@@ -191,6 +407,52 @@ impl std::fmt::Debug for FetchBroker {
 }
 
 impl FetchBroker {
+    pub(super) fn policy_identity(&self) -> String {
+        let config = &self.inner.config;
+        let mut schemes: Vec<_> = config.policy.schemes.iter().collect();
+        schemes.sort();
+        let mut ports: Vec<_> = config.policy.ports.iter().collect();
+        ports.sort();
+        let mut methods: Option<Vec<_>> = config
+            .policy
+            .methods
+            .as_ref()
+            .map(|methods| methods.iter().collect());
+        if let Some(methods) = &mut methods {
+            methods.sort();
+        }
+        let mut ranges: Vec<_> = config
+            .policy
+            .ip_ranges
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        ranges.sort();
+        let mut paths: Option<Vec<_>> = config
+            .policy
+            .paths
+            .as_ref()
+            .map(|paths| paths.iter().collect());
+        if let Some(paths) = &mut paths {
+            paths.sort();
+        }
+        serde_json::json!({
+            "network": config.policy.network.authority_json(),
+            "schemes": schemes,
+            "ports": ports,
+            "methods": methods,
+            "ip_ranges": ranges,
+            "credential_reference": self.inner.credential,
+            "paths":paths,"query_parameters":config.policy.query_parameters,"body_policy":config.policy.body_policy,
+            "address_classes": {
+                "loopback": config.policy.address_opt_ins.loopback,
+                "private": config.policy.address_opt_ins.private,
+                "metadata": config.policy.address_opt_ins.metadata,
+            },
+            "limits": config.limits,
+        }).to_string()
+    }
+
     pub fn new(config: FetchBrokerConfig) -> Result<Self> {
         if config.limits.max_concurrent_requests == 0
             || config.limits.connect_timeout.is_zero()
@@ -212,12 +474,23 @@ impl FetchBroker {
                 active: AtomicUsize::new(0),
                 dns_active: AtomicUsize::new(0),
                 resolver: Arc::new(SystemResolver),
+                credential: None,
             }),
         })
     }
 
     pub fn denied() -> Self {
         Self::new(FetchBrokerConfig::default()).expect("default fetch broker is valid")
+    }
+
+    pub fn with_credential(mut self, credential: FetchCredential) -> Result<Self> {
+        credential.validate()?;
+        Arc::get_mut(&mut self.inner)
+            .ok_or_else(|| {
+                Error::State("fetch credential must be configured before sharing broker".into())
+            })?
+            .credential = Some(credential);
+        Ok(self)
     }
 
     pub(crate) fn session(&self, deadline: Instant) -> FetchSession {
@@ -352,7 +625,7 @@ impl FetchBroker {
     async fn send_request(
         &self,
         request: &PreparedFetchRequest,
-        body: Body,
+        mut body: Body,
         request_deadline: Instant,
     ) -> std::result::Result<(Response, Instant), FetchFailure> {
         let broker_deadline = Instant::now()
@@ -368,6 +641,16 @@ impl FetchBroker {
         if method == Method::CONNECT || method == Method::TRACE {
             return Err(FetchFailure::invalid("HTTP method is not supported"));
         }
+        if self
+            .inner
+            .config
+            .policy
+            .methods
+            .as_ref()
+            .is_some_and(|methods| !methods.contains(method.as_str()))
+        {
+            return Err(FetchFailure::policy("HTTP method is not allowed"));
+        }
         let mut headers = request.header_map()?;
         if let Some(body_length) = request.body_length {
             headers.insert(
@@ -377,11 +660,26 @@ impl FetchBroker {
             );
         }
         let (host, port) = self.inner.config.policy.authorize_url(&url)?;
+        if let Some(policy) = &self.inner.config.policy.body_policy {
+            use http_body_util::BodyExt;
+            let remaining = broker_deadline.saturating_duration_since(Instant::now());
+            let limited =
+                http_body_util::Limited::new(body, self.inner.config.limits.max_request_bytes);
+            let bytes = tokio::time::timeout(remaining, limited.collect())
+                .await
+                .map_err(|_| FetchFailure::timeout())?
+                .map_err(|_| FetchFailure::too_large("provider request body exceeds limit"))?
+                .to_bytes();
+            policy.validate_request(&bytes).map_err(|_| {
+                FetchFailure::policy("provider request fields or limits are not admitted")
+            })?;
+            body = Body::from(bytes);
+        }
         let addresses = if let Ok(ip) = host.parse::<IpAddr>() {
             vec![SocketAddr::new(ip, port)]
         } else {
             let resolver = self.inner.resolver.clone();
-            let _dns_admission = DnsAdmission::acquire(self.inner.clone())?;
+            let dns_admission = DnsAdmission::acquire(self.inner.clone())?;
             let lookup_host = host.clone();
             let remaining = broker_deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -389,7 +687,10 @@ impl FetchBroker {
             }
             tokio::time::timeout(
                 remaining,
-                tokio::task::spawn_blocking(move || resolver.resolve(&lookup_host, port)),
+                tokio::task::spawn_blocking(move || {
+                    let _dns_admission = dns_admission;
+                    resolver.resolve(&lookup_host, port)
+                }),
             )
             .await
             .map_err(|_| FetchFailure::timeout())?
@@ -397,6 +698,27 @@ impl FetchBroker {
             .map_err(|error| FetchFailure::dns(format!("DNS lookup failed: {error}")))?
         };
         self.inner.config.policy.authorize_addresses(&addresses)?;
+        if let Some(credential) = &self.inner.credential {
+            let credential = credential.clone();
+            let destination = url.clone();
+            let admission = DnsAdmission::acquire(self.inner.clone())?;
+            let remaining = broker_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(FetchFailure::timeout());
+            }
+            headers = tokio::time::timeout(
+                remaining,
+                tokio::task::spawn_blocking(move || {
+                    let _admission = admission;
+                    credential.inject(&destination, &mut headers)?;
+                    Ok::<_, FetchFailure>(headers)
+                }),
+            )
+            .await
+            .map_err(|_| FetchFailure::timeout())?
+            .map_err(|_| FetchFailure::credential())??;
+            check_deadline(broker_deadline)?;
+        }
         let remaining = broker_deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(FetchFailure::timeout());
@@ -417,6 +739,17 @@ impl FetchBroker {
             .await
             .map_err(map_reqwest_error)?;
         check_deadline(broker_deadline)?;
+        let peer = response
+            .remote_addr()
+            .ok_or_else(|| FetchFailure::policy("connected peer identity unavailable"))?;
+        if !addresses.iter().any(|address| {
+            canonical_ip(address.ip()) == canonical_ip(peer.ip()) && address.port() == peer.port()
+        }) {
+            return Err(FetchFailure::policy(
+                "connected peer differs from authorized resolution",
+            ));
+        }
+        self.inner.config.policy.authorize_addresses(&[peer])?;
         Ok((response, broker_deadline))
     }
 
@@ -731,6 +1064,37 @@ impl PreparedFetchRequest {
 }
 
 impl FetchSession {
+    pub(super) fn sequence_state(&self) -> (u64, u64) {
+        (
+            self.inner.next_id.load(Ordering::Acquire),
+            self.inner.v2_next_id.load(Ordering::Acquire),
+        )
+    }
+    pub(super) fn restore_sequence(&self, next: u64, v2_next: u64) -> Result<()> {
+        if next == 0 || v2_next == 0 {
+            return Err(Error::Snapshot(
+                "invalid checkpoint fetch handle watermark".into(),
+            ));
+        }
+        self.inner.next_id.store(next, Ordering::Release);
+        self.inner.v2_next_id.store(v2_next, Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn is_quiescent(&self) -> Result<bool> {
+        let operations = self
+            .inner
+            .operations
+            .lock()
+            .map_err(|_| Error::State("fetch operations poisoned".into()))?;
+        let v2 = self
+            .inner
+            .v2_operations
+            .lock()
+            .map_err(|_| Error::State("fetch v2 operations poisoned".into()))?;
+        Ok(operations.is_empty() && v2.is_empty())
+    }
+
     pub(crate) fn set_deadline(&self, deadline: Instant) {
         *self
             .inner
@@ -1600,6 +1964,7 @@ fn fetch_runtime() -> &'static Runtime {
     RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
+            .max_blocking_threads(32)
             .enable_all()
             .thread_name("workerd-fetch")
             .build()
@@ -1762,12 +2127,16 @@ pub enum FetchErrorCode {
 }
 
 #[derive(Clone)]
-struct FetchFailure {
+pub(super) struct FetchFailure {
     code: FetchErrorCode,
     message: String,
 }
 
 impl FetchFailure {
+    fn credential() -> Self {
+        Self::policy("host credential reference unavailable or invalid")
+    }
+
     fn new(code: FetchErrorCode, message: impl Into<String>) -> Self {
         Self {
             code,
@@ -2722,5 +3091,203 @@ mod tests {
                 .unwrap(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn destination_credentials_rotate_host_only_and_denials_send_zero_requests() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let receiver_seen = seen.clone();
+        let receiver_stop = stopped.clone();
+        let receiver = thread::spawn(move || {
+            while !receiver_stop.load(Ordering::Acquire) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(error) => panic!("receiver accept failed:{error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request = String::new();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    assert!(
+                        !line.is_empty(),
+                        "synthetic receiver got incomplete request"
+                    );
+                    request.push_str(&line);
+                }
+                receiver_seen.lock().unwrap().push(request);
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .unwrap();
+            }
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let value_file = tmp.path().join("credential");
+        std::fs::write(&value_file, b"Bearer synthetic-one").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&value_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let credential = FetchCredential {
+            reference: "synthetic".into(),
+            value_file: value_file.clone(),
+            header: "authorization".into(),
+            scheme: "http".into(),
+            host: "127.0.0.1".into(),
+            port,
+        };
+        let allowed_policy = FetchPolicy::new(
+            NetworkPolicy::AllowList(crate::AllowList::from_hosts(&["127.0.0.1"]).unwrap()),
+            ["http"],
+            [port],
+        )
+        .allow_loopback(true)
+        .with_methods(["GET".into()])
+        .unwrap()
+        .with_ip_ranges(vec!["127.0.0.0/8".parse().unwrap()]);
+        let broker = FetchBroker::new(FetchBrokerConfig {
+            policy: allowed_policy.clone(),
+            limits: Default::default(),
+        })
+        .unwrap()
+        .with_credential(credential.clone())
+        .unwrap();
+        let session = broker.session(Instant::now() + Duration::from_secs(10));
+        let mut get = request(port, "GET", "/", &[]);
+        get.url = format!("http://127.0.0.1:{port}/");
+        assert!(run(&session, get.clone(), &[])["error"].is_null());
+        std::fs::write(&value_file, b"Bearer synthetic-two").unwrap();
+        assert!(run(&session, get.clone(), &[])["error"].is_null());
+        let mut denied = get.clone();
+        denied.method = "POST".into();
+        assert_eq!(run(&session, denied, &[])["error"]["code"], "policy_denied");
+        let wrong_range = FetchBroker::new(FetchBrokerConfig {
+            policy: allowed_policy
+                .clone()
+                .with_ip_ranges(vec!["192.0.2.0/24".parse().unwrap()]),
+            limits: Default::default(),
+        })
+        .unwrap()
+        .with_credential(credential.clone())
+        .unwrap();
+        assert_eq!(
+            run(
+                &wrong_range.session(Instant::now() + Duration::from_secs(5)),
+                get.clone(),
+                &[]
+            )["error"]["code"],
+            "policy_denied"
+        );
+        let mut wrong_destination = get.clone();
+        wrong_destination.url = format!("http://localhost:{port}/");
+        assert_eq!(
+            run(&session, wrong_destination, &[])["error"]["code"],
+            "policy_denied"
+        );
+        std::fs::remove_file(&value_file).unwrap();
+        let missing = run(&session, get, &[]);
+        assert_eq!(missing["error"]["code"], "policy_denied");
+        assert!(!missing.to_string().contains("synthetic-one"));
+        stopped.store(true, Ordering::Release);
+        receiver.join().unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen.len(),
+            2,
+            "denied address/method/reference must send no credential-bearing request"
+        );
+        assert!(seen[0].contains("Bearer synthetic-one"));
+        assert!(seen[1].contains("Bearer synthetic-two"));
+    }
+
+    #[test]
+    fn credential_injection_rejects_conflicts_before_reading_secret() {
+        let credential = FetchCredential {
+            reference: "synthetic".into(),
+            value_file: std::path::PathBuf::from("/absent"),
+            header: "api-key".into(),
+            scheme: "https".into(),
+            host: "api.example.test".into(),
+            port: 443,
+        };
+        for name in [
+            "authorization",
+            "proxy-authorization",
+            "cookie",
+            "api-key",
+            "x-api-key",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_static("guest-spoof"),
+            );
+            let error = credential
+                .inject(
+                    &Url::parse("https://api.example.test/").unwrap(),
+                    &mut headers,
+                )
+                .unwrap_err();
+            assert!(error.message.contains("conflicting"), "{name}");
+        }
+    }
+
+    #[test]
+    fn resource_path_query_and_http_authority_are_checked_before_transmission() {
+        let policy = FetchPolicy::new(NetworkPolicy::AllowAll, ["https"], [443])
+            .with_resource_scope(
+                vec!["/openai/deployments/admitted/chat/completions".into()],
+                std::collections::BTreeMap::from([(
+                    "api-version".into(),
+                    vec!["2025-01-01".into()],
+                )]),
+                None,
+            )
+            .unwrap();
+        assert!(policy.authorize_url(&Url::parse("https://api.example.test/openai/deployments/admitted/chat/completions?api-version=2025-01-01").unwrap()).is_ok());
+        for url in [
+            "https://api.example.test/openai/deployments/other/chat/completions?api-version=2025-01-01",
+            "https://api.example.test/openai/deployments/admitted%2fother/chat/completions?api-version=2025-01-01",
+            "https://api.example.test/openai/deployments/admitted/chat/completions?api-version=2025-01-01&api-version=unsafe",
+            "https://api.example.test/openai/deployments/admitted/chat/completions?other-resource=unadmitted",
+        ] {
+            assert!(
+                policy.authorize_url(&Url::parse(url).unwrap()).is_err(),
+                "{url}"
+            );
+        }
+        let request = PreparedFetchRequest {
+            protocol_version: 1,
+            request_id: "host-spoof".into(),
+            method: "GET".into(),
+            url: "https://api.example.test/".into(),
+            body_length: Some(0),
+            headers: vec![FetchHeader {
+                name: "Host".into(),
+                value: "other-virtual-host.test".into(),
+            }],
+        };
+        assert!(
+            request.header_map().is_err(),
+            "HTTPHost must not override approved URL/SNI authority"
+        );
     }
 }

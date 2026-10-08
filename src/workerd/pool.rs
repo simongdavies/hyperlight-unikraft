@@ -2,7 +2,8 @@
 // Copyright 2026 The Hyperlight Authors.
 
 use super::{
-    Error, ExecutionProfile, RequestEnvelope, Result, WorkerVersionId, WorkerVersionSandbox,
+    Error, ExecutionProfile, InvocationCancellation, InvocationRequest, InvocationResponse,
+    RequestEnvelope, Result, WorkerVersionId, WorkerVersionSandbox,
     sandbox::RestoredWorkerVersionSandbox,
 };
 use std::collections::VecDeque;
@@ -12,20 +13,21 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-type Completion = Box<dyn FnOnce(RequestExecution) + Send + 'static>;
+type Completion = Box<dyn FnOnce(InvocationExecution) + Send + 'static>;
 
 struct RequestJob {
-    request: RequestEnvelope,
+    request: super::ingress::PoolInvocation,
     timeout: Duration,
     completion: Completion,
     admitted_at: Instant,
     ready_wait_started_at: Option<Instant>,
     diagnostic_wave_member: bool,
+    cancellation: InvocationCancellation,
 }
 
 struct CompletedJob {
     completion: Completion,
-    execution: RequestExecution,
+    execution: InvocationExecution,
 }
 
 struct PrewarmExecutionTiming {
@@ -38,7 +40,7 @@ struct PrewarmExecutionTiming {
 }
 
 enum OwnerMessage {
-    Execute(RequestJob),
+    Execute(Box<RequestJob>),
     Shutdown,
 }
 
@@ -89,6 +91,24 @@ pub struct RequestExecution {
     pub result: Result<super::ResponseEnvelope>,
     pub profile: ExecutionProfile,
     pub submit_error: Option<PoolSubmitError>,
+}
+
+pub struct InvocationExecution {
+    pub request_id: String,
+    pub result: Result<InvocationResponse>,
+    pub profile: ExecutionProfile,
+    pub submit_error: Option<PoolSubmitError>,
+}
+
+impl InvocationExecution {
+    pub(super) fn into_fetch(self) -> RequestExecution {
+        RequestExecution {
+            request_id: self.request_id,
+            result: self.result.and_then(InvocationResponse::into_fetch),
+            profile: self.profile,
+            submit_error: self.submit_error,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -943,7 +963,64 @@ impl WorkerRequestPool {
         timeout: Duration,
         completion: impl FnOnce(RequestExecution) + Send + 'static,
     ) -> std::result::Result<(), PoolSubmitError> {
-        let request_id = request.request_id.clone();
+        self.try_submit_invocation(request.into(), timeout, move |execution| {
+            completion(execution.into_fetch())
+        })
+    }
+
+    pub fn try_submit_invocation(
+        &self,
+        request: InvocationRequest,
+        timeout: Duration,
+        completion: impl FnOnce(InvocationExecution) + Send + 'static,
+    ) -> std::result::Result<(), PoolSubmitError> {
+        self.try_submit_cancellable(
+            request,
+            timeout,
+            InvocationCancellation::default(),
+            completion,
+        )
+    }
+
+    pub fn try_submit_cancellable(
+        &self,
+        request: InvocationRequest,
+        timeout: Duration,
+        cancellation: InvocationCancellation,
+        completion: impl FnOnce(InvocationExecution) + Send + 'static,
+    ) -> std::result::Result<(), PoolSubmitError> {
+        self.try_submit_job(request.into(), timeout, cancellation, completion)
+    }
+
+    pub fn try_submit_stream(
+        &self,
+        request: RequestEnvelope,
+        websocket: bool,
+        ingress: super::GuestIngress,
+        timeout: Duration,
+        completion: impl FnOnce(InvocationExecution) + Send + 'static,
+    ) -> std::result::Result<(), PoolSubmitError> {
+        let cancellation = ingress.cancellation();
+        self.try_submit_job(
+            super::ingress::PoolInvocation::Stream {
+                request,
+                websocket,
+                ingress,
+            },
+            timeout,
+            cancellation,
+            completion,
+        )
+    }
+
+    fn try_submit_job(
+        &self,
+        request: super::ingress::PoolInvocation,
+        timeout: Duration,
+        cancellation: InvocationCancellation,
+        completion: impl FnOnce(InvocationExecution) + Send + 'static,
+    ) -> std::result::Result<(), PoolSubmitError> {
+        let request_id = request.request_id().to_string();
         if self
             .admitted
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
@@ -952,7 +1029,7 @@ impl WorkerRequestPool {
             .is_err()
         {
             let error = self.terminal_error().unwrap_or(PoolSubmitError::Full);
-            completion(RequestExecution {
+            completion(InvocationExecution {
                 request_id,
                 result: Err(Error::State(error.to_string())),
                 profile: ExecutionProfile::default(),
@@ -967,6 +1044,7 @@ impl WorkerRequestPool {
             admitted_at: Instant::now(),
             ready_wait_started_at: None,
             diagnostic_wave_member: false,
+            cancellation,
         };
         let pushed = match &self.dispatch {
             PoolDispatch::OnDemand(queue) => queue.try_push(job),
@@ -976,7 +1054,7 @@ impl WorkerRequestPool {
             Ok(()) => Ok(()),
             Err((error, job)) => {
                 self.admitted.fetch_sub(1, Ordering::AcqRel);
-                (job.completion)(RequestExecution {
+                (job.completion)(InvocationExecution {
                     request_id,
                     result: Err(Error::State(error.to_string())),
                     profile: ExecutionProfile::default(),
@@ -1152,11 +1230,16 @@ fn run_on_demand_worker(
     metrics: Arc<PoolMetrics>,
 ) {
     while let Some(job) = queue.pop() {
-        let request_id = job.request.request_id.clone();
+        let request_id = job.request.request_id().to_string();
         let ready_wait_ms = elapsed_ms(job.admitted_at);
         active.fetch_add(1, Ordering::AcqRel);
         let execution = catch_unwind(AssertUnwindSafe(|| {
-            worker.execute_profiled(&version, job.request, job.timeout)
+            job.request.execute_worker(
+                &worker,
+                &version,
+                job.timeout.saturating_sub(job.admitted_at.elapsed()),
+                job.cancellation,
+            )
         }));
         active.fetch_sub(1, Ordering::AcqRel);
         let (result, profile) = match execution {
@@ -1176,7 +1259,7 @@ fn run_on_demand_worker(
             &completion_sender,
             CompletedJob {
                 completion: job.completion,
-                execution: RequestExecution {
+                execution: InvocationExecution {
                     request_id,
                     result,
                     profile,
@@ -1197,13 +1280,13 @@ fn run_prewarmed_dispatcher(
     metrics: Arc<PoolMetrics>,
 ) {
     while let Some((owner, job)) = scheduler.next_dispatch() {
-        if let Err(error) = owner_senders[owner.index].send(OwnerMessage::Execute(job)) {
+        if let Err(error) = owner_senders[owner.index].send(OwnerMessage::Execute(Box::new(job))) {
             scheduler.finish_failed_dispatch();
             let OwnerMessage::Execute(job) = error.0 else {
                 unreachable!("dispatcher only sends execute messages")
             };
             enqueue_job_error(
-                job,
+                *job,
                 PoolSubmitError::Unavailable,
                 &completion_sender,
                 &metrics,
@@ -1355,7 +1438,7 @@ fn run_prewarmed_owner(
             return;
         }
         let job = match receiver.recv() {
-            Ok(OwnerMessage::Execute(job)) => job,
+            Ok(OwnerMessage::Execute(job)) => *job,
             Ok(OwnerMessage::Shutdown) | Err(_) => {
                 inventory.fetch_sub(1, Ordering::AcqRel);
                 drop(restored);
@@ -1424,14 +1507,15 @@ fn execute_prewarmed_job(
     timing: PrewarmExecutionTiming,
     metrics: &PoolMetrics,
 ) -> CompletedJob {
-    let request_id = job.request.request_id.clone();
+    let request_id = job.request.request_id().to_string();
     let execution = catch_unwind(AssertUnwindSafe(|| {
         let total_started = Instant::now();
         let teardown_started = std::cell::Cell::new(None);
-        let mut execution = restored.execute_profiled_with_teardown_observer(
-            job.request,
-            job.timeout,
+        let mut execution = job.request.execute_restored(
+            restored,
+            job.timeout.saturating_sub(job.admitted_at.elapsed()),
             total_started,
+            job.cancellation,
             || {
                 let in_flight = metrics.teardown_in_flight.fetch_add(1, Ordering::AcqRel) + 1;
                 update_max(&metrics.teardown_peak, in_flight);
@@ -1474,7 +1558,7 @@ fn execute_prewarmed_job(
     };
     CompletedJob {
         completion: job.completion,
-        execution: RequestExecution {
+        execution: InvocationExecution {
             request_id,
             result,
             profile,
@@ -1554,12 +1638,12 @@ fn enqueue_job_error(
     metrics: &PoolMetrics,
     admitted: &AtomicUsize,
 ) {
-    let request_id = job.request.request_id.clone();
+    let request_id = job.request.request_id().to_string();
     enqueue_completion(
         sender,
         CompletedJob {
             completion: job.completion,
-            execution: RequestExecution {
+            execution: InvocationExecution {
                 request_id,
                 result: Err(Error::State(error.to_string())),
                 profile: ExecutionProfile::default(),
@@ -1582,9 +1666,9 @@ fn enqueue_jobs(
         if let Some(sender) = sender {
             enqueue_job_error(job, error, sender, metrics, admitted);
         } else {
-            let request_id = job.request.request_id.clone();
+            let request_id = job.request.request_id().to_string();
             let _ = catch_unwind(AssertUnwindSafe(|| {
-                (job.completion)(RequestExecution {
+                (job.completion)(InvocationExecution {
                     request_id,
                     result: Err(Error::State(error.to_string())),
                     profile: ExecutionProfile::default(),
@@ -1760,8 +1844,8 @@ mod tests {
             PoolSubmitError::Full
         );
         queue.close();
-        assert_eq!(queue.pop().unwrap().request.request_id, "one");
-        assert_eq!(queue.pop().unwrap().request.request_id, "two");
+        assert_eq!(queue.pop().unwrap().request.request_id(), "one");
+        assert_eq!(queue.pop().unwrap().request.request_id(), "two");
         assert!(queue.pop().is_none());
         assert_eq!(
             queue.try_push(test_job("closed", |_| {})).unwrap_err().0,
@@ -1824,7 +1908,7 @@ mod tests {
 
         let (owner, job) = scheduler.next_dispatch().unwrap();
         assert_eq!(owner.index, 0);
-        assert_eq!(job.request.request_id, "one");
+        assert_eq!(job.request.request_id(), "one");
         assert_eq!(scheduler.status().active, 1);
         assert_eq!(scheduler.status().queued, 1);
         assert_eq!(scheduler.status().ready, 1);
@@ -1839,7 +1923,8 @@ mod tests {
                     .unwrap()
                     .1
                     .request
-                    .request_id,
+                    .request_id()
+                    .to_string(),
             )
             .unwrap();
         });
@@ -1884,7 +1969,7 @@ mod tests {
         ));
 
         assert_eq!(
-            scheduler.next_dispatch().unwrap().1.request.request_id,
+            scheduler.next_dispatch().unwrap().1.request.request_id(),
             "one"
         );
         let status = scheduler.status();
@@ -2051,7 +2136,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .unwrap()
             .unwrap();
-        assert_eq!(job.request.request_id, "after-wave");
+        assert_eq!(job.request.request_id(), "after-wave");
 
         scheduler.shutdown();
         dispatch.join().unwrap();
@@ -2359,8 +2444,8 @@ mod tests {
         );
     }
 
-    fn test_execution(request_id: &str) -> RequestExecution {
-        RequestExecution {
+    fn test_execution(request_id: &str) -> InvocationExecution {
+        InvocationExecution {
             request_id: request_id.into(),
             result: Err(Error::State("test".into())),
             profile: ExecutionProfile::default(),
@@ -2388,7 +2473,7 @@ mod tests {
 
     fn test_job(
         request_id: &str,
-        completion: impl FnOnce(RequestExecution) + Send + 'static,
+        completion: impl FnOnce(InvocationExecution) + Send + 'static,
     ) -> RequestJob {
         RequestJob {
             request: RequestEnvelope {
@@ -2398,12 +2483,14 @@ mod tests {
                 url: "https://example.test/".into(),
                 headers: vec![],
                 body_base64: String::new(),
-            },
+            }
+            .into(),
             timeout: Duration::from_secs(1),
             completion: Box::new(completion),
             admitted_at: Instant::now(),
             ready_wait_started_at: None,
             diagnostic_wave_member: false,
+            cancellation: InvocationCancellation::default(),
         }
     }
 

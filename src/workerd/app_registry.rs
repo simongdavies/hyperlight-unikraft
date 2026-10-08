@@ -10,21 +10,15 @@
 //! [`super::sandbox`]'s existing disposable restore/execute paths, are
 //! changed here: an [`AppRegistry`] only composes them per app.
 //!
-//! Capability policy configuration is intentionally minimal in this
-//! boundary: [`WorkerCapabilityPolicyConfig`] only supports a deny-all fetch
-//! broker and deny-all storage policy (matching every bundle this host is
-//! currently exercised with). Richer per-app fetch allow-lists / storage
-//! bindings through JSON are deferred to a follow-up change; nothing here
-//! prevents adding fields to that struct later without breaking existing
-//! configs (`#[serde(deny_unknown_fields)]` is intentionally *not* used on
-//! it for that reason, while every other config struct in this module keeps
-//! the stricter `deny_unknown_fields` convention from `protocol.rs`).
+//! Per-app capability configuration is deny-by-default and strictly typed.
+//! Unsupported logical services and misspelled fields are rejected rather
+//! than silently granting, dropping or substituting authority.
 
 use super::{
-    Error, FetchBroker, PoolSubmitError, RequestEnvelope, RequestExecution, ResidentHandle,
-    ResidentPolicy, ResidentPoolConfig, ResidentWorkerPool, StoragePolicy, TimerLimits,
-    WorkerBundle, WorkerCapabilityPolicy, WorkerPoolRestoreMode, WorkerRequestPool,
-    WorkerVersionSandbox,
+    Error, FetchBroker, FetchBrokerConfig, FetchLimits, FetchPolicy, PoolSubmitError,
+    RequestEnvelope, RequestExecution, ResidentHandle, ResidentPolicy, ResidentPoolConfig,
+    ResidentWorkerPool, StorageBinding, StoragePolicy, TimerLimits, WorkerBundle,
+    WorkerCapabilityPolicy, WorkerPoolRestoreMode, WorkerRequestPool, WorkerVersionSandbox,
 };
 use serde::{Deserialize, Serialize};
 use std::fs::File;
@@ -77,6 +71,12 @@ pub enum AppRegistryError {
         #[source]
         source: Error,
     },
+    #[error("invalid capability policy for app '{app_id}': {source}")]
+    CapabilityPolicy {
+        app_id: String,
+        #[source]
+        source: Error,
+    },
 }
 
 /// Matches an inbound request to an app by exact `Host` header and/or a path
@@ -91,18 +91,179 @@ pub struct AppRoute {
     pub path_prefix: Option<String>,
 }
 
-/// Capability policy for an app's worker. See the module docs: only
-/// deny-all fetch/storage is supported today.
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
-pub struct WorkerCapabilityPolicyConfig {}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FetchPolicyConfig {
+    pub hosts: Vec<String>,
+    pub schemes: Vec<String>,
+    pub ports: Vec<u16>,
+    pub methods: Vec<String>,
+    pub ip_ranges: Vec<ipnet::IpNet>,
+    pub credential: Option<super::FetchCredential>,
+    pub paths: Vec<String>,
+    pub query_parameters: std::collections::BTreeMap<String, Vec<String>>,
+    pub body_policy: Option<super::FetchBodyPolicy>,
+    pub allow_loopback: bool,
+    pub allow_private: bool,
+    pub allow_metadata: bool,
+    pub limits: FetchLimits,
+}
+
+impl FetchPolicyConfig {
+    fn build(&self) -> super::Result<FetchBroker> {
+        if self
+            .schemes
+            .iter()
+            .any(|scheme| scheme != "http" && scheme != "https")
+            || self.ports.contains(&0)
+            || self
+                .hosts
+                .iter()
+                .any(|host| host.is_empty() || host.contains(char::is_whitespace))
+        {
+            return Err(Error::State(
+                "fetch requires valid hosts, http/https schemes and nonzero ports".into(),
+            ));
+        }
+        let hosts = crate::AllowList::from_hosts(&self.hosts)
+            .map_err(|error| Error::State(format!("invalid fetch allowlist: {error}")))?;
+        let policy = FetchPolicy::new(
+            crate::NetworkPolicy::AllowList(hosts),
+            self.schemes.clone(),
+            self.ports.clone(),
+        )
+        .allow_loopback(self.allow_loopback)
+        .allow_private(self.allow_private)
+        .allow_metadata(self.allow_metadata)
+        .with_methods(self.methods.clone())?
+        .with_ip_ranges(self.ip_ranges.clone())
+        .with_resource_scope(
+            self.paths.clone(),
+            self.query_parameters.clone(),
+            self.body_policy.clone(),
+        )?;
+        let broker = FetchBroker::new(FetchBrokerConfig {
+            policy,
+            limits: self.limits.clone(),
+        })?;
+        if let Some(credential) = &self.credential {
+            broker.with_credential(credential.clone())
+        } else {
+            Ok(broker)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageMode {
+    ReadOnly,
+    ReadWrite,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageBindingConfig {
+    pub name: String,
+    pub host_path: PathBuf,
+    pub mode: StorageMode,
+    pub max_operations: u64,
+    pub max_read_bytes: u64,
+    pub max_write_bytes: u64,
+}
+
+impl StorageBindingConfig {
+    fn build(&self) -> super::Result<StorageBinding> {
+        let limits = crate::MountLimits {
+            max_operations: Some(self.max_operations),
+            max_read_bytes: Some(self.max_read_bytes),
+            max_write_bytes: Some(self.max_write_bytes),
+        };
+        match self.mode {
+            StorageMode::ReadOnly => StorageBinding::read_only(&self.name, &self.host_path, limits),
+            StorageMode::ReadWrite => {
+                StorageBinding::read_write(&self.name, &self.host_path, limits)
+            }
+        }
+    }
+}
+
+/// Empty configuration denies fetch/storage; timers remain bounded.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorkerCapabilityPolicyConfig {
+    pub fetch: FetchPolicyConfig,
+    pub timers: TimerLimits,
+    pub storage: Vec<StorageBindingConfig>,
+    pub bindings: Vec<super::LogicalBindingConfig>,
+    pub network: Option<super::RawNetworkPolicyConfig>,
+    pub binding_budget_scope: super::LogicalBudgetScope,
+}
 
 impl WorkerCapabilityPolicyConfig {
-    fn build(&self) -> WorkerCapabilityPolicy {
-        WorkerCapabilityPolicy::new(
-            FetchBroker::denied(),
-            TimerLimits::default(),
-            StoragePolicy::denied(),
-        )
+    pub fn sha256(&self) -> super::Result<String> {
+        Ok(self.build()?.sha256())
+    }
+
+    fn build(&self) -> super::Result<WorkerCapabilityPolicy> {
+        self.build_for("standalone", "unbound")
+    }
+
+    pub fn sha256_for(&self, app_id: &str, revision: &str) -> super::Result<String> {
+        Ok(self.build_for(app_id, revision)?.sha256())
+    }
+
+    fn build_for(&self, app_id: &str, revision: &str) -> super::Result<WorkerCapabilityPolicy> {
+        super::timer::TimerBroker::new(self.timers.clone())?;
+        let bindings = self
+            .storage
+            .iter()
+            .map(StorageBindingConfig::build)
+            .collect::<super::Result<Vec<_>>>()?;
+        let webhook_secrets = self.bindings.iter().filter_map(|binding| match binding {
+            super::LogicalBindingConfig::Webhook(policy) => Some(&policy.value_file),
+            super::LogicalBindingConfig::ProviderWebsocket(policy) => {
+                Some(&policy.credential.value_file)
+            }
+            _ => None,
+        });
+        let fetch_secrets = self
+            .fetch
+            .credential
+            .iter()
+            .map(|credential| &credential.value_file);
+        for secret in webhook_secrets.chain(fetch_secrets) {
+            let parent = secret
+                .parent()
+                .ok_or_else(|| Error::State("secret reference has no secret directory".into()))?;
+            let parent = std::fs::canonicalize(parent)?;
+            if bindings
+                .iter()
+                .any(|binding| parent.starts_with(binding.host_path()))
+            {
+                return Err(Error::State(
+                    "credential reference overlaps a guest-mounted host directory".into(),
+                ));
+            }
+        }
+        let policy = WorkerCapabilityPolicy::new(
+            self.fetch.build()?,
+            self.timers.clone(),
+            StoragePolicy::new(bindings)?,
+        );
+        if self.bindings.is_empty() && self.network.is_none() {
+            Ok(policy)
+        } else {
+            policy.with_logical_bindings(
+                super::LogicalBindingsPolicy::with_network(
+                    app_id,
+                    revision,
+                    self.bindings.clone(),
+                    self.network.clone(),
+                )?
+                .with_budget_scope(self.binding_budget_scope),
+            )
+        }
     }
 }
 
@@ -189,6 +350,12 @@ pub struct AppConfig {
     /// unchanged.
     #[serde(default)]
     pub snapshot_dir: Option<PathBuf>,
+    /// Opt-in fenced instance home replaces (never duplicates) the resident
+    /// pool. Public requests must pass through the authenticated platform.
+    #[serde(default)]
+    pub instance_home: Option<super::InstanceHomeConfig>,
+    #[serde(default)]
+    pub streaming: bool,
 }
 
 /// Top-level multi-app host configuration. `rootfs_path`/`executor_path`
@@ -222,21 +389,51 @@ impl HostConfig {
 
 /// One app's live pool, already bound to its initialized worker.
 pub enum AppHandle {
+    Instances {
+        app_id: String,
+        home: Box<super::InstanceHome>,
+        identity: AppIdentity,
+    },
     Disposable {
         app_id: String,
         pool: WorkerRequestPool,
+        identity: AppIdentity,
     },
     Resident {
         app_id: String,
         pool: ResidentWorkerPool,
         affinity: ConnectionAffinity,
+        identity: AppIdentity,
     },
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct AppIdentity {
+    pub worker_version: super::WorkerVersionId,
+    pub bundle_sha256: String,
+    pub capability_policy_sha256: String,
+    pub execute_timeout_secs: u64,
+    pub streaming: bool,
+    pub capabilities: Vec<String>,
+}
+
 impl AppHandle {
+    pub fn identity(&self) -> &AppIdentity {
+        match self {
+            Self::Disposable { identity, .. }
+            | Self::Resident { identity, .. }
+            | Self::Instances { identity, .. } => identity,
+        }
+    }
+
+    pub fn execute_timeout(&self) -> Duration {
+        Duration::from_secs(self.identity().execute_timeout_secs)
+    }
     pub fn app_id(&self) -> &str {
         match self {
-            Self::Disposable { app_id, .. } | Self::Resident { app_id, .. } => app_id,
+            Self::Disposable { app_id, .. }
+            | Self::Resident { app_id, .. }
+            | Self::Instances { app_id, .. } => app_id,
         }
     }
 
@@ -247,7 +444,7 @@ impl AppHandle {
     /// or surfaced here.
     pub fn affinity(&self) -> ConnectionAffinity {
         match self {
-            Self::Disposable { .. } => ConnectionAffinity::None,
+            Self::Disposable { .. } | Self::Instances { .. } => ConnectionAffinity::None,
             Self::Resident { affinity, .. } => *affinity,
         }
     }
@@ -260,7 +457,7 @@ impl AppHandle {
     /// is enforced once, at the call site, not duplicated here.
     pub fn reserve(&self) -> Option<ResidentHandle> {
         match self {
-            Self::Disposable { .. } => None,
+            Self::Disposable { .. } | Self::Instances { .. } => None,
             Self::Resident { pool, .. } => pool.reserve(),
         }
     }
@@ -274,6 +471,89 @@ impl AppHandle {
         match self {
             Self::Disposable { pool, .. } => pool.try_submit(request, timeout, completion),
             Self::Resident { pool, .. } => pool.try_submit(request, timeout, completion),
+            Self::Instances { .. } => {
+                completion(RequestExecution {
+                    request_id: request.request_id,
+                    result: Err(Error::State(
+                        "instance home requires a fenced instance invocation".into(),
+                    )),
+                    profile: Default::default(),
+                    submit_error: Some(PoolSubmitError::Unavailable),
+                });
+                Err(PoolSubmitError::Unavailable)
+            }
+        }
+    }
+
+    pub fn try_submit_invocation(
+        &self,
+        request: super::InvocationRequest,
+        timeout: Duration,
+        completion: impl FnOnce(super::InvocationExecution) + Send + 'static,
+    ) -> std::result::Result<(), PoolSubmitError> {
+        match self {
+            Self::Disposable { pool, .. } => {
+                pool.try_submit_invocation(request, timeout, completion)
+            }
+            Self::Resident { pool, .. } => pool.try_submit_invocation(request, timeout, completion),
+            Self::Instances { .. } => {
+                completion(super::InvocationExecution {
+                    request_id: request.request_id().into(),
+                    result: Err(Error::State(
+                        "instance home requires a fenced instance invocation".into(),
+                    )),
+                    profile: Default::default(),
+                    submit_error: Some(PoolSubmitError::Unavailable),
+                });
+                Err(PoolSubmitError::Unavailable)
+            }
+        }
+    }
+
+    pub fn try_submit_cancellable(
+        &self,
+        request: super::InvocationRequest,
+        timeout: Duration,
+        cancellation: super::InvocationCancellation,
+        completion: impl FnOnce(super::InvocationExecution) + Send + 'static,
+    ) -> std::result::Result<(), PoolSubmitError> {
+        match self {
+            Self::Disposable { pool, .. } => {
+                pool.try_submit_cancellable(request, timeout, cancellation, completion)
+            }
+            Self::Resident { pool, .. } => {
+                pool.try_submit_cancellable(request, timeout, cancellation, completion)
+            }
+            Self::Instances { .. } => self.try_submit_invocation(request, timeout, completion),
+        }
+    }
+
+    pub fn try_submit_stream(
+        &self,
+        request: RequestEnvelope,
+        websocket: bool,
+        ingress: super::GuestIngress,
+        timeout: Duration,
+        completion: impl FnOnce(super::InvocationExecution) + Send + 'static,
+    ) -> std::result::Result<(), PoolSubmitError> {
+        match self {
+            Self::Disposable { pool, .. } => {
+                pool.try_submit_stream(request, websocket, ingress, timeout, completion)
+            }
+            Self::Resident { pool, .. } => {
+                pool.try_submit_stream(request, websocket, ingress, timeout, completion)
+            }
+            Self::Instances { .. } => {
+                completion(super::InvocationExecution {
+                    request_id: request.request_id,
+                    result: Err(Error::State(
+                        "stream requires fenced instance transport".into(),
+                    )),
+                    profile: Default::default(),
+                    submit_error: Some(PoolSubmitError::Unavailable),
+                });
+                Err(PoolSubmitError::Unavailable)
+            }
         }
     }
 
@@ -286,10 +566,29 @@ impl AppHandle {
     /// [`WorkerCapabilityPolicyConfig`].
     pub fn status_json(&self) -> serde_json::Value {
         match self {
-            Self::Disposable { app_id, pool } => {
+            Self::Instances {
+                app_id,
+                home,
+                identity,
+            } => match home.status() {
+                Ok(instances) => serde_json::json!({
+                    "app_id":app_id,"kind":"resident","identity":identity,
+                    "instance_home":true,"checkpoint_policy":home.policy(),"instances":instances,
+                }),
+                Err(error) => serde_json::json!({
+                    "app_id":app_id,"kind":"resident","identity":identity,
+                    "instance_home":true,"status":"unavailable","error":error.to_string(),
+                }),
+            },
+            Self::Disposable {
+                app_id,
+                pool,
+                identity,
+            } => {
                 let status = pool.status();
                 serde_json::json!({
                     "app_id": app_id,
+                    "identity": identity,
                     "kind": "disposable",
                     "admitted": status.admitted,
                     "active": status.active,
@@ -302,12 +601,15 @@ impl AppHandle {
                 app_id,
                 pool,
                 affinity,
+                identity,
             } => {
                 let status = pool.status();
                 serde_json::json!({
                     "app_id": app_id,
+                    "identity": identity,
                     "kind": "resident",
                     "capacity": status.capacity,
+                    "live_vms": status.live_vms,
                     "active": status.active,
                     "queued": status.queued,
                     "queue_capacity": status.queue_capacity,
@@ -429,7 +731,13 @@ impl AppRegistry {
                                         source,
                                     }
                                 })?;
-                            let policy = app.capability_policy.build();
+                            let policy = app
+                                .capability_policy
+                                .build_for(&app_id, bundle.worker_version.as_str())
+                                .map_err(|source| AppRegistryError::CapabilityPolicy {
+                                    app_id: app_id.clone(),
+                                    source,
+                                })?;
                             let worker = if let Some(snapshot_dir) = &app.snapshot_dir {
                                 WorkerVersionSandbox::initialize_from_snapshot_dir(
                                     snapshot_dir,
@@ -460,30 +768,179 @@ impl AppRegistry {
                                     }
                                 })?
                             };
-                            let handle = match app.pool {
-                                AppPoolConfig::Disposable(pool_config) => {
-                                    let pool = WorkerRequestPool::with_restore_mode(
-                                        worker,
-                                        pool_config.max_concurrent_sandboxes,
-                                        pool_config.queue_capacity,
-                                        WorkerPoolRestoreMode::OnDemand,
-                                    )
-                                    .map_err(|source| AppRegistryError::PoolInit {
+                            let identity = AppIdentity {
+                                worker_version: worker.worker_version().clone(),
+                                bundle_sha256: worker.snapshot().binding().bundle_sha256().into(),
+                                capability_policy_sha256: worker
+                                    .snapshot()
+                                    .binding()
+                                    .capability_policy_sha256()
+                                    .into(),
+                                execute_timeout_secs: app.execute_timeout_secs,
+                                streaming: app.streaming,
+                                capabilities: Vec::new(),
+                            };
+                            let mut identity = identity;
+                            identity.capabilities = [
+                                "fetch",
+                                "scheduled",
+                                "queue",
+                                "bounded-capacity",
+                                "cancel",
+                                "outbound-policy-v1",
+                            ]
+                            .into_iter()
+                            .map(str::to_string)
+                            .collect();
+                            let mut required = vec!["tracked-work-drain-v1", "safe-point-v1"];
+                            if app.streaming {
+                                required.push("ingress-stream-v1");
+                            }
+                            if app.capability_policy.bindings.iter().any(|binding| {
+                                matches!(binding, super::LogicalBindingConfig::ProviderWebsocket(_))
+                            }) {
+                                required.push("authenticated-egress-websocket-v1");
+                            }
+                            let negotiated = worker
+                                .negotiated_extensions(
+                                    &required,
+                                    Duration::from_secs(app.execute_timeout_secs),
+                                )
+                                .map_err(|source| AppRegistryError::WorkerInit {
+                                    app_id: app_id.clone(),
+                                    source,
+                                })?;
+                            identity.capabilities.push("tracked-work-drain".into());
+                            if negotiated
+                                .extensions
+                                .iter()
+                                .any(|extension| extension == "secure-entropy-v1")
+                            {
+                                identity.capabilities.push("secure-entropy-v1".into());
+                            }
+                            if negotiated
+                                .extensions
+                                .iter()
+                                .any(|extension| extension == "authenticated-egress-websocket-v1")
+                            {
+                                identity
+                                    .capabilities
+                                    .push("authenticated-egress-websocket-v1".into());
+                            }
+                            if app.streaming {
+                                identity.capabilities.extend(
+                                    ["ingress-stream", "sse", "websocket", "fetch-stream"]
+                                        .into_iter()
+                                        .map(str::to_string),
+                                );
+                            }
+                            if let Some(home) = &app.instance_home {
+                                identity.capabilities.extend(
+                                    [
+                                        "current-state-checkpoint",
+                                        "safe-point-drain",
+                                        "fenced-ownership",
+                                    ]
+                                    .into_iter()
+                                    .map(str::to_string),
+                                );
+                                if home.checkpoint_policy == super::CheckpointPolicy::Durable {
+                                    identity.capabilities.push("durable-checkpoint".into());
+                                }
+                            }
+                            for binding in &app.capability_policy.bindings {
+                                match binding {
+                                    super::LogicalBindingConfig::D1 { .. } => {
+                                        identity.capabilities.extend(
+                                            ["binding-sql", "binding-d1"]
+                                                .into_iter()
+                                                .map(str::to_string),
+                                        );
+                                    }
+                                    super::LogicalBindingConfig::Kv { .. } => {
+                                        identity.capabilities.push("binding-kv".into())
+                                    }
+                                    super::LogicalBindingConfig::Webhook(_) => {
+                                        identity.capabilities.push("binding-webhook-secret".into())
+                                    }
+                                    super::LogicalBindingConfig::ProviderWebsocket(_) => {
+                                        identity.capabilities.push("provider-websocket-v1".into())
+                                    }
+                                }
+                            }
+                            if app.capability_policy.fetch.body_policy.is_some()
+                                && app.capability_policy.fetch.credential.is_some()
+                                && !app.capability_policy.fetch.paths.is_empty()
+                            {
+                                identity.capabilities.push("binding-ai-azure".into());
+                            }
+                            let handle = if let Some(home_config) = app.instance_home {
+                                let AppPoolConfig::Resident(pool_config) = app.pool else {
+                                    return Err(AppRegistryError::PoolInit {
+                                        app_id,
+                                        source: Error::State(
+                                            "instance home requires resident execution mode".into(),
+                                        ),
+                                    });
+                                };
+                                if app.connection_affinity != ConnectionAffinity::None {
+                                    return Err(AppRegistryError::PoolInit {
+                                        app_id,
+                                        source: Error::State(
+                                            "fenced instance home cannot use connection affinity"
+                                                .into(),
+                                        ),
+                                    });
+                                }
+                                let home = super::InstanceHome::new(
+                                    worker,
+                                    home_config,
+                                    pool_config.capacity,
+                                    pool_config.queue_capacity,
+                                )
+                                .map_err(|source| {
+                                    AppRegistryError::PoolInit {
                                         app_id: app_id.clone(),
                                         source,
-                                    })?;
-                                    AppHandle::Disposable { app_id, pool }
+                                    }
+                                })?;
+                                AppHandle::Instances {
+                                    app_id,
+                                    home: Box::new(home),
+                                    identity,
                                 }
-                                AppPoolConfig::Resident(pool_config) => {
-                                    let pool = ResidentWorkerPool::new(worker, pool_config.into())
+                            } else {
+                                match app.pool {
+                                    AppPoolConfig::Disposable(pool_config) => {
+                                        let pool = WorkerRequestPool::with_restore_mode(
+                                            worker,
+                                            pool_config.max_concurrent_sandboxes,
+                                            pool_config.queue_capacity,
+                                            WorkerPoolRestoreMode::OnDemand,
+                                        )
                                         .map_err(|source| AppRegistryError::PoolInit {
                                             app_id: app_id.clone(),
                                             source,
                                         })?;
-                                    AppHandle::Resident {
-                                        app_id,
-                                        pool,
-                                        affinity: app.connection_affinity,
+                                        AppHandle::Disposable {
+                                            app_id,
+                                            pool,
+                                            identity,
+                                        }
+                                    }
+                                    AppPoolConfig::Resident(pool_config) => {
+                                        let pool =
+                                            ResidentWorkerPool::new(worker, pool_config.into())
+                                                .map_err(|source| AppRegistryError::PoolInit {
+                                                    app_id: app_id.clone(),
+                                                    source,
+                                                })?;
+                                        AppHandle::Resident {
+                                            app_id,
+                                            pool,
+                                            affinity: app.connection_affinity,
+                                            identity,
+                                        }
                                     }
                                 }
                             };
@@ -551,6 +1008,13 @@ impl AppRegistry {
         self.entries.len()
     }
 
+    pub fn app(&self, app_id: &str) -> Option<&AppHandle> {
+        self.entries
+            .iter()
+            .find(|entry| entry.handle.app_id() == app_id)
+            .map(|entry| &entry.handle)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -568,6 +1032,24 @@ impl AppRegistry {
             .iter()
             .map(|entry| entry.handle.status_json())
             .collect()
+    }
+
+    pub fn capabilities_json(&self) -> serde_json::Value {
+        let apps=self.entries.iter().map(|entry|serde_json::json!({
+            "app_id":entry.handle.app_id(),"revision":entry.handle.identity().worker_version,
+            "capabilities":entry.handle.identity().capabilities,
+        })).collect::<Vec<_>>();
+        let mut capabilities = self
+            .entries
+            .iter()
+            .flat_map(|entry| entry.handle.identity().capabilities.iter().cloned())
+            .collect::<Vec<_>>();
+        capabilities.sort();
+        capabilities.dedup();
+        serde_json::json!({"protocol_version":1,"capabilities":capabilities,"apps":apps,
+            "limits":{"bundle_source_bytes":super::MAX_PACKAGE_SOURCE_BYTES,"module_source_bytes":super::MAX_PACKAGE_MODULE_BYTES,
+                "legacy_bundle_source_bytes":super::MAX_BUNDLE_SOURCE_BYTES,"body_bytes":super::MAX_BODY_BYTES,
+                "envelope_bytes":super::MAX_ENVELOPE_BYTES,"frame_bytes":super::MAX_FRAME_BYTES}})
     }
 }
 
@@ -626,5 +1108,51 @@ mod tests {
         let a = route("a", &[], None);
         let error = validate_routes(&[&a]).unwrap_err();
         assert!(matches!(error, AppRegistryError::NoHostnames(id) if id == "a"));
+    }
+
+    #[test]
+    fn capability_config_rejects_unknown_nested_and_unsupported_settings() {
+        for json in [
+            r#"{"fetxh":{}}"#,
+            r#"{"fetch":{"allow_prviate":true}}"#,
+            r#"{"fetch":{"limits":{"max_reponse_bytes":1}}}"#,
+            r#"{"timers":{"unbounded":true}}"#,
+            r#"{"bindings":[{"name":"KV","kind":"kv"}]}"#,
+            r#"{"storage":[{"name":"data","host_path":"/tmp","mode":"read_write","max_operations":1,"max_read_bytes":1,"max_write_bytes":1,"unbounded":true}]}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<WorkerCapabilityPolicyConfig>(json).is_err(),
+                "{json}"
+            );
+        }
+    }
+
+    #[test]
+    fn configured_fetch_and_timer_authority_changes_fingerprint() {
+        let baseline = WorkerCapabilityPolicyConfig::default()
+            .build()
+            .unwrap()
+            .sha256();
+        for json in [
+            r#"{"fetch":{"hosts":["127.0.0.1"],"schemes":["http"],"ports":[80],"allow_loopback":true}}"#,
+            r#"{"fetch":{"limits":{"max_response_bytes":1}}}"#,
+            r#"{"timers":{"max_active_timers":1}}"#,
+        ] {
+            let config: WorkerCapabilityPolicyConfig = serde_json::from_str(json).unwrap();
+            assert_ne!(config.build().unwrap().sha256(), baseline, "{json}");
+        }
+    }
+
+    #[test]
+    fn invalid_capability_limits_and_schemes_fail_closed() {
+        for json in [
+            r#"{"fetch":{"schemes":["file"]}}"#,
+            r#"{"fetch":{"ports":[0]}}"#,
+            r#"{"fetch":{"limits":{"max_concurrent_requests":0}}}"#,
+            r#"{"timers":{"max_active_timers":0}}"#,
+        ] {
+            let config: WorkerCapabilityPolicyConfig = serde_json::from_str(json).unwrap();
+            assert!(config.build().is_err(), "{json}");
+        }
     }
 }

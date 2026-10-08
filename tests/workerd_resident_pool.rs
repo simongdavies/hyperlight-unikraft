@@ -92,6 +92,11 @@ fn pool_serves_many_sequential_requests_through_one_resident_vm() {
     assert_eq!(status.capacity, 1);
     assert_eq!(status.retirements, 0);
     assert_eq!(status.resident_requests_served, 5);
+    assert_eq!(status.active, 0);
+    assert_eq!(
+        status.live_vms, 1,
+        "idle-but-live resident must not be reported as zero VMs"
+    );
 }
 
 #[test]

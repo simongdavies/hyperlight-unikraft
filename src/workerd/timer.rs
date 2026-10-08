@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 pub const TIMER_PROTOCOL_VERSION: u32 = 1;
 const MAX_TIMER_ID: u64 = (1u64 << 53) - 1;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct TimerLimits {
     pub max_active_timers: usize,
     pub max_unreleased_handles: usize,
@@ -271,6 +272,28 @@ impl TimerResponse {
 }
 
 impl TimerSession {
+    pub(super) fn sequence_state(&self) -> u64 {
+        self.inner.next_id.load(Ordering::Acquire)
+    }
+    pub(super) fn restore_sequence(&self, next: u64) -> Result<()> {
+        if next == 0 || next > MAX_TIMER_ID {
+            return Err(Error::Snapshot(
+                "invalid checkpoint timer handle watermark".into(),
+            ));
+        }
+        self.inner.next_id.store(next, Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn is_quiescent(&self) -> Result<bool> {
+        Ok(self
+            .inner
+            .timers
+            .lock()
+            .map_err(|_| Error::State("timer state poisoned".into()))?
+            .is_empty())
+    }
+
     fn start_json(&self, delay_ns: u64) -> Result<String> {
         let response = match self.start(delay_ns) {
             Ok(timer_id) => TimerResponse::state(timer_id, TimerResponseState::Pending),

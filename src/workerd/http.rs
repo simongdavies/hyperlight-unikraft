@@ -73,19 +73,79 @@ pub fn read_http_request(
     request_id: String,
     max_head_bytes: usize,
 ) -> Result<ParsedHttpRequest, String> {
+    read_http_request_with_control(stream, request_id, max_head_bytes, false)
+}
+
+/// Operator control JSON may be one bounded envelope, while actual buffered
+/// guest requests remain subject to the original 32 KiB body limit.
+pub fn read_http_request_with_control(
+    stream: &mut TcpStream,
+    request_id: String,
+    max_head_bytes: usize,
+    operator_control: bool,
+) -> Result<ParsedHttpRequest, String> {
+    let original_timeout = stream.read_timeout().map_err(|error| error.to_string())?;
+    let budget = original_timeout.unwrap_or(std::time::Duration::from_secs(5));
+    let deadline = std::time::Instant::now()
+        .checked_add(budget)
+        .ok_or("HTTP read timeout too large")?;
+    let result = read_http_request_until(
+        stream,
+        request_id,
+        max_head_bytes,
+        operator_control,
+        deadline,
+    );
+    stream
+        .set_read_timeout(original_timeout)
+        .map_err(|error| error.to_string())?;
+    result
+}
+
+fn read_http_request_until(
+    stream: &mut TcpStream,
+    request_id: String,
+    max_head_bytes: usize,
+    operator_control: bool,
+    deadline: std::time::Instant,
+) -> Result<ParsedHttpRequest, String> {
+    fn remaining(stream: &TcpStream, deadline: std::time::Instant) -> Result<(), String> {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err("HTTP request read deadline exceeded".into());
+        }
+        stream
+            .set_read_timeout(Some(remaining))
+            .map_err(|error| error.to_string())
+    }
     let mut bytes = Vec::new();
     let mut chunk = [0u8; 4096];
     let head_end = loop {
-        if bytes.len() > max_head_bytes {
+        if bytes.len() >= max_head_bytes {
             return Err("request headers exceed limit".into());
         }
-        let count = stream.read(&mut chunk).map_err(|e| e.to_string())?;
+        remaining(stream, deadline)?;
+        let count = stream.peek(&mut chunk).map_err(|e| e.to_string())?;
         if count == 0 {
             return Err("connection closed before request headers".into());
         }
-        bytes.extend_from_slice(&chunk[..count]);
-        if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
-            break end + 4;
+        let prefix = bytes.len().saturating_sub(3);
+        let mut candidate = bytes[prefix..].to_vec();
+        candidate.extend_from_slice(&chunk[..count]);
+        let end = candidate.windows(4).position(|part| part == b"\r\n\r\n");
+        let consume = end
+            .map_or(count, |end| prefix + end + 4 - bytes.len())
+            .min(max_head_bytes - bytes.len());
+        stream
+            .read_exact(&mut chunk[..consume])
+            .map_err(|error| error.to_string())?;
+        bytes.extend_from_slice(&chunk[..consume]);
+        if let Some(end) = end {
+            let end = prefix + end + 4;
+            if end > max_head_bytes {
+                return Err("request headers exceed limit".into());
+            }
+            break end;
         }
     };
     let head = std::str::from_utf8(&bytes[..head_end])
@@ -108,14 +168,25 @@ pub fn read_http_request(
     let mut headers = Vec::new();
     let mut host = None;
     let mut content_length = 0usize;
+    let mut seen_content_length = false;
     for line in lines {
         let (name, value) = line
             .split_once(':')
             .ok_or_else(|| "malformed header".to_string())?;
         let value = value.trim();
         if name.eq_ignore_ascii_case("host") {
+            if host.is_some() {
+                return Err("duplicate Host header".into());
+            }
             host = Some(value);
         } else if name.eq_ignore_ascii_case("content-length") {
+            if seen_content_length {
+                return Err("duplicate Content-Length header".into());
+            }
+            seen_content_length = true;
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err("invalid Content-Length".into());
+            }
             content_length = value
                 .parse()
                 .map_err(|_| "invalid Content-Length".to_string())?;
@@ -127,11 +198,29 @@ pub fn read_http_request(
             value: value.into(),
         });
     }
-    if content_length > MAX_BODY_BYTES {
+    let url = if target.starts_with("http://") || target.starts_with("https://") {
+        target.into()
+    } else {
+        let host = host.ok_or_else(|| "missing Host header".to_string())?;
+        format!("http://{host}{target}")
+    };
+    let path = request_path(&url).to_owned();
+    let control =
+        operator_control && (path.starts_with("/v1/apps/") || path.starts_with("/v1/instances/"));
+    let body_limit = if control {
+        super::MAX_ENVELOPE_BYTES
+    } else {
+        MAX_BODY_BYTES
+    };
+    if content_length > body_limit {
         return Err("request body exceeds limit".into());
     }
     while bytes.len() - head_end < content_length {
-        let count = stream.read(&mut chunk).map_err(|e| e.to_string())?;
+        remaining(stream, deadline)?;
+        let wanted = (content_length - (bytes.len() - head_end)).min(chunk.len());
+        let count = stream
+            .read(&mut chunk[..wanted])
+            .map_err(|e| e.to_string())?;
         if count == 0 {
             return Err("connection closed before request body".into());
         }
@@ -143,22 +232,19 @@ pub fn read_http_request(
     if bytes.len() - head_end != content_length {
         return Err("bytes after request body".into());
     }
-    let url = if target.starts_with("http://") || target.starts_with("https://") {
-        target.into()
-    } else {
-        let host = host.ok_or_else(|| "missing Host header".to_string())?;
-        format!("http://{host}{target}")
-    };
-    let path = request_path(&url).to_owned();
-    let envelope = RequestEnvelope {
+    let mut envelope = RequestEnvelope {
         protocol_version: PROTOCOL_VERSION,
         request_id,
         method: method.into(),
         url,
         headers,
-        body_base64: STANDARD.encode(&bytes[head_end..]),
+        body_base64: String::new(),
     };
     envelope.validate().map_err(|error| error.to_string())?;
+    envelope.body_base64 = STANDARD.encode(&bytes[head_end..]);
+    if !control {
+        envelope.validate().map_err(|error| error.to_string())?;
+    }
     Ok(ParsedHttpRequest { envelope, path })
 }
 
@@ -245,5 +331,30 @@ mod tests {
             value: "close".into(),
         });
         assert!(!wants_keep_alive(&envelope));
+    }
+
+    #[test]
+    fn fragmented_headers_obey_one_absolute_read_deadline() {
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let sender = std::thread::spawn(move || {
+            for byte in b"GET / HTTP/1.1\r\nHost: slow.test\r\n\r\n" {
+                if client.write_all(&[*byte]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let started = Instant::now();
+        assert!(read_http_request(&mut server, "slow".into(), 16384).is_err());
+        assert!(started.elapsed() < Duration::from_millis(300));
+        drop(server);
+        sender.join().unwrap();
     }
 }

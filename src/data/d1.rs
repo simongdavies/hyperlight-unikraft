@@ -7,15 +7,23 @@ use crate::broker_runtime::{
     LogicalInvocation, LogicalRuntimeStatus, LogicalWireError, LogicalWireService,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
+use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+use rusqlite::limits::Limit;
 use rusqlite::types::{Value, ValueRef};
 use rusqlite::{Connection, params_from_iter};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::{Duration, Instant};
 
 const D1_PROTOCOL_VERSION: u16 = 1;
 const MAX_WIRE_BYTES: usize = 256 * 1024;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct D1Limits {
     pub max_operations: u64,
     pub max_request_bytes: u64,
@@ -25,6 +33,7 @@ pub struct D1Limits {
     pub max_parameters: usize,
     pub max_rows: usize,
     pub max_result_bytes: u64,
+    pub max_execution_ms: u64,
 }
 
 impl D1Limits {
@@ -37,6 +46,8 @@ impl D1Limits {
             || self.max_parameters == 0
             || self.max_rows == 0
             || self.max_result_bytes == 0
+            || self.max_execution_ms == 0
+            || self.max_execution_ms > 30_000
         {
             return Err(DataError::InvalidLimit);
         }
@@ -55,6 +66,7 @@ impl Default for D1Limits {
             max_parameters: 128,
             max_rows: 1000,
             max_result_bytes: 256 * 1024,
+            max_execution_ms: 5_000,
         }
     }
 }
@@ -210,6 +222,8 @@ struct D1Store {
     operations: u64,
     request_bytes: u64,
     response_bytes: u64,
+    authorizer_denied: Arc<AtomicBool>,
+    invocation_deadline: Option<Instant>,
 }
 
 impl D1Store {
@@ -224,12 +238,75 @@ impl D1Store {
         connection
             .execute_batch("PRAGMA foreign_keys = ON;")
             .map_err(DataError::InitializeBacking)?;
+        for (limit, value) in [
+            (
+                Limit::SQLITE_LIMIT_LENGTH,
+                binding
+                    .limits
+                    .max_result_bytes
+                    .max(4096)
+                    .min(i32::MAX as u64) as i32,
+            ),
+            (
+                Limit::SQLITE_LIMIT_SQL_LENGTH,
+                binding.limits.max_statement_bytes.min(i32::MAX as usize) as i32,
+            ),
+            (
+                Limit::SQLITE_LIMIT_VARIABLE_NUMBER,
+                binding.limits.max_parameters.min(i32::MAX as usize) as i32,
+            ),
+            (Limit::SQLITE_LIMIT_COLUMN, 256),
+            (Limit::SQLITE_LIMIT_EXPR_DEPTH, 100),
+            (Limit::SQLITE_LIMIT_COMPOUND_SELECT, 32),
+            (Limit::SQLITE_LIMIT_VDBE_OP, 100_000),
+        ] {
+            connection
+                .set_limit(limit, value)
+                .map_err(DataError::InitializeBacking)?;
+        }
+        let authorizer_denied = Arc::new(AtomicBool::new(false));
+        let denied = authorizer_denied.clone();
+        connection.authorizer(Some(move |context: AuthContext<'_>| {
+            let allowed = context
+                .database_name
+                .is_none_or(|database| database == "main")
+                && match context.action {
+                    AuthAction::CreateIndex { .. }
+                    | AuthAction::CreateTable { .. }
+                    | AuthAction::CreateTrigger { .. }
+                    | AuthAction::CreateView { .. }
+                    | AuthAction::Delete { .. }
+                    | AuthAction::DropIndex { .. }
+                    | AuthAction::DropTable { .. }
+                    | AuthAction::DropTrigger { .. }
+                    | AuthAction::DropView { .. }
+                    | AuthAction::Insert { .. }
+                    | AuthAction::Read { .. }
+                    | AuthAction::Select
+                    | AuthAction::Transaction { .. }
+                    | AuthAction::Update { .. }
+                    | AuthAction::AlterTable { .. }
+                    | AuthAction::Reindex { .. }
+                    | AuthAction::Savepoint { .. }
+                    | AuthAction::Recursive => true,
+                    AuthAction::Function { function_name } => safe_sql_function(function_name),
+                    _ => false,
+                };
+            if allowed {
+                Authorization::Allow
+            } else {
+                denied.store(true, Ordering::Release);
+                Authorization::Deny
+            }
+        }));
         Ok(Self {
             binding,
             connection,
             operations: 0,
             request_bytes: 0,
             response_bytes: 0,
+            authorizer_denied,
+            invocation_deadline: None,
         })
     }
 
@@ -262,8 +339,27 @@ impl D1Store {
     fn execute(
         &mut self,
         statements: Vec<D1Statement>,
+        request_id: &str,
     ) -> std::result::Result<Vec<D1ResultSet>, &'static str> {
         validate_statements(&statements, self.binding.limits)?;
+        let deadline = Instant::now()
+            .checked_add(Duration::from_millis(self.binding.limits.max_execution_ms))
+            .ok_or("execution_deadline")?;
+        let deadline = self
+            .invocation_deadline
+            .map_or(deadline, |admitted| admitted.min(deadline));
+        if Instant::now() >= deadline {
+            return Err("execution_deadline");
+        }
+        self.connection
+            .busy_timeout(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(50)),
+            )
+            .map_err(|_| "sqlite_deadline")?;
+        self.connection
+            .progress_handler(1000, Some(move || Instant::now() >= deadline));
         let transaction = self
             .connection
             .transaction()
@@ -277,9 +373,14 @@ impl D1Store {
                 .into_iter()
                 .map(D1Parameter::into_sql)
                 .collect::<std::result::Result<Vec<_>, _>>()?;
-            let mut prepared = transaction
-                .prepare(&statement.sql)
-                .map_err(|_| "sqlite_prepare")?;
+            self.authorizer_denied.store(false, Ordering::Release);
+            let mut prepared = transaction.prepare(&statement.sql).map_err(|_| {
+                if self.authorizer_denied.load(Ordering::Acquire) {
+                    "forbidden_sql"
+                } else {
+                    "sqlite_prepare"
+                }
+            })?;
             if self.binding.read_only && !prepared.readonly() {
                 return Err("read_only");
             }
@@ -309,20 +410,37 @@ impl D1Store {
                 .query(params_from_iter(parameters))
                 .map_err(|_| "sqlite_query")?;
             let mut values = Vec::new();
+            let empty_result = D1ResultSet {
+                columns: columns.clone(),
+                rows: Vec::new(),
+                rows_affected: 0,
+            };
+            let mut encoded_bytes = serde_json::to_vec(&empty_result)
+                .map_err(|_| "sqlite_value")?
+                .len() as u64;
             while let Some(row) = rows.next().map_err(|_| "sqlite_query")? {
                 total_rows += 1;
                 if total_rows > self.binding.limits.max_rows {
                     return Err("row_quota");
                 }
-                values.push(
-                    (0..columns.len())
-                        .map(|index| {
-                            row.get_ref(index)
-                                .map_err(|_| "sqlite_value")
-                                .and_then(sql_value)
-                        })
-                        .collect::<std::result::Result<Vec<_>, _>>()?,
-                );
+                let row_values = (0..columns.len())
+                    .map(|index| {
+                        row.get_ref(index)
+                            .map_err(|_| "sqlite_value")
+                            .and_then(sql_value)
+                    })
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                let row_bytes = serde_json::to_vec(&row_values)
+                    .map_err(|_| "sqlite_value")?
+                    .len() as u64;
+                encoded_bytes =
+                    encoded_bytes.saturating_add(row_bytes + u64::from(!values.is_empty()));
+                if total_result_bytes.saturating_add(encoded_bytes)
+                    > self.binding.limits.max_result_bytes
+                {
+                    return Err("result_bytes_quota");
+                }
+                values.push(row_values);
             }
             let result = D1ResultSet {
                 columns,
@@ -335,6 +453,30 @@ impl D1Store {
                 self.binding.limits.max_result_bytes,
             )?;
             results.push(result);
+        }
+        #[derive(Serialize)]
+        struct BorrowedResponse<'a> {
+            version: u16,
+            request_id: &'a str,
+            status: D1Status,
+            code: &'a str,
+            results: &'a [D1ResultSet],
+        }
+        let encoded = serde_json::to_vec(&BorrowedResponse {
+            version: 1,
+            request_id,
+            status: D1Status::Ok,
+            code: "ok",
+            results: &results,
+        })
+        .map_err(|_| "sqlite_value")?;
+        if encoded.len() > 60 * 1024 {
+            return Err("response_bytes_quota");
+        }
+        if self.response_bytes.saturating_add(encoded.len() as u64)
+            > self.binding.limits.max_response_bytes
+        {
+            return Err("response_bytes_quota");
         }
         transaction.commit().map_err(|_| "sqlite_commit")?;
         Ok(results)
@@ -353,24 +495,113 @@ fn validate_statements(
         if statement.sql.is_empty() || statement.sql.len() > limits.max_statement_bytes {
             return Err("statement_size");
         }
-        if statement
-            .sql
-            .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
-            .any(|token| {
-                matches!(
-                    token.to_ascii_lowercase().as_str(),
-                    "attach" | "detach" | "pragma" | "vacuum"
-                )
-            })
-        {
-            return Err("forbidden_sql");
-        }
         parameters = parameters.saturating_add(statement.parameters.len());
         if parameters > limits.max_parameters {
             return Err("parameter_quota");
         }
     }
     Ok(())
+}
+
+fn safe_sql_function(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "abs"
+            | "char"
+            | "coalesce"
+            | "concat"
+            | "concat_ws"
+            | "format"
+            | "glob"
+            | "hex"
+            | "ifnull"
+            | "iif"
+            | "instr"
+            | "length"
+            | "like"
+            | "likelihood"
+            | "likely"
+            | "lower"
+            | "ltrim"
+            | "max"
+            | "min"
+            | "nullif"
+            | "octet_length"
+            | "printf"
+            | "quote"
+            | "random"
+            | "randomblob"
+            | "replace"
+            | "round"
+            | "rtrim"
+            | "sign"
+            | "soundex"
+            | "substr"
+            | "substring"
+            | "total_changes"
+            | "changes"
+            | "trim"
+            | "typeof"
+            | "unhex"
+            | "unicode"
+            | "unlikely"
+            | "upper"
+            | "zeroblob"
+            | "last_insert_rowid"
+            | "avg"
+            | "count"
+            | "sum"
+            | "total"
+            | "group_concat"
+            | "string_agg"
+            | "date"
+            | "time"
+            | "datetime"
+            | "julianday"
+            | "unixepoch"
+            | "strftime"
+            | "timediff"
+            | "json"
+            | "json_array"
+            | "json_array_length"
+            | "json_error_position"
+            | "json_extract"
+            | "json_insert"
+            | "json_object"
+            | "json_patch"
+            | "json_quote"
+            | "json_remove"
+            | "json_replace"
+            | "json_set"
+            | "json_type"
+            | "json_valid"
+            | "json_group_array"
+            | "json_group_object"
+            | "jsonb"
+            | "jsonb_array"
+            | "jsonb_extract"
+            | "jsonb_insert"
+            | "jsonb_object"
+            | "jsonb_patch"
+            | "jsonb_remove"
+            | "jsonb_replace"
+            | "jsonb_set"
+            | "->"
+            | "->>"
+            | "row_number"
+            | "rank"
+            | "dense_rank"
+            | "percent_rank"
+            | "cume_dist"
+            | "ntile"
+            | "lag"
+            | "lead"
+            | "first_value"
+            | "last_value"
+            | "nth_value"
+            | "sqlite_version"
+            | "sqlite_source_id"
+    )
 }
 
 fn charge_result_bytes(
@@ -449,6 +680,12 @@ impl D1Service {
 }
 
 impl LogicalWireService for D1Service {
+    fn set_deadline(&mut self, deadline: Instant) {
+        for store in &mut self.stores {
+            store.invocation_deadline = Some(deadline);
+        }
+    }
+
     fn inspect(&self, payload: &[u8]) -> std::result::Result<LogicalInvocation, LogicalWireError> {
         let request = Self::parse(payload).map_err(|code| match code {
             "unsupported_version" => LogicalWireError::UnsupportedVersion,
@@ -473,7 +710,7 @@ impl LogicalWireService for D1Service {
             return Self::rejection(request.request_id, D1Status::QuotaExceeded, code);
         }
         let D1Operation::Batch { statements } = request.operation;
-        let results = match store.execute(statements) {
+        let results = match store.execute(statements, &request.request_id) {
             Ok(results) => results,
             Err(code @ ("read_only" | "forbidden_sql")) => {
                 return Self::rejection(request.request_id, D1Status::Denied, code);
@@ -665,6 +902,115 @@ mod tests {
                 D1Status::Denied,
                 "forbidden_sql".to_string(),
             )
+        );
+    }
+
+    #[test]
+    fn sqlite_authorizer_denies_host_paths_extensions_pragmas_and_virtual_tables_without_token_filter()
+     {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("private.sqlite");
+        let exported = tmp.path().join("export.sqlite");
+        let store =
+            D1Store::open(D1Binding::in_memory("database", false, D1Limits::default()).unwrap())
+                .unwrap();
+        store
+            .connection
+            .execute_batch("CREATE TABLE allowed(id INTEGER);INSERT INTO allowed VALUES(1);")
+            .unwrap();
+        for sql in [
+            format!(
+                "-- comment\nATTACH DATABASE '{}' AS stolen",
+                outside.display()
+            ),
+            "DETACH DATABASE main".into(),
+            format!("VACUUM INTO '{}'", exported.display()),
+            "PRAGMA writable_schema=ON".into(),
+            "SELECT load_extension('/run/host-secrets/extension')".into(),
+            "SELECT readfile('/run/host-secrets/checkpoint-key')".into(),
+            "SELECT writefile('/state/checkpoints.db','overwrite')".into(),
+            "CREATE VIRTUAL TABLE stolen USING csv(filename='/run/host-secrets/token')".into(),
+            "SELECT * FROM pragma_database_list".into(),
+        ] {
+            assert!(store.connection.execute_batch(&sql).is_err(), "{sql}");
+        }
+        assert!(!outside.exists());
+        assert!(!exported.exists());
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT 'attach' || 'pragma' FROM allowed", [], |row| row
+                    .get::<_, String>(
+                    0
+                ))
+                .unwrap(),
+            "attachpragma"
+        );
+    }
+
+    #[test]
+    fn bounded_sqlite_work_cannot_allocate_huge_values_or_spin_past_admitted_limit() {
+        let mut store = D1Store::open(
+            D1Binding::in_memory(
+                "database",
+                false,
+                D1Limits {
+                    max_execution_ms: 5,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let statement = |sql: &str| {
+            vec![D1Statement {
+                sql: sql.into(),
+                parameters: vec![],
+            }]
+        };
+        assert!(
+            store
+                .execute(statement("SELECT randomblob(1000000000)"), "too-large")
+                .is_err()
+        );
+        let started = Instant::now();
+        assert!(store.execute(statement("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<100000000) SELECT sum(x) FROM n"),"deadline").is_err());
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn response_quota_failure_rolls_back_mutation_before_acknowledgement() {
+        let mut store = D1Store::open(
+            D1Binding::in_memory(
+                "database",
+                false,
+                D1Limits {
+                    max_response_bytes: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        store
+            .connection
+            .execute_batch("CREATE TABLE records(value TEXT);INSERT INTO records VALUES('before')")
+            .unwrap();
+        let result = store.execute(
+            vec![D1Statement {
+                sql: "UPDATE records SET value='after' RETURNING value".into(),
+                parameters: vec![],
+            }],
+            "quota",
+        );
+        assert_eq!(result.unwrap_err(), "response_bytes_quota");
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT value FROM records", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "before"
         );
     }
 

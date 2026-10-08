@@ -24,7 +24,7 @@ use hyperlight_unikraft::workerd::{
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const DEFAULT_ROOTFS: &str = "build-elfloader/workerd-executor/rootfs.img";
@@ -277,7 +277,7 @@ fn run_sql_proof(
     rootfs: &PathBuf,
     executor: &PathBuf,
     scratch_mib: usize,
-    state_dir: &PathBuf,
+    state_dir: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let kv_path = state_dir.join("kv.sqlite");
     let cache_path = state_dir.join("cache.sqlite");

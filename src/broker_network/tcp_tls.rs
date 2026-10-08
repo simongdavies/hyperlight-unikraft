@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 The Hyperlight Authors.
 
-use super::{NetworkExecutor, NetworkResource, resolve};
+use super::{DeadlineTcpStream, NetworkExecutor, NetworkResource, resolve};
 use crate::broker::{BrokerEndpoint, TlsProfile, TlsVersion};
 use crate::broker_adapter::{BrokerExecution, BrokerHostError};
 use rustls::pki_types::ServerName;
@@ -93,19 +93,26 @@ pub(super) fn receive(
 pub(super) fn connect(
     executor: &NetworkExecutor,
     endpoint: &BrokerEndpoint,
-) -> Result<TcpStream, BrokerHostError> {
+) -> Result<DeadlineTcpStream, BrokerHostError> {
     let addresses = resolve(executor, endpoint)?;
     let mut last_error = None;
     for address in addresses {
-        match TcpStream::connect_timeout(&address, executor.connect_timeout) {
+        match TcpStream::connect_timeout(
+            &address,
+            executor.remaining_timeout(executor.connect_timeout)?,
+        ) {
             Ok(stream) => {
                 stream
-                    .set_read_timeout(Some(executor.io_timeout))
+                    .set_read_timeout(Some(executor.remaining_timeout(executor.io_timeout)?))
                     .map_err(|_| BrokerHostError::new("stream_configuration"))?;
                 stream
-                    .set_write_timeout(Some(executor.io_timeout))
+                    .set_write_timeout(Some(executor.remaining_timeout(executor.io_timeout)?))
                     .map_err(|_| BrokerHostError::new("stream_configuration"))?;
-                return Ok(stream);
+                return Ok(DeadlineTcpStream {
+                    inner: stream,
+                    deadline: executor.deadline.clone(),
+                    io_timeout: executor.io_timeout,
+                });
             }
             Err(error) => last_error = Some(error),
         }

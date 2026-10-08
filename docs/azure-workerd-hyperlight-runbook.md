@@ -4,6 +4,18 @@ This walkthrough starts from an existing x86-64 Linux machine with KVM. It
 builds the Workerd and Hyperlight forks containing this integration, then
 presents every feature as an interactive, individually runnable demo.
 
+## Quick navigation
+
+| Goal | Walkthrough |
+|---|---|
+| First native Linux setup | [Clone/KVM](#1-clone-and-check-kvm), [build and shared caches](#2-build) |
+| Developer package and standalone host | [Installation](workerd-runtime/installation.md) |
+| Operator mode choice, migration and rollback | [Execution modes](workerd-runtime/execution-modes.md) |
+| Park, resume and recovery | [Checkpoints](workerd-runtime/checkpoints.md) |
+| Service grants and secret-free credentials | [Capabilities](workerd-runtime/capabilities.md) |
+| Streaming and bounded load evidence | [Qualification](workerd-runtime/qualification.md) |
+| Present the existing demos | [Demo index](#demo-index), [choose a demo](#3-choose-a-demo) |
+
 ## 1. Clone and check KVM
 
 ```bash
@@ -18,6 +30,29 @@ Your user must be able to use `/dev/kvm` and Docker. Run the setup script as
 that user, not with `sudo`; it invokes `sudo` only for apt. The script keeps
 Rustup and Cargo in writable user directories (normally `~/.rustup` and
 `~/.cargo`) and installs Ubuntu's `docker.io` and `containerd` packages.
+
+Reuse existing caches; do not clear or relocate active outputs. Native Cargo
+uses the shared `~/.cargo/{registry,git}` download caches while this project's
+compiled `target/` remains project/target/toolchain/profile specific. Native
+Node uses the shared npm download cache (normally `~/.npm`), but each scaffold
+keeps its own `node_modules` and generated output.
+
+The setup recipe shares Bazel repository downloads and content-addressed
+action data with native builds:
+
+```bash
+export WORKERD_BAZEL_SHARED_CACHE="$HOME/.cache/bazel/_bazel_$(id -un)/cache"
+export WORKERD_BAZEL_REPOSITORY_CACHE="$WORKERD_BAZEL_SHARED_CACHE/repos/v1"
+```
+
+The corresponding native Bazel flags are `--disk_cache` and
+`--repository_cache`; keep the populated cache root. Builder output bases
+remain namespaced by the exact Docker builder image ID, not shared blindly
+across mismatched toolchains/profiles. Docker builds run as the host UID/GID
+so they do not make shared native cache entries unwritable. Existing BuildKit
+layers are retained. A cache hit requires matching real action keys; changing
+FASTBUILD/Rust-I/O to the shipping `opt`/`strip=always`/C++-I/O profile changes
+many keys and is not evidence of a broken cache.
 
 If Docker CE packages such as `containerd.io`, `docker-ce`, or
 `docker-ce-cli` are already installed, remove them before using
@@ -64,6 +99,16 @@ This checks out the matching Workerd fork, builds both projects, and prepares
 the demos. Omit `--install-deps` when the build tools are already installed.
 `just setup-workerd-demo` runs the same script from a checkout with `just`
 installed.
+
+### Standalone developer and operator walkthroughs
+
+Start with the focused pages rather than a single long script/log:
+
+- [Install and load an immutable package](workerd-runtime/installation.md)
+- [Choose modes, invoke events, and migrate or roll back](workerd-runtime/execution-modes.md)
+- [Park/resume, durable recovery and ownership](workerd-runtime/checkpoints.md)
+- [Authorize capabilities and host-only credential references](workerd-runtime/capabilities.md)
+- [Streaming, tested guarantees and bounded load](workerd-runtime/qualification.md)
 
 ## 3. Choose a demo
 

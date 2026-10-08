@@ -6,17 +6,31 @@
 mod tcp_tls;
 mod udp;
 mod websocket;
+pub(crate) use websocket::WebSocketTransport;
 
 use crate::broker::{
     BrokerContractError, BrokerEndpoint, BrokerLimits, BrokerOperation, BrokerPolicy, DnsPolicy,
-    EndpointHost, RequestIdentity, is_host_local_ip,
+    EndpointHost, RequestIdentity,
 };
 use crate::broker_adapter::{BrokerAdapter, BrokerExecution, BrokerExecutor, BrokerHostError};
 use crate::broker_runtime::BrokerRuntime;
 use std::collections::HashMap;
+use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+
+static DNS_LOOKUPS: AtomicUsize = AtomicUsize::new(0);
+const MAX_DNS_LOOKUPS: usize = 32;
+
+struct DnsAdmission;
+impl Drop for DnsAdmission {
+    fn drop(&mut self) {
+        DNS_LOOKUPS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// Host-owned settings for the concrete outbound network broker.
 #[derive(Clone, Debug)]
@@ -115,10 +129,68 @@ impl NetworkBroker {
 }
 
 enum NetworkResource {
-    Tcp(std::net::TcpStream),
-    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>>),
+    Tcp(DeadlineTcpStream),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, DeadlineTcpStream>>),
     Udp(std::net::UdpSocket),
     WebSocket(Box<tungstenite::WebSocket<websocket::WebSocketTransport>>),
+}
+
+pub(crate) struct DeadlineTcpStream {
+    inner: std::net::TcpStream,
+    deadline: Arc<Mutex<Option<Instant>>>,
+    io_timeout: Duration,
+}
+impl DeadlineTcpStream {
+    fn configure(&self) -> std::io::Result<()> {
+        let deadline = *self
+            .deadline
+            .lock()
+            .map_err(|_| std::io::Error::other("network deadline state poisoned"))?;
+        let timeout = deadline.map_or(self.io_timeout, |deadline| {
+            self.io_timeout
+                .min(deadline.saturating_duration_since(Instant::now()))
+        });
+        if timeout.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "admitted network deadline exceeded",
+            ));
+        }
+        self.inner.set_read_timeout(Some(timeout))?;
+        self.inner.set_write_timeout(Some(timeout))
+    }
+}
+impl Read for DeadlineTcpStream {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.configure()?;
+        self.inner.read(buffer)
+    }
+}
+impl Write for DeadlineTcpStream {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.configure()?;
+        self.inner.write(buffer)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.configure()?;
+        self.inner.flush()
+    }
+}
+
+pub(crate) fn provider_tls_transport(
+    config: &NetworkBrokerConfig,
+    endpoint: &BrokerEndpoint,
+    deadline: Instant,
+) -> Result<WebSocketTransport, BrokerHostError> {
+    let executor = NetworkExecutor::new(config);
+    *executor
+        .deadline
+        .lock()
+        .map_err(|_| BrokerHostError::new("deadline_poisoned"))? = Some(deadline);
+    let tcp = tcp_tls::connect(&executor, endpoint)?;
+    Ok(WebSocketTransport::Tls(Box::new(websocket::tls(
+        &executor, endpoint, tcp,
+    )?)))
 }
 
 struct NetworkExecutor {
@@ -130,6 +202,7 @@ struct NetworkExecutor {
     max_message_bytes: usize,
     next_handle: u64,
     resources: HashMap<u64, NetworkResource>,
+    deadline: Arc<Mutex<Option<Instant>>>,
 }
 
 impl NetworkExecutor {
@@ -144,6 +217,7 @@ impl NetworkExecutor {
                 .unwrap_or(usize::MAX),
             next_handle: 1,
             resources: HashMap::new(),
+            deadline: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -160,6 +234,51 @@ impl NetworkExecutor {
     fn dns_policy(&self) -> &DnsPolicy {
         self.policy.dns()
     }
+
+    fn remaining_timeout(&self, configured: Duration) -> Result<Duration, BrokerHostError> {
+        match *self
+            .deadline
+            .lock()
+            .map_err(|_| BrokerHostError::new("deadline_poisoned"))?
+        {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(BrokerHostError::new("execution_deadline"));
+                }
+                Ok(configured.min(remaining))
+            }
+            None => Ok(configured),
+        }
+    }
+
+    fn retime_resources(&self) -> Result<(), BrokerHostError> {
+        let timeout = self.remaining_timeout(self.io_timeout)?;
+        let tcp = |stream: &DeadlineTcpStream| -> Result<(), BrokerHostError> {
+            stream
+                .inner
+                .set_read_timeout(Some(timeout))
+                .and_then(|()| stream.inner.set_write_timeout(Some(timeout)))
+                .map_err(|_| BrokerHostError::new("stream_configuration"))
+        };
+        for resource in self.resources.values() {
+            match resource {
+                NetworkResource::Tcp(stream) => tcp(stream)?,
+                NetworkResource::Tls(stream) => tcp(&stream.sock)?,
+                NetworkResource::Udp(socket) => {
+                    socket
+                        .set_read_timeout(Some(timeout))
+                        .and_then(|()| socket.set_write_timeout(Some(timeout)))
+                        .map_err(|_| BrokerHostError::new("udp_configuration"))?;
+                }
+                NetworkResource::WebSocket(socket) => match socket.get_ref() {
+                    websocket::WebSocketTransport::Tcp(stream) => tcp(stream)?,
+                    websocket::WebSocketTransport::Tls(stream) => tcp(&stream.sock)?,
+                },
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Mozilla WebPKI roots used by the default host TLS policy.
@@ -168,7 +287,24 @@ pub fn default_tls_roots() -> rustls::RootCertStore {
 }
 
 impl BrokerExecutor for NetworkExecutor {
+    fn checkpoint_next_handle(&self) -> Option<u64> {
+        Some(self.next_handle)
+    }
+    fn restore_next_handle(&mut self, next: u64) -> Result<(), BrokerHostError> {
+        if next == 0 || !self.resources.is_empty() {
+            return Err(BrokerHostError::new("invalid_handle_watermark"));
+        }
+        self.next_handle = next;
+        Ok(())
+    }
+    fn set_deadline(&mut self, deadline: Instant) {
+        *self
+            .deadline
+            .lock()
+            .expect("network deadline state poisoned") = Some(deadline);
+    }
     fn execute(&mut self, operation: &BrokerOperation) -> Result<BrokerExecution, BrokerHostError> {
+        self.retime_resources()?;
         match operation {
             BrokerOperation::TcpConnect { endpoint } => tcp_tls::connect_tcp(self, endpoint),
             BrokerOperation::TlsConnect { endpoint, profile } => {
@@ -224,7 +360,6 @@ impl BrokerExecutor for NetworkExecutor {
 
     fn reset_for_fresh_vm(&mut self) -> Result<(), BrokerHostError> {
         self.resources.clear();
-        self.next_handle = 1;
         Ok(())
     }
 }
@@ -241,16 +376,47 @@ fn resolve(
             {
                 return Err(BrokerHostError::new("dns_denied"));
             }
-            (name.as_str(), endpoint.port())
-                .to_socket_addrs()
-                .map_err(|_| BrokerHostError::new("dns_failed"))?
-                .collect()
+            if DNS_LOOKUPS
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                    (active < MAX_DNS_LOOKUPS).then_some(active + 1)
+                })
+                .is_err()
+            {
+                return Err(BrokerHostError::new("dns_overloaded"));
+            }
+            let admission = DnsAdmission;
+            let name = name.as_str().to_string();
+            let port = endpoint.port();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::Builder::new()
+                .name("broker-dns".into())
+                .spawn(move || {
+                    let _admission = admission;
+                    let result = (name.as_str(), port)
+                        .to_socket_addrs()
+                        .map(|addresses| addresses.take(65).collect::<Vec<_>>());
+                    if sender.send(result).is_err() {
+                        tracing::debug!("broker DNS deadline elapsed");
+                    }
+                })
+                .map_err(|_| BrokerHostError::new("dns_unavailable"))?;
+            let addresses = receiver
+                .recv_timeout(executor.remaining_timeout(executor.connect_timeout)?)
+                .map_err(|_| BrokerHostError::new("dns_deadline"))?
+                .map_err(|_| BrokerHostError::new("dns_failed"))?;
+            if addresses.len() > 64 {
+                return Err(BrokerHostError::new("dns_answer_limit"));
+            }
+            addresses
         }
     };
-    let mut allowed: Vec<_> = addresses
-        .into_iter()
-        .filter(|address| !is_host_local_ip(address.ip()))
-        .collect();
+    if addresses
+        .iter()
+        .any(|address| !executor.policy.address_allowed(address.ip()))
+    {
+        return Err(BrokerHostError::new("resolved_address_denied"));
+    }
+    let mut allowed = addresses;
     if allowed.is_empty() {
         return Err(BrokerHostError::new("resolved_address_denied"));
     }

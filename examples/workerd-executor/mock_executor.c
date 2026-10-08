@@ -292,7 +292,8 @@ static int dispatch(const uint8_t *fc, size_t fc_len)
 	if (fc_name_is(fc, fc_len, "init")) {
 		if (len > 60 * 1024 ||
 		    (!strstr(arg, "\"protocol_version\":1") &&
-		     !strstr(arg, "\"protocol_version\":2")) ||
+		     !strstr(arg, "\"protocol_version\":2") &&
+		     !strstr(arg, "\"protocol_version\":3")) ||
 		    !strstr(arg, "\"worker_version\":") ||
 		    !strstr(arg, "\"main_module\":") ||
 		    !strstr(arg, "\"modules\":"))
@@ -300,9 +301,12 @@ static int dispatch(const uint8_t *fc, size_t fc_len)
 		initialized = 1;
 		return 0;
 	}
-	if (!initialized || !fc_name_is(fc, fc_len, "fetch"))
+	int scheduled = fc_name_is(fc, fc_len, "scheduled");
+	int queue = fc_name_is(fc, fc_len, "queue");
+	int capabilities = fc_name_is(fc, fc_len, "runtime_capabilities");
+	int checkpoint = fc_name_is(fc, fc_len, "checkpoint");
+	if (!initialized || (!fc_name_is(fc, fc_len, "fetch") && !scheduled && !queue && !capabilities && !checkpoint))
 		return -1;
-	fetch_count++;
 	char *json = strndup(arg, len);
 	if (!json)
 		return -1;
@@ -320,6 +324,25 @@ static int dispatch(const uint8_t *fc, size_t fc_len)
 	}
 	memcpy(id, start, n);
 	id[n] = 0;
+	if (capabilities || checkpoint) {
+		if (capabilities)
+			printf("{\"protocol_version\":1,\"request_id\":\"%s\",\"extensions\":[\"tracked-work-drain-v1\",\"safe-point-v1\"],\"max_frame_bytes\":16384}\n", id);
+		else
+			printf("{\"protocol_version\":1,\"request_id\":\"%s\",\"quiescent\":true,\"active_invocations\":0,\"active_streams\":0,\"active_websockets\":0,\"active_tasks\":0}\n", id);
+		fflush(stdout);
+		free(json);
+		return 0;
+	}
+	fetch_count++;
+	if (scheduled || queue) {
+		if (scheduled)
+			printf("{\"protocol_version\":1,\"request_id\":\"%s\",\"outcome\":\"ok\",\"retry\":false}\n", id);
+		else
+			printf("{\"protocol_version\":1,\"request_id\":\"%s\",\"outcome\":\"ok\",\"ack_all\":true,\"retry_batch\":{\"retry\":false,\"delay_seconds\":null},\"explicit_acks\":[],\"retry_messages\":[]}\n", id);
+		fflush(stdout);
+		free(json);
+		return 0;
+	}
 	if (strstr(json, "/busy\"")) {
 		for (;;)
 			__asm__ volatile("" ::: "memory");

@@ -192,7 +192,7 @@ fn real_guest_storage_policy_enforces_modes_confinement_quotas_and_reset() {
     assert!(
         error
             .to_string()
-            .contains("snapshot storage policy binding mismatch")
+            .contains("snapshot capability policy binding mismatch")
     );
 }
 

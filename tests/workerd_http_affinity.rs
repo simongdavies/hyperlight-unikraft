@@ -83,6 +83,8 @@ fn resident_app(
         }),
         connection_affinity: affinity,
         snapshot_dir: None,
+        instance_home: None,
+        streaming: false,
     }
 }
 
@@ -224,8 +226,6 @@ mod signal {
 
 #[cfg(unix)]
 mod signal {
-    pub const CREATE_NEW_PROCESS_GROUP: u32 = 0;
-
     pub fn send_graceful_shutdown(pid: u32) {
         let status = std::process::Command::new("kill")
             .args(["-TERM", &pid.to_string()])

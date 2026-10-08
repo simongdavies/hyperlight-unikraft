@@ -2,9 +2,10 @@
 // Copyright 2026 The Hyperlight Authors.
 
 use super::{
-    Error, FetchBroker, QueueRequest, QueueResponse, RequestEnvelope, ResponseEnvelope, Result,
-    ScheduledRequest, ScheduledResponse, SnapshotBinding, TimerLimits, VerifiedSnapshot,
-    WorkerBinding, WorkerBundle, WorkerVersionId, snapshot::kernel_for_rootfs, timer::TimerBroker,
+    Error, FetchBroker, InvocationCancellation, InvocationRequest, InvocationResponse,
+    QueueRequest, QueueResponse, RequestEnvelope, ResponseEnvelope, Result, ScheduledRequest,
+    ScheduledResponse, SnapshotBinding, TimerLimits, VerifiedSnapshot, WorkerBinding, WorkerBundle,
+    WorkerVersionId, snapshot::kernel_for_rootfs, timer::TimerBroker,
 };
 use crate::{AppSandbox, Mount, MountLimits, Yield, broker_runtime::BrokerRuntime};
 use hyperlight_host::func::Registerable;
@@ -63,7 +64,116 @@ struct RequestState {
 }
 
 #[derive(Clone, Default)]
-struct Responses(Arc<Mutex<RequestState>>);
+struct Responses(Arc<Mutex<RequestState>>, super::ingress::IngressSession);
+
+fn read_entropy(amount: u64) -> hyperlight_host::Result<Vec<u8>> {
+    use ring::rand::SecureRandom;
+    let amount = usize::try_from(amount)
+        .ok()
+        .filter(|amount| (1..=16_384).contains(amount))
+        .ok_or_else(|| hyperlight_host::new_error!("entropy read must be 1..16384 bytes"))?;
+    let mut bytes = vec![0; amount];
+    ring::rand::SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| hyperlight_host::new_error!("host OS entropy unavailable"))?;
+    Ok(bytes)
+}
+
+fn register_entropy(target: &mut impl Registerable) -> Result<()> {
+    target.register_host_function("WorkerdEntropyV1Read", read_entropy)?;
+    Ok(())
+}
+
+fn register_provider_websockets(
+    target: &mut impl Registerable,
+    runtime: &BrokerRuntime,
+) -> Result<()> {
+    if runtime.has_provider_websockets() {
+        for function in [
+            "WorkerdWebSocketV1Open",
+            "WorkerdWebSocketV1Send",
+            "WorkerdWebSocketV1Receive",
+            "WorkerdWebSocketV1Close",
+        ] {
+            let runtime = runtime.clone();
+            target.register_host_function(
+                function,
+                move |payload: String| -> hyperlight_host::Result<String> {
+                    runtime
+                        .dispatch_provider_websocket(function, &payload)
+                        .map_err(|error| hyperlight_host::new_error!("{error}"))
+                },
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn drive_control_call<T: serde::de::DeserializeOwned>(
+    app: &mut AppSandbox,
+    responses: &Responses,
+    sessions: (super::fetch::FetchSession, super::timer::TimerSession),
+    function: &str,
+    request_id: &str,
+    deadline: Instant,
+    cancellation: InvocationCancellation,
+) -> Result<T> {
+    let request = super::ControlRequest::new(request_id)?;
+    let encoded = serde_json::to_string(&request)?;
+    responses.begin(request_id)?;
+    let result = with_watchdog_cancellable(
+        app,
+        deadline,
+        Some(sessions),
+        cancellation,
+        |app, deadline| {
+            app.resume()?;
+            drive_call(app, function, encoded, deadline)
+        },
+    );
+    match result {
+        Ok(()) => super::control::decode(responses.finish_raw()?.as_bytes()),
+        Err(error) => {
+            responses.clear()?;
+            match error {
+                Error::Guest(crate::Error::CallFailed { status }) => Err(Error::State(format!(
+                    "guest control {function} failed with status {status}"
+                ))),
+                error => Err(error),
+            }
+        }
+    }
+}
+
+fn validate_guest_completion(
+    app: &mut AppSandbox,
+    responses: &Responses,
+    sessions: (super::fetch::FetchSession, super::timer::TimerSession),
+    deadline: Instant,
+    cancellation: InvocationCancellation,
+) -> Result<()> {
+    let capabilities: super::GuestCapabilities = drive_control_call(
+        app,
+        responses,
+        sessions.clone(),
+        "runtime_capabilities",
+        "completion-capabilities",
+        deadline,
+        cancellation.clone(),
+    )?;
+    capabilities.validate("completion-capabilities", "safe-point-v1")?;
+    capabilities.validate("completion-capabilities", "tracked-work-drain-v1")?;
+    let safe: super::SafePoint = drive_control_call(
+        app,
+        responses,
+        sessions,
+        "checkpoint",
+        "invocation-completion",
+        deadline,
+        cancellation,
+    )?;
+    safe.validate("invocation-completion")
+}
 
 impl Responses {
     fn begin(&self, id: &str) -> Result<()> {
@@ -192,6 +302,33 @@ impl Responses {
         QueueResponse::from_json(self.finish_raw()?.as_bytes())
     }
 
+    fn finish_invocation(&self, function: &str) -> Result<InvocationResponse> {
+        match function {
+            "fetch" => self.finish_fetch().map(InvocationResponse::Fetch),
+            "scheduled" => self.finish_scheduled().map(InvocationResponse::Scheduled),
+            "queue" => self.finish_queue().map(InvocationResponse::Queue),
+            _ => Err(Error::State("unsupported invocation response kind".into())),
+        }
+    }
+
+    fn finish_stream(&self) -> Result<()> {
+        let completed = std::mem::take(
+            &mut *self
+                .0
+                .lock()
+                .map_err(|_| Error::State("response mutex poisoned".into()))?,
+        );
+        if completed.violation.is_some()
+            || completed.response.is_some()
+            || !completed.bytes.is_empty()
+        {
+            return Err(Error::Protocol(
+                "streaming invocation emitted buffered stdout response".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn clear(&self) -> Result<()> {
         *self
             .0
@@ -201,6 +338,7 @@ impl Responses {
     }
 
     fn register(&self, target: &mut impl Registerable) -> Result<()> {
+        self.1.register(target)?;
         target.register_host_function("ReadStdin", || -> hyperlight_host::Result<String> {
             Err(hyperlight_host::new_error!(
                 "workerd has no stdin capability"
@@ -254,6 +392,8 @@ pub struct WorkerVersionSandbox {
     storage_policy: StoragePolicy,
     broker_runtime: Option<BrokerRuntime>,
     capability_policy_sha256: String,
+    logical_policy: Option<super::LogicalBindingsPolicy>,
+    allow_instance_checkpoint: bool,
 }
 
 const STORAGE_GUEST_ROOT: &str = "/mnt/workerd-storage";
@@ -347,7 +487,8 @@ impl StoragePolicy {
     }
 
     pub fn new(bindings: impl IntoIterator<Item = StorageBinding>) -> Result<Self> {
-        let bindings: Vec<_> = bindings.into_iter().collect();
+        let mut bindings: Vec<_> = bindings.into_iter().collect();
+        bindings.sort_by(|left, right| left.name.cmp(&right.name));
         if bindings.len() > MAX_STORAGE_BINDINGS {
             return Err(Error::State(format!(
                 "storage policy supports at most {MAX_STORAGE_BINDINGS} bindings"
@@ -417,6 +558,7 @@ pub struct WorkerCapabilityPolicy {
     storage_policy: StoragePolicy,
     broker_runtime: Option<BrokerRuntime>,
     bindings: Vec<WorkerBinding>,
+    logical_policy: Option<super::LogicalBindingsPolicy>,
 }
 
 impl WorkerCapabilityPolicy {
@@ -431,6 +573,7 @@ impl WorkerCapabilityPolicy {
             storage_policy,
             broker_runtime: None,
             bindings: Vec::new(),
+            logical_policy: None,
         }
     }
 
@@ -439,6 +582,11 @@ impl WorkerCapabilityPolicy {
         broker_runtime: BrokerRuntime,
         bindings: impl IntoIterator<Item = WorkerBinding>,
     ) -> Result<Self> {
+        if self.logical_policy.is_some() {
+            return Err(Error::State(
+                "cannot mix typed reconstruction policy with opaque callbacks".into(),
+            ));
+        }
         let mut bindings: Vec<_> = bindings.into_iter().collect();
         bindings.sort_by(|left, right| left.name.cmp(&right.name));
         if bindings.is_empty() {
@@ -465,10 +613,39 @@ impl WorkerCapabilityPolicy {
         Ok(self)
     }
 
+    pub fn with_logical_bindings(mut self, policy: super::LogicalBindingsPolicy) -> Result<Self> {
+        if self.broker_runtime.is_some() {
+            return Err(Error::State(
+                "cannot mix opaque runtime with reconstructable logical policy".into(),
+            ));
+        }
+        self.bindings = policy.worker_bindings();
+        self.logical_policy = Some(policy);
+        Ok(self)
+    }
+
     pub(super) fn sha256(&self) -> String {
         let mut digest = Sha256::new();
-        digest.update(b"workerd-capability-policy:v2\0");
+        digest.update(b"workerd-capability-policy:v3\0");
+        digest.update(self.fetch_broker.policy_identity().as_bytes());
+        digest.update(b"\0");
+        digest.update(self.timer_limits.max_active_timers.to_le_bytes());
+        digest.update(self.timer_limits.max_unreleased_handles.to_le_bytes());
         digest.update(self.storage_policy.sha256().as_bytes());
+        if let Some(policy) = &self.logical_policy {
+            digest.update(b"\0logical-policy\0");
+            digest.update(policy.authority().as_bytes());
+        }
+        if let Some(runtime) = &self.broker_runtime {
+            // Opaque legacy callbacks are intentionally process-bound. They
+            // cannot be persisted/reconstructed as an equivalent host policy.
+            digest.update(b"\0opaque-runtime\0");
+            digest.update(runtime.opaque_authority_identity().as_bytes());
+            digest.update([
+                u8::from(runtime.has_network()),
+                u8::from(runtime.has_logical()),
+            ]);
+        }
         digest.update(b"\0");
         for binding in &self.bindings {
             digest.update(binding.name.as_bytes());
@@ -528,6 +705,9 @@ fn validate_storage_limits(limits: MountLimits) -> Result<()> {
 pub(super) struct RestoredWorkerVersionSandbox {
     app: AppSandbox,
     responses: Responses,
+    broker_runtime: Option<BrokerRuntime>,
+    use_invoke_v2: bool,
+    reset_broker_per_invocation: bool,
     fetch_session: super::fetch::FetchSession,
     timer_session: super::timer::TimerSession,
 }
@@ -671,6 +851,7 @@ impl WorkerVersionSandbox {
             storage_policy,
             broker_runtime,
             bindings,
+            logical_policy,
         } = policy;
         let policy_sha256 = WorkerCapabilityPolicy {
             fetch_broker: fetch_broker.clone(),
@@ -678,6 +859,7 @@ impl WorkerVersionSandbox {
             storage_policy: storage_policy.clone(),
             broker_runtime: broker_runtime.clone(),
             bindings: bindings.clone(),
+            logical_policy: logical_policy.clone(),
         }
         .sha256();
         let mut profile = InitializationProfile::default();
@@ -693,7 +875,12 @@ impl WorkerVersionSandbox {
         let started = Instant::now();
         let kernel = kernel_for_rootfs(rootfs.as_ref())
             .map_err(|error| Self::initialization_failure("binding", error, &profile))?;
-        let init_json = if storage_policy.bindings().is_empty() && bindings.is_empty() {
+        let bundle_reader = super::bundle::BundleReader::new(&bundle)
+            .map_err(|error| Self::initialization_failure("binding", error, &profile))?;
+        let init_json = if bundle.protocol_version != super::PACKAGE_PROTOCOL_VERSION
+            && storage_policy.bindings().is_empty()
+            && bindings.is_empty()
+        {
             bundle.to_canonical_json()
         } else {
             bundle.to_executor_init_json_with_bindings(
@@ -723,6 +910,11 @@ impl WorkerVersionSandbox {
         )
         .map_err(|error| Self::initialization_failure("assemble", error, &profile))?;
         responses
+            .register(&mut uninitialized)
+            .map_err(|error| Self::initialization_failure("assemble", error, &profile))?;
+        register_entropy(&mut uninitialized)
+            .map_err(|error| Self::initialization_failure("assemble", error, &profile))?;
+        bundle_reader
             .register(&mut uninitialized)
             .map_err(|error| Self::initialization_failure("assemble", error, &profile))?;
         let init_deadline =
@@ -774,6 +966,7 @@ impl WorkerVersionSandbox {
         let started = Instant::now();
         timed_call(&mut app, "init", init_json, timeout)
             .map_err(|error| Self::initialization_failure("init", error, &profile))?;
+        bundle_reader.close();
         profile.init_ms = Self::elapsed_ms(started);
         let started = Instant::now();
         let snapshot = app
@@ -789,6 +982,8 @@ impl WorkerVersionSandbox {
                 storage_policy,
                 broker_runtime,
                 capability_policy_sha256: policy_sha256,
+                logical_policy,
+                allow_instance_checkpoint: false,
             },
             profile,
         ))
@@ -811,7 +1006,7 @@ impl WorkerVersionSandbox {
     }
 
     pub fn from_verified_snapshot(image: VerifiedSnapshot) -> Self {
-        let capability_policy_sha256 = image.binding().capability_policy_sha256().into();
+        let capability_policy_sha256 = WorkerCapabilityPolicy::default().sha256();
         Self {
             image,
             fetch_broker: FetchBroker::denied(),
@@ -819,6 +1014,8 @@ impl WorkerVersionSandbox {
             storage_policy: StoragePolicy::denied(),
             broker_runtime: None,
             capability_policy_sha256,
+            logical_policy: None,
+            allow_instance_checkpoint: false,
         }
     }
 
@@ -826,7 +1023,12 @@ impl WorkerVersionSandbox {
         image: VerifiedSnapshot,
         fetch_broker: FetchBroker,
     ) -> Self {
-        let capability_policy_sha256 = image.binding().capability_policy_sha256().into();
+        let capability_policy_sha256 = WorkerCapabilityPolicy::new(
+            fetch_broker.clone(),
+            TimerLimits::default(),
+            StoragePolicy::denied(),
+        )
+        .sha256();
         Self {
             image,
             fetch_broker,
@@ -834,6 +1036,8 @@ impl WorkerVersionSandbox {
             storage_policy: StoragePolicy::denied(),
             broker_runtime: None,
             capability_policy_sha256,
+            logical_policy: None,
+            allow_instance_checkpoint: false,
         }
     }
 
@@ -873,6 +1077,8 @@ impl WorkerVersionSandbox {
             storage_policy,
             broker_runtime: None,
             capability_policy_sha256: policy.sha256(),
+            logical_policy: None,
+            allow_instance_checkpoint: false,
         })
     }
 
@@ -901,7 +1107,9 @@ impl WorkerVersionSandbox {
         executor: impl AsRef<Path>,
         policy: WorkerCapabilityPolicy,
     ) -> Result<Self> {
-        if policy.broker_runtime.is_some() || !policy.bindings.is_empty() {
+        if policy.broker_runtime.is_some()
+            || (!policy.bindings.is_empty() && policy.logical_policy.is_none())
+        {
             return Err(Error::Snapshot(
                 "snapshot_dir restore does not support a broker runtime or Workerd bindings".into(),
             ));
@@ -910,6 +1118,18 @@ impl WorkerVersionSandbox {
         let expected =
             SnapshotBinding::from_artifacts_with_policy(bundle, rootfs, executor, policy_sha256)?;
         let image = VerifiedSnapshot::open(snapshot_dir, &expected)?;
+        if policy.logical_policy.is_some() {
+            return Ok(Self {
+                image,
+                fetch_broker: policy.fetch_broker,
+                timer_broker: TimerBroker::new(policy.timer_limits)?,
+                storage_policy: policy.storage_policy,
+                broker_runtime: None,
+                capability_policy_sha256: expected.capability_policy_sha256().into(),
+                logical_policy: policy.logical_policy,
+                allow_instance_checkpoint: false,
+            });
+        }
         Self::from_verified_snapshot_with_storage(
             image,
             policy.fetch_broker,
@@ -920,6 +1140,28 @@ impl WorkerVersionSandbox {
 
     pub fn snapshot(&self) -> &VerifiedSnapshot {
         &self.image
+    }
+
+    pub fn negotiate_extensions(&self, required: &[&str], timeout: Duration) -> Result<()> {
+        self.negotiated_extensions(required, timeout).map(|_| ())
+    }
+
+    pub(super) fn negotiated_extensions(
+        &self,
+        required: &[&str],
+        timeout: Duration,
+    ) -> Result<super::GuestCapabilities> {
+        let started = Instant::now();
+        let (mut restored, _) = self.restore()?;
+        let deadline = started
+            .checked_add(timeout)
+            .ok_or_else(|| Error::State("capability admission deadline too large".into()))?;
+        let capabilities: super::GuestCapabilities =
+            restored.control_call("runtime_capabilities", "admitted-capabilities", deadline)?;
+        for required in required {
+            capabilities.validate("admitted-capabilities", required)?;
+        }
+        Ok(capabilities)
     }
 
     pub fn worker_version(&self) -> &WorkerVersionId {
@@ -941,6 +1183,21 @@ impl WorkerVersionSandbox {
         request: ScheduledRequest,
         timeout: Duration,
     ) -> Result<ScheduledResponse> {
+        if self.image.binding().bundle_protocol_version() == super::PACKAGE_PROTOCOL_VERSION {
+            return self
+                .execute_invocation_profiled(
+                    version,
+                    InvocationRequest::Scheduled(request),
+                    timeout,
+                )
+                .0
+                .and_then(|response| match response {
+                    InvocationResponse::Scheduled(response) => Ok(response),
+                    _ => Err(Error::Protocol(
+                        "wrong budgeted scheduled response kind".into(),
+                    )),
+                });
+        }
         if version != self.worker_version() {
             return Err(Error::State(
                 "sandbox cannot be reassigned across Worker versions".into(),
@@ -956,6 +1213,15 @@ impl WorkerVersionSandbox {
         request: QueueRequest,
         timeout: Duration,
     ) -> Result<QueueResponse> {
+        if self.image.binding().bundle_protocol_version() == super::PACKAGE_PROTOCOL_VERSION {
+            return self
+                .execute_invocation_profiled(version, InvocationRequest::Queue(request), timeout)
+                .0
+                .and_then(|response| match response {
+                    InvocationResponse::Queue(response) => Ok(response),
+                    _ => Err(Error::Protocol("wrong budgeted queue response kind".into())),
+                });
+        }
         if version != self.worker_version() {
             return Err(Error::State(
                 "sandbox cannot be reassigned across Worker versions".into(),
@@ -971,6 +1237,11 @@ impl WorkerVersionSandbox {
         request: RequestEnvelope,
         timeout: Duration,
     ) -> (Result<ResponseEnvelope>, ExecutionProfile) {
+        if self.image.binding().bundle_protocol_version() == super::PACKAGE_PROTOCOL_VERSION {
+            let (result, profile) =
+                self.execute_invocation_profiled(version, request.into(), timeout);
+            return (result.and_then(InvocationResponse::into_fetch), profile);
+        }
         let total_started = Instant::now();
         let mut profile = ExecutionProfile::default();
         if version != self.worker_version() {
@@ -996,6 +1267,75 @@ impl WorkerVersionSandbox {
         (result, execution_profile)
     }
 
+    pub fn execute_invocation_profiled(
+        &self,
+        version: &WorkerVersionId,
+        request: InvocationRequest,
+        timeout: Duration,
+    ) -> (Result<InvocationResponse>, ExecutionProfile) {
+        self.execute_invocation_cancellable(
+            version,
+            request,
+            timeout,
+            InvocationCancellation::default(),
+        )
+    }
+
+    pub fn execute_invocation_cancellable(
+        &self,
+        version: &WorkerVersionId,
+        request: InvocationRequest,
+        timeout: Duration,
+        cancellation: InvocationCancellation,
+    ) -> (Result<InvocationResponse>, ExecutionProfile) {
+        let started = Instant::now();
+        if version != self.worker_version() {
+            return (
+                Err(Error::State(
+                    "sandbox cannot be reassigned across Worker versions".into(),
+                )),
+                ExecutionProfile::default(),
+            );
+        }
+        if cancellation.is_cancelled() {
+            return (Err(Error::Cancelled), ExecutionProfile::default());
+        }
+        if timeout.is_zero() {
+            return (Err(Error::Timeout), ExecutionProfile::default());
+        }
+        let (restored, restore_ms) = match self.restore() {
+            Ok(restored) => restored,
+            Err(error) => return (Err(error), ExecutionProfile::default()),
+        };
+        let (result, mut profile) = restored.execute_invocation_with_teardown_observer(
+            request,
+            timeout.saturating_sub(started.elapsed()),
+            started,
+            cancellation,
+            || {},
+            || {},
+        );
+        profile.snapshot_restore_ms = restore_ms;
+        (result, profile)
+    }
+
+    pub fn execute_stream(
+        &self,
+        request: RequestEnvelope,
+        websocket: bool,
+        ingress: super::GuestIngress,
+        timeout: Duration,
+    ) -> Result<()> {
+        let started = Instant::now();
+        let (mut restored, _) = self.restore()?;
+        restored.execute_stream(
+            request,
+            websocket,
+            ingress,
+            timeout.saturating_sub(started.elapsed()),
+        )
+    }
+
     /// Restore one VM from the snapshot and hand it back as a
     /// [`super::resident::ResidentWorkerSandbox`] the caller can execute
     /// more than once against, instead of the disposable, single-call
@@ -1003,14 +1343,79 @@ impl WorkerVersionSandbox {
     /// or any disposable call path.
     pub fn restore_resident(&self) -> Result<super::resident::ResidentWorkerSandbox> {
         let (restored, restore_ms) = self.restore()?;
-        Ok(super::resident::ResidentWorkerSandbox::new(
+        super::resident::ResidentWorkerSandbox::new(
             restored,
-            self.worker_version().clone(),
+            self.image.binding().clone(),
             restore_ms,
-        ))
+        )
+    }
+
+    pub(super) fn checkpoint_binding(&self) -> Result<SnapshotBinding> {
+        if self.broker_runtime.is_some() {
+            return Err(Error::Snapshot(
+                "resident checkpoint requires an explicit reconstruction policy for an opaque broker runtime".into(),
+            ));
+        }
+        Ok(self.image.binding().clone())
+    }
+
+    pub fn restore_resident_checkpoint(
+        &self,
+        checkpoint: &VerifiedSnapshot,
+    ) -> Result<super::resident::ResidentWorkerSandbox> {
+        self.checkpoint_binding()?;
+        if checkpoint.binding() != self.image.binding() {
+            return Err(Error::Snapshot(
+                "instance checkpoint revision, target or capability policy mismatch".into(),
+            ));
+        }
+        let mut worker = self.clone();
+        worker.image = checkpoint.clone();
+        worker.allow_instance_checkpoint = true;
+        let mut resident = worker.restore_resident()?;
+        let super::snapshot::SnapshotPurpose::Instance {
+            identity,
+            host_state,
+        } = &checkpoint.purpose
+        else {
+            return Err(Error::Snapshot(
+                "cannot resume an initialized template as a logical instance checkpoint".into(),
+            ));
+        };
+        resident.restore_host_state(identity.clone(), host_state.requests_served);
+        Ok(resident)
+    }
+
+    pub fn resume_checkpoint_claim(
+        &self,
+        store: &super::CheckpointStore,
+        claim: super::CheckpointClaim,
+    ) -> Result<super::ResidentWorkerSandbox> {
+        let mut resident = match self.restore_resident_checkpoint(claim.snapshot()) {
+            Ok(resident) => resident,
+            Err(error) => {
+                store.fail(&claim)?;
+                return Err(error);
+            }
+        };
+        resident.retain_checkpoint_layout(claim.layout());
+        resident.set_identity(claim.identity.clone());
+        store.activate(&claim)?;
+        Ok(resident)
     }
 
     pub(super) fn restore(&self) -> Result<(RestoredWorkerVersionSandbox, f64)> {
+        if !self.allow_instance_checkpoint
+            && !matches!(
+                self.image.purpose,
+                super::snapshot::SnapshotPurpose::Template
+            )
+        {
+            return Err(Error::Snapshot(
+                "changed-instance checkpoint cannot be used as an initialized revision template"
+                    .into(),
+            ));
+        }
         if self.image.binding().capability_policy_sha256() != self.capability_policy_sha256 {
             return Err(Error::Snapshot(
                 "snapshot capability policy binding mismatch".into(),
@@ -1020,10 +1425,33 @@ impl WorkerVersionSandbox {
         let responses = Responses::default();
         let fetch_session = self.fetch_broker.session(Instant::now());
         let timer_session = self.timer_broker.session();
-        if let Some(runtime) = &self.broker_runtime {
+        if let super::snapshot::SnapshotPurpose::Instance { host_state, .. } = &self.image.purpose {
+            fetch_session
+                .restore_sequence(host_state.fetch_next_id, host_state.fetch_v2_next_id)?;
+            timer_session.restore_sequence(host_state.timer_next_id)?;
+        }
+        let broker_runtime = if let Some(policy) = &self.logical_policy {
+            Some(policy.runtime()?)
+        } else {
+            self.broker_runtime.clone()
+        };
+        if let Some(runtime) = &broker_runtime {
             runtime
                 .reset_for_fresh_vm()
                 .map_err(|error| Error::State(error.to_string()))?;
+        }
+        if let super::snapshot::SnapshotPurpose::Instance { host_state, .. } = &self.image.purpose {
+            match &broker_runtime {
+                Some(runtime) => runtime
+                    .restore_next_handle(host_state.network_next_id)
+                    .map_err(|error| Error::Snapshot(error.to_string()))?,
+                None if host_state.network_next_id.is_none() => {}
+                _ => {
+                    return Err(Error::Snapshot(
+                        "checkpoint network host-state binding mismatch".into(),
+                    ));
+                }
+            }
         }
         let (sandbox, config) = crate::restore_snapshot_with(
             self.image.snapshot.clone(),
@@ -1032,11 +1460,14 @@ impl WorkerVersionSandbox {
             None,
             |functions| {
                 responses.register(functions)?;
+                register_entropy(functions)?;
+                super::bundle::BundleReader::default().register(functions)?;
                 self.fetch_broker
                     .register(functions, fetch_session.clone())?;
                 self.timer_broker
                     .register(functions, timer_session.clone())?;
-                if let Some(runtime) = &self.broker_runtime {
+                if let Some(runtime) = &broker_runtime {
+                    register_provider_websockets(functions, runtime)?;
                     if runtime.has_network() {
                         let runtime = runtime.clone();
                         functions.register_host_function(
@@ -1074,6 +1505,12 @@ impl WorkerVersionSandbox {
                     restore_poisoned: false,
                 },
                 responses,
+                broker_runtime,
+                use_invoke_v2: self.image.binding().bundle_protocol_version()
+                    == super::PACKAGE_PROTOCOL_VERSION,
+                reset_broker_per_invocation: self.logical_policy.as_ref().is_some_and(|policy| {
+                    policy.budget_scope() == super::LogicalBudgetScope::Invocation
+                }),
                 fetch_session,
                 timer_session,
             },
@@ -1083,6 +1520,362 @@ impl WorkerVersionSandbox {
 }
 
 impl RestoredWorkerVersionSandbox {
+    pub(super) fn execute_stream(
+        &mut self,
+        request: RequestEnvelope,
+        websocket: bool,
+        ingress: super::GuestIngress,
+        timeout: Duration,
+    ) -> Result<()> {
+        let result = (|| {
+            request.validate()?;
+            if !request.body_base64.is_empty() || request.request_id != ingress.request_id() {
+                return Err(Error::Protocol(
+                    "streaming request must match transport and have an empty buffered body".into(),
+                ));
+            }
+            if timeout.is_zero() {
+                return Err(Error::Timeout);
+            }
+            let deadline = Instant::now()
+                .checked_add(timeout)
+                .ok_or_else(|| Error::State("streaming lifetime too large".into()))?
+                .min(ingress.deadline());
+            let capabilities_id = "ingress-capabilities";
+            let capabilities: super::GuestCapabilities =
+                self.control_call("runtime_capabilities", capabilities_id, deadline)?;
+            capabilities.validate(capabilities_id, "ingress-stream-v1")?;
+            capabilities.validate(capabilities_id, "tracked-work-drain-v1")?;
+            let lifetime_budget_ms = u32::try_from(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis(),
+            )
+            .map_err(|_| {
+                Error::State("streaming lifetime exceeds u32 millisecond budget".into())
+            })?;
+            if lifetime_budget_ms == 0 {
+                return Err(Error::Timeout);
+            }
+            let request_id = request.request_id.clone();
+            let encoded = serde_json::json!({
+                "protocol_version":1,"request_id":request_id,"request":request,
+                "websocket":websocket,"lifetime_budget_ms":lifetime_budget_ms,
+            })
+            .to_string();
+            if encoded.len() > super::MAX_ENVELOPE_BYTES {
+                return Err(Error::Protocol(
+                    "ingress invocation exceeds envelope limit".into(),
+                ));
+            }
+            self.fetch_session.set_deadline(deadline);
+            begin_broker_invocation(
+                &self.broker_runtime,
+                self.reset_broker_per_invocation,
+                deadline,
+            )?;
+            self.responses.begin(&request_id)?;
+            self.responses.1.attach(ingress.clone())?;
+            let call = with_watchdog_cancellable(
+                &mut self.app,
+                deadline,
+                Some((self.fetch_session.clone(), self.timer_session.clone())),
+                ingress.cancellation(),
+                |app, deadline| {
+                    app.resume()?;
+                    drive_call(app, "ingress_stream", encoded, deadline)
+                },
+            );
+            match call {
+                Ok(()) => {
+                    self.responses.finish_stream()?;
+                    validate_guest_completion(
+                        &mut self.app,
+                        &self.responses,
+                        (self.fetch_session.clone(), self.timer_session.clone()),
+                        deadline,
+                        ingress.cancellation(),
+                    )?;
+                    ingress.finish(true)
+                }
+                Err(error) => {
+                    self.responses.clear()?;
+                    Err(error)
+                }
+            }
+        })();
+        if result.is_err() {
+            ingress.abort();
+        }
+        self.responses.1.detach()?;
+        result
+    }
+
+    pub(super) fn checkpoint(
+        &mut self,
+        binding: SnapshotBinding,
+        request_id: &str,
+        timeout: Duration,
+        identity: super::InstanceIdentity,
+        requests_served: u64,
+    ) -> Result<VerifiedSnapshot> {
+        if timeout.is_zero() {
+            return Err(Error::Timeout);
+        }
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| Error::State("checkpoint timeout too large".into()))?;
+        let capabilities_id = "checkpoint-capabilities";
+        let capabilities: super::GuestCapabilities =
+            self.control_call("runtime_capabilities", capabilities_id, deadline)?;
+        capabilities.validate(capabilities_id, "safe-point-v1")?;
+        capabilities.validate(capabilities_id, "tracked-work-drain-v1")?;
+        let safe: super::SafePoint = self.control_call("checkpoint", request_id, deadline)?;
+        safe.validate(request_id)?;
+        let broker_quiescent = match &self.broker_runtime {
+            Some(runtime) => runtime
+                .checkpoint_quiescent()
+                .map_err(|error| Error::Snapshot(error.to_string()))?,
+            None => true,
+        };
+        if !self.fetch_session.is_quiescent()?
+            || !self.timer_session.is_quiescent()?
+            || !broker_quiescent
+        {
+            return Err(Error::Snapshot(
+                "host fetch/timer handles are not reconstructable at safe point".into(),
+            ));
+        }
+        // Capture this VM after its handler mutations and safe-point call.
+        // self.image (the initialized revision template) is never used here.
+        let (fetch_next_id, fetch_v2_next_id) = self.fetch_session.sequence_state();
+        let network_next_id = self
+            .broker_runtime
+            .as_ref()
+            .map(BrokerRuntime::checkpoint_next_handle)
+            .transpose()
+            .map_err(|error| Error::Snapshot(error.to_string()))?
+            .flatten();
+        Ok(VerifiedSnapshot::changed_instance(
+            self.app.snapshot()?,
+            binding,
+            identity,
+            super::snapshot::HostCheckpointState {
+                fetch_next_id,
+                fetch_v2_next_id,
+                timer_next_id: self.timer_session.sequence_state(),
+                requests_served,
+                network_next_id,
+            },
+        ))
+    }
+
+    fn control_call<T: serde::de::DeserializeOwned>(
+        &mut self,
+        function: &str,
+        request_id: &str,
+        deadline: Instant,
+    ) -> Result<T> {
+        drive_control_call(
+            &mut self.app,
+            &self.responses,
+            (self.fetch_session.clone(), self.timer_session.clone()),
+            function,
+            request_id,
+            deadline,
+            InvocationCancellation::default(),
+        )
+    }
+
+    pub(super) fn execute_invocation_with_teardown_observer(
+        mut self,
+        request: InvocationRequest,
+        timeout: Duration,
+        total_started: Instant,
+        cancellation: InvocationCancellation,
+        teardown_started: impl FnOnce(),
+        teardown_finished: impl FnOnce(),
+    ) -> (Result<InvocationResponse>, ExecutionProfile) {
+        if !self.use_invoke_v2
+            && let InvocationRequest::Fetch(request) = request
+        {
+            let (result, profile) = self.execute_profiled_cancellable_with_teardown_observer(
+                request,
+                timeout,
+                total_started,
+                cancellation,
+                teardown_started,
+                teardown_finished,
+            );
+            return (result.map(InvocationResponse::Fetch), profile);
+        }
+        let (result, mut profile) = self.execute_resident_invocation_cancellable(
+            request,
+            timeout,
+            total_started,
+            cancellation,
+        );
+        teardown_started();
+        let teardown = Instant::now();
+        drop(self);
+        profile.vm_teardown_ms = WorkerVersionSandbox::elapsed_ms(teardown);
+        teardown_finished();
+        profile.total_ms = WorkerVersionSandbox::elapsed_ms(total_started);
+        (result, profile)
+    }
+
+    pub(super) fn execute_resident_invocation_cancellable(
+        &mut self,
+        request: InvocationRequest,
+        timeout: Duration,
+        total_started: Instant,
+        cancellation: InvocationCancellation,
+    ) -> (Result<InvocationResponse>, ExecutionProfile) {
+        if self.use_invoke_v2 {
+            return self.execute_budgeted_invocation(request, timeout, total_started, cancellation);
+        }
+        if let InvocationRequest::Fetch(request) = request {
+            let (result, profile) =
+                self.execute_resident_cancellable(request, timeout, total_started, cancellation);
+            return (result.map(InvocationResponse::Fetch), profile);
+        }
+        let mut profile = ExecutionProfile::default();
+        let setup = Instant::now();
+        let result = (|| {
+            let request_id = request.request_id().to_string();
+            let (function, encoded) = request.encode()?;
+            if cancellation.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            if timeout.is_zero() {
+                return Err(Error::Timeout);
+            }
+            let deadline = Instant::now()
+                .checked_add(timeout)
+                .ok_or_else(|| Error::State("timeout too large".into()))?;
+            self.fetch_session.set_deadline(deadline);
+            begin_broker_invocation(
+                &self.broker_runtime,
+                self.reset_broker_per_invocation,
+                deadline,
+            )?;
+            self.responses.begin(&request_id)?;
+            profile.request_setup_ms = WorkerVersionSandbox::elapsed_ms(setup);
+            let execution = Instant::now();
+            let result = with_watchdog_cancellable(
+                &mut self.app,
+                deadline,
+                Some((self.fetch_session.clone(), self.timer_session.clone())),
+                cancellation.clone(),
+                |app, deadline| {
+                    app.resume()?;
+                    drive_call(app, function, encoded, deadline)
+                },
+            );
+            profile.guest_execution_ms = WorkerVersionSandbox::elapsed_ms(execution);
+            let finish = Instant::now();
+            let result = match result {
+                Ok(()) => self
+                    .responses
+                    .finish_invocation(function)
+                    .and_then(|response| {
+                        validate_guest_completion(
+                            &mut self.app,
+                            &self.responses,
+                            (self.fetch_session.clone(), self.timer_session.clone()),
+                            deadline,
+                            cancellation,
+                        )?;
+                        Ok(response)
+                    }),
+                Err(error) => {
+                    self.responses.clear()?;
+                    Err(error)
+                }
+            };
+            profile.response_finish_ms = WorkerVersionSandbox::elapsed_ms(finish);
+            result
+        })();
+        profile.total_ms = WorkerVersionSandbox::elapsed_ms(total_started);
+        (result, profile)
+    }
+
+    fn execute_budgeted_invocation(
+        &mut self,
+        request: InvocationRequest,
+        timeout: Duration,
+        total_started: Instant,
+        cancellation: InvocationCancellation,
+    ) -> (Result<InvocationResponse>, ExecutionProfile) {
+        let mut profile = ExecutionProfile::default();
+        let result = (|| {
+            if timeout.is_zero() {
+                return Err(Error::Timeout);
+            }
+            if cancellation.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            let deadline = Instant::now()
+                .checked_add(timeout)
+                .ok_or_else(|| Error::State("invocation budget too large".into()))?;
+            let request_id = request.request_id().to_string();
+            let (kind, _) = request.encode()?;
+            let capabilities: super::GuestCapabilities =
+                self.control_call("runtime_capabilities", "invocation-capabilities", deadline)?;
+            capabilities.validate("invocation-capabilities", "invocation-budget-v2")?;
+            capabilities.validate("invocation-capabilities", "tracked-work-drain-v1")?;
+            capabilities.validate("invocation-capabilities", "safe-point-v1")?;
+            let remaining = u32::try_from(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis(),
+            )
+            .map_err(|_| Error::State("invocation exceeds u32 millisecond budget".into()))?;
+            if remaining == 0 {
+                return Err(Error::Timeout);
+            }
+            let encoded = request.to_budgeted_json(remaining)?;
+            self.responses.begin(&request_id)?;
+            self.fetch_session.set_deadline(deadline);
+            begin_broker_invocation(
+                &self.broker_runtime,
+                self.reset_broker_per_invocation,
+                deadline,
+            )?;
+            let execution = Instant::now();
+            let called = with_watchdog_cancellable(
+                &mut self.app,
+                deadline,
+                Some((self.fetch_session.clone(), self.timer_session.clone())),
+                cancellation.clone(),
+                |app, deadline| {
+                    app.resume()?;
+                    drive_call(app, "invoke", encoded, deadline)
+                },
+            );
+            profile.guest_execution_ms = WorkerVersionSandbox::elapsed_ms(execution);
+            match called {
+                Ok(()) => {
+                    let response = self.responses.finish_invocation(kind)?;
+                    validate_guest_completion(
+                        &mut self.app,
+                        &self.responses,
+                        (self.fetch_session.clone(), self.timer_session.clone()),
+                        deadline,
+                        cancellation,
+                    )?;
+                    Ok(response)
+                }
+                Err(error) => {
+                    self.responses.clear()?;
+                    Err(error)
+                }
+            }
+        })();
+        profile.total_ms = WorkerVersionSandbox::elapsed_ms(total_started);
+        (result, profile)
+    }
+
     fn execute_scheduled(
         self,
         request: ScheduledRequest,
@@ -1122,6 +1915,9 @@ impl RestoredWorkerVersionSandbox {
             responses,
             fetch_session,
             timer_session,
+            broker_runtime,
+            use_invoke_v2: _,
+            reset_broker_per_invocation,
         } = self;
         if timeout.is_zero() {
             return Err(Error::Timeout);
@@ -1130,19 +1926,28 @@ impl RestoredWorkerVersionSandbox {
             .checked_add(timeout)
             .ok_or_else(|| Error::State("timeout too large".into()))?;
         fetch_session.set_deadline(deadline);
+        begin_broker_invocation(&broker_runtime, reset_broker_per_invocation, deadline)?;
         responses.begin(&request_id)?;
         let result = with_watchdog(
             &mut app,
             deadline,
-            Some((fetch_session, timer_session)),
+            Some((fetch_session.clone(), timer_session.clone())),
             |app, deadline| {
                 app.resume()?;
                 drive_call(app, function, encoded, deadline)
             },
         );
-        drop(app);
         match result {
-            Ok(()) => finish(&responses),
+            Ok(()) => finish(&responses).and_then(|response| {
+                validate_guest_completion(
+                    &mut app,
+                    &responses,
+                    (fetch_session, timer_session),
+                    deadline,
+                    InvocationCancellation::default(),
+                )?;
+                Ok(response)
+            }),
             Err(error) => match responses.clear() {
                 Ok(()) => Err(error),
                 Err(clear_error) => Err(clear_error),
@@ -1167,11 +1972,33 @@ impl RestoredWorkerVersionSandbox {
         teardown_started: impl FnOnce(),
         teardown_finished: impl FnOnce(),
     ) -> (Result<ResponseEnvelope>, ExecutionProfile) {
+        self.execute_profiled_cancellable_with_teardown_observer(
+            request,
+            timeout,
+            total_started,
+            InvocationCancellation::default(),
+            teardown_started,
+            teardown_finished,
+        )
+    }
+
+    fn execute_profiled_cancellable_with_teardown_observer(
+        self,
+        request: RequestEnvelope,
+        timeout: Duration,
+        total_started: Instant,
+        cancellation: InvocationCancellation,
+        teardown_started: impl FnOnce(),
+        teardown_finished: impl FnOnce(),
+    ) -> (Result<ResponseEnvelope>, ExecutionProfile) {
         let Self {
             app,
             responses,
             fetch_session,
             timer_session,
+            broker_runtime,
+            use_invoke_v2: _,
+            reset_broker_per_invocation,
         } = self;
         let mut app = ObservedAppTeardown::new(app, teardown_started, teardown_finished);
         let mut profile = ExecutionProfile::default();
@@ -1184,6 +2011,9 @@ impl RestoredWorkerVersionSandbox {
             }};
         }
         let setup_started = Instant::now();
+        if cancellation.is_cancelled() {
+            fail!(Error::Cancelled);
+        }
         let encoded = match request.to_json() {
             Ok(encoded) => encoded,
             Err(error) => fail!(error),
@@ -1196,6 +2026,11 @@ impl RestoredWorkerVersionSandbox {
             None => fail!(Error::State("timeout too large".into())),
         };
         fetch_session.set_deadline(deadline);
+        if let Err(error) =
+            begin_broker_invocation(&broker_runtime, reset_broker_per_invocation, deadline)
+        {
+            fail!(error);
+        }
         if let Err(error) = responses.begin(&request.request_id) {
             fail!(error);
         }
@@ -1208,23 +2043,30 @@ impl RestoredWorkerVersionSandbox {
             deadline,
             fetch_session.clone(),
             timer_session.clone(),
+            cancellation.clone(),
         );
         profile.guest_execution_ms = WorkerVersionSandbox::elapsed_ms(execution_started);
 
-        // Join the watchdog before dropping the VM; no late kill can hit the
-        // next request. Dropping also discards timers, threads and guest secrets.
-        app.teardown();
-        profile.vm_teardown_ms = app.elapsed_ms();
-
         let finish_started = Instant::now();
         let result = match result {
-            Ok(()) => responses.finish_fetch(),
+            Ok(()) => responses.finish_fetch().and_then(|response| {
+                validate_guest_completion(
+                    app.app_mut(),
+                    &responses,
+                    (fetch_session, timer_session),
+                    deadline,
+                    cancellation,
+                )?;
+                Ok(response)
+            }),
             Err(error) => match responses.clear() {
                 Ok(()) => Err(error),
                 Err(clear_error) => Err(clear_error),
             },
         };
         profile.response_finish_ms = WorkerVersionSandbox::elapsed_ms(finish_started);
+        app.teardown();
+        profile.vm_teardown_ms = app.elapsed_ms();
         profile.total_ms = WorkerVersionSandbox::elapsed_ms(total_started);
         (result, profile)
     }
@@ -1236,11 +2078,12 @@ impl RestoredWorkerVersionSandbox {
     /// only when `result` is `Ok`; any error (including a watchdog-induced
     /// timeout kill or a guest exit) leaves the VM unusable and the caller
     /// must retire it rather than call this again.
-    pub(super) fn execute_resident(
+    fn execute_resident_cancellable(
         &mut self,
         request: RequestEnvelope,
         timeout: Duration,
         total_started: Instant,
+        cancellation: InvocationCancellation,
     ) -> (Result<ResponseEnvelope>, ExecutionProfile) {
         let mut profile = ExecutionProfile::default();
         macro_rules! fail {
@@ -1250,6 +2093,9 @@ impl RestoredWorkerVersionSandbox {
             }};
         }
         let setup_started = Instant::now();
+        if cancellation.is_cancelled() {
+            fail!(Error::Cancelled);
+        }
         let encoded = match request.to_json() {
             Ok(encoded) => encoded,
             Err(error) => fail!(error),
@@ -1262,9 +2108,17 @@ impl RestoredWorkerVersionSandbox {
             None => fail!(Error::State("timeout too large".into())),
         };
         self.fetch_session.set_deadline(deadline);
+        if let Err(error) = begin_broker_invocation(
+            &self.broker_runtime,
+            self.reset_broker_per_invocation,
+            deadline,
+        ) {
+            fail!(error);
+        }
         if let Err(error) = self.responses.begin(&request.request_id) {
             fail!(error);
         }
+
         profile.request_setup_ms = WorkerVersionSandbox::elapsed_ms(setup_started);
 
         let execution_started = Instant::now();
@@ -1274,12 +2128,22 @@ impl RestoredWorkerVersionSandbox {
             deadline,
             self.fetch_session.clone(),
             self.timer_session.clone(),
+            cancellation.clone(),
         );
         profile.guest_execution_ms = WorkerVersionSandbox::elapsed_ms(execution_started);
 
         let finish_started = Instant::now();
         let result = match result {
-            Ok(()) => self.responses.finish_fetch(),
+            Ok(()) => self.responses.finish_fetch().and_then(|response| {
+                validate_guest_completion(
+                    &mut self.app,
+                    &self.responses,
+                    (self.fetch_session.clone(), self.timer_session.clone()),
+                    deadline,
+                    cancellation,
+                )?;
+                Ok(response)
+            }),
             Err(error) => match self.responses.clear() {
                 Ok(()) => Err(error),
                 Err(clear_error) => Err(clear_error),
@@ -1357,17 +2221,45 @@ impl<F: FnOnce()> Drop for ScopeExit<F> {
     }
 }
 
+fn begin_broker_invocation(
+    runtime: &Option<BrokerRuntime>,
+    reset: bool,
+    deadline: Instant,
+) -> Result<()> {
+    if let Some(runtime) = runtime {
+        if reset {
+            if !runtime
+                .checkpoint_quiescent()
+                .map_err(|error| Error::State(error.to_string()))?
+            {
+                return Err(Error::State(
+                    "cannot reset invocation budget while host resources remain live".into(),
+                ));
+            }
+            runtime
+                .reset_for_fresh_vm()
+                .map_err(|error| Error::State(error.to_string()))?;
+        }
+        runtime
+            .set_deadline(deadline)
+            .map_err(|error| Error::State(error.to_string()))?;
+    }
+    Ok(())
+}
+
 fn timed_request(
     app: &mut AppSandbox,
     encoded: String,
     deadline: Instant,
     fetch_session: super::fetch::FetchSession,
     timer_session: super::timer::TimerSession,
+    cancellation: InvocationCancellation,
 ) -> Result<()> {
-    with_watchdog(
+    with_watchdog_cancellable(
         app,
         deadline,
         Some((fetch_session, timer_session)),
+        cancellation,
         |app, deadline| {
             app.resume()?;
             drive_call(app, "fetch", encoded, deadline)
@@ -1411,19 +2303,47 @@ fn with_watchdog(
     sessions: Option<(super::fetch::FetchSession, super::timer::TimerSession)>,
     run: impl FnOnce(&mut AppSandbox, Instant) -> Result<()>,
 ) -> Result<()> {
+    with_watchdog_cancellable(
+        app,
+        deadline,
+        sessions,
+        InvocationCancellation::default(),
+        run,
+    )
+}
+
+fn with_watchdog_cancellable(
+    app: &mut AppSandbox,
+    deadline: Instant,
+    sessions: Option<(super::fetch::FetchSession, super::timer::TimerSession)>,
+    cancellation: InvocationCancellation,
+    run: impl FnOnce(&mut AppSandbox, Instant) -> Result<()>,
+) -> Result<()> {
+    if cancellation.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
     if Instant::now() >= deadline {
         return Err(Error::Timeout);
     }
     let interrupt = app.interrupt_handle();
     let (done, wait) = mpsc::channel();
+    let watchdog_cancellation = cancellation.clone();
     let watchdog = std::thread::Builder::new()
         .name("workerd-watchdog".into())
         .spawn(move || {
-            if wait
-                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .is_ok()
-            {
-                return false;
+            loop {
+                if watchdog_cancellation.is_cancelled() || Instant::now() >= deadline {
+                    break;
+                }
+                match wait.recv_timeout(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(10)),
+                ) {
+                    Ok(()) => return false,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
             }
             if let Some((fetch_session, timer_session)) = sessions {
                 fetch_session.cancel_all();
@@ -1438,7 +2358,9 @@ fn with_watchdog(
     let timed_out = watchdog
         .join()
         .map_err(|_| Error::State("watchdog panicked".into()))?;
-    if timed_out || Instant::now() >= deadline {
+    if cancellation.is_cancelled() {
+        Err(Error::Cancelled)
+    } else if timed_out || Instant::now() >= deadline {
         Err(Error::Timeout)
     } else {
         result
@@ -1448,6 +2370,20 @@ fn with_watchdog(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_entropy_is_bounded_and_fresh() {
+        for amount in [0, 16_385, u64::MAX] {
+            assert!(read_entropy(amount).is_err());
+        }
+        for amount in [1, 32, 16_384] {
+            assert_eq!(read_entropy(amount).unwrap().len(), amount as usize);
+        }
+        assert!(
+            read_entropy(32).unwrap() != read_entropy(32).unwrap(),
+            "host entropy unexpectedly repeated"
+        );
+    }
 
     fn response(id: &str) -> String {
         format!(

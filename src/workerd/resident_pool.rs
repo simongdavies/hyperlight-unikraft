@@ -13,8 +13,9 @@
 //! any execution error), never after every request.
 
 use super::{
-    Error, ExecutionProfile, PoolSubmitError, RequestEnvelope, RequestExecution, ResidentPolicy,
-    ResidentWorkerSandbox, Result, WorkerVersionSandbox,
+    Error, ExecutionProfile, InvocationCancellation, InvocationExecution, InvocationRequest,
+    PoolSubmitError, RequestEnvelope, RequestExecution, ResidentPolicy, ResidentWorkerSandbox,
+    Result, WorkerVersionSandbox,
 };
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -23,13 +24,14 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-type Completion = Box<dyn FnOnce(RequestExecution) + Send + 'static>;
+type Completion = Box<dyn FnOnce(InvocationExecution) + Send + 'static>;
 
 struct SubmitJob {
-    request: RequestEnvelope,
+    request: super::ingress::PoolInvocation,
     timeout: Duration,
     completion: Completion,
     admitted_at: Instant,
+    cancellation: InvocationCancellation,
 }
 
 /// A request to dedicate one owner thread's resident VM to a single caller
@@ -39,7 +41,7 @@ struct SubmitJob {
 /// without sending (e.g. the queue is shut down first) tells the caller no
 /// reservation could be granted.
 struct ReserveJob {
-    ack: std::sync::mpsc::Sender<std::sync::mpsc::Sender<ReservedJob>>,
+    ack: std::sync::mpsc::Sender<std::sync::mpsc::SyncSender<ReservedJob>>,
 }
 
 /// One request dispatched directly to an owner thread that already holds a
@@ -47,9 +49,11 @@ struct ReserveJob {
 /// to land on the same resident VM as every other request on the same
 /// [`ResidentHandle`].
 struct ReservedJob {
-    request: RequestEnvelope,
+    request: super::ingress::PoolInvocation,
     timeout: Duration,
-    reply: std::sync::mpsc::Sender<RequestExecution>,
+    completion: Completion,
+    admitted_at: Instant,
+    cancellation: InvocationCancellation,
 }
 
 enum ResidentJob {
@@ -165,6 +169,7 @@ pub struct ResidentPoolConfig {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ResidentPoolStatus {
     pub capacity: usize,
+    pub live_vms: usize,
     pub active: usize,
     pub queued: usize,
     pub queue_capacity: usize,
@@ -177,6 +182,7 @@ pub struct ResidentPoolStatus {
 pub struct ResidentWorkerPool {
     queue: Arc<ResidentQueue>,
     active: Arc<AtomicUsize>,
+    live_vms: Arc<AtomicUsize>,
     admitted: Arc<AtomicUsize>,
     admission_capacity: usize,
     capacity: usize,
@@ -204,6 +210,7 @@ impl ResidentWorkerPool {
             .ok_or_else(|| Error::State("resident pool capacity is too large".into()))?;
         let queue = Arc::new(ResidentQueue::new(admission_capacity));
         let active = Arc::new(AtomicUsize::new(0));
+        let live_vms = Arc::new(AtomicUsize::new(0));
         let admitted = Arc::new(AtomicUsize::new(0));
         let retirements = Arc::new(AtomicU64::new(0));
         let resident_requests_served = Arc::new(AtomicU64::new(0));
@@ -211,6 +218,7 @@ impl ResidentWorkerPool {
         for index in 0..config.capacity {
             let worker_queue = queue.clone();
             let worker_active = active.clone();
+            let worker_live = live_vms.clone();
             let worker_admitted = admitted.clone();
             let worker_sandbox = worker.clone();
             let worker_retirements = retirements.clone();
@@ -227,6 +235,7 @@ impl ResidentWorkerPool {
                         policy,
                         worker_retirements,
                         worker_served,
+                        worker_live,
                     )
                 }) {
                 Ok(handle) => handle,
@@ -243,6 +252,7 @@ impl ResidentWorkerPool {
         Ok(Self {
             queue,
             active,
+            live_vms,
             admitted,
             admission_capacity,
             capacity: config.capacity,
@@ -266,7 +276,64 @@ impl ResidentWorkerPool {
         timeout: Duration,
         completion: impl FnOnce(RequestExecution) + Send + 'static,
     ) -> std::result::Result<(), PoolSubmitError> {
-        let request_id = request.request_id.clone();
+        self.try_submit_invocation(request.into(), timeout, move |execution| {
+            completion(execution.into_fetch())
+        })
+    }
+
+    pub fn try_submit_invocation(
+        &self,
+        request: InvocationRequest,
+        timeout: Duration,
+        completion: impl FnOnce(InvocationExecution) + Send + 'static,
+    ) -> std::result::Result<(), PoolSubmitError> {
+        self.try_submit_cancellable(
+            request,
+            timeout,
+            InvocationCancellation::default(),
+            completion,
+        )
+    }
+
+    pub fn try_submit_cancellable(
+        &self,
+        request: InvocationRequest,
+        timeout: Duration,
+        cancellation: InvocationCancellation,
+        completion: impl FnOnce(InvocationExecution) + Send + 'static,
+    ) -> std::result::Result<(), PoolSubmitError> {
+        self.try_submit_job(request.into(), timeout, cancellation, completion)
+    }
+
+    pub fn try_submit_stream(
+        &self,
+        request: RequestEnvelope,
+        websocket: bool,
+        ingress: super::GuestIngress,
+        timeout: Duration,
+        completion: impl FnOnce(InvocationExecution) + Send + 'static,
+    ) -> std::result::Result<(), PoolSubmitError> {
+        let cancellation = ingress.cancellation();
+        self.try_submit_job(
+            super::ingress::PoolInvocation::Stream {
+                request,
+                websocket,
+                ingress,
+            },
+            timeout,
+            cancellation,
+            completion,
+        )
+    }
+
+    fn try_submit_job(
+        &self,
+        request: super::ingress::PoolInvocation,
+        timeout: Duration,
+        cancellation: InvocationCancellation,
+        completion: impl FnOnce(InvocationExecution) + Send + 'static,
+    ) -> std::result::Result<(), PoolSubmitError> {
+        let request_id = request.request_id().to_string();
         if self
             .admitted
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
@@ -275,7 +342,7 @@ impl ResidentWorkerPool {
             .is_err()
         {
             let error = self.terminal_error().unwrap_or(PoolSubmitError::Full);
-            completion(RequestExecution {
+            completion(InvocationExecution {
                 request_id,
                 result: Err(Error::State(error.to_string())),
                 profile: ExecutionProfile::default(),
@@ -288,6 +355,7 @@ impl ResidentWorkerPool {
             timeout,
             completion: Box::new(completion),
             admitted_at: Instant::now(),
+            cancellation,
         };
         match self.queue.try_push(ResidentJob::Submit(job)) {
             Ok(()) => Ok(()),
@@ -296,7 +364,7 @@ impl ResidentWorkerPool {
                 let ResidentJob::Submit(job) = *job else {
                     unreachable!("try_submit only ever pushes ResidentJob::Submit")
                 };
-                (job.completion)(RequestExecution {
+                (job.completion)(InvocationExecution {
                     request_id,
                     result: Err(Error::State(error.to_string())),
                     profile: ExecutionProfile::default(),
@@ -333,16 +401,16 @@ impl ResidentWorkerPool {
         }
         match ack_rx.recv_timeout(Duration::from_secs(10)) {
             Ok(reserved_tx) => Some(ResidentHandle { tx: reserved_tx }),
-            Err(_) => {
-                self.admitted.fetch_sub(1, Ordering::AcqRel);
-                None
-            }
+            // The queued/owner reservation still holds this admission slot;
+            // its owner releases it when the expired acknowledgement fails.
+            Err(_) => None,
         }
     }
 
     pub fn status(&self) -> ResidentPoolStatus {
         ResidentPoolStatus {
             capacity: self.capacity,
+            live_vms: self.live_vms.load(Ordering::Acquire),
             active: self.active.load(Ordering::Acquire),
             queued: self.queue.len(),
             queue_capacity: self.queue_capacity,
@@ -361,8 +429,8 @@ impl ResidentWorkerPool {
             self.admitted.fetch_sub(1, Ordering::AcqRel);
             match job {
                 ResidentJob::Submit(job) => {
-                    (job.completion)(RequestExecution {
-                        request_id: job.request.request_id,
+                    (job.completion)(InvocationExecution {
+                        request_id: job.request.request_id().to_string(),
                         result: Err(Error::State(PoolSubmitError::ShuttingDown.to_string())),
                         profile: ExecutionProfile::default(),
                         submit_error: Some(PoolSubmitError::ShuttingDown),
@@ -393,37 +461,81 @@ impl Drop for ResidentWorkerPool {
 /// guarantee of the unreserved path). Dropping the handle releases the
 /// owner thread back to the shared pool.
 pub struct ResidentHandle {
-    tx: std::sync::mpsc::Sender<ReservedJob>,
+    tx: std::sync::mpsc::SyncSender<ReservedJob>,
 }
 
 impl ResidentHandle {
     /// Runs one request on this handle's dedicated resident VM. Blocks the
     /// calling thread until the owner thread finishes it.
     pub fn execute(&self, request: RequestEnvelope, timeout: Duration) -> RequestExecution {
-        let request_id = request.request_id.clone();
+        self.execute_invocation(request.into(), timeout)
+            .into_fetch()
+    }
+
+    pub fn execute_invocation(
+        &self,
+        request: InvocationRequest,
+        timeout: Duration,
+    ) -> InvocationExecution {
+        self.execute_cancellable(request, timeout, InvocationCancellation::default())
+    }
+
+    pub fn execute_cancellable(
+        &self,
+        request: InvocationRequest,
+        timeout: Duration,
+        cancellation: InvocationCancellation,
+    ) -> InvocationExecution {
+        let request_id = request.request_id().to_string();
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-        let job = ReservedJob {
-            request,
-            timeout,
-            reply: reply_tx,
-        };
-        if self.tx.send(job).is_err() {
-            return RequestExecution {
-                request_id,
-                result: Err(Error::State(PoolSubmitError::ShuttingDown.to_string())),
-                profile: ExecutionProfile::default(),
-                submit_error: Some(PoolSubmitError::ShuttingDown),
-            };
-        }
-        reply_rx.recv().unwrap_or_else(|_| RequestExecution {
+        let _ = self.try_submit_cancellable(request, timeout, cancellation, move |execution| {
+            if reply_tx.send(execution).is_err() {
+                tracing::debug!("reserved invocation receiver dropped");
+            }
+        });
+        reply_rx.recv().unwrap_or_else(|_| InvocationExecution {
             request_id,
             result: Err(Error::State(PoolSubmitError::ShuttingDown.to_string())),
             profile: ExecutionProfile::default(),
             submit_error: Some(PoolSubmitError::ShuttingDown),
         })
     }
+
+    pub fn try_submit_cancellable(
+        &self,
+        request: InvocationRequest,
+        timeout: Duration,
+        cancellation: InvocationCancellation,
+        completion: impl FnOnce(InvocationExecution) + Send + 'static,
+    ) -> std::result::Result<(), PoolSubmitError> {
+        let request_id = request.request_id().to_string();
+        let job = ReservedJob {
+            request: request.into(),
+            timeout,
+            completion: Box::new(completion),
+            admitted_at: Instant::now(),
+            cancellation,
+        };
+        if let Err(error) = self.tx.try_send(job) {
+            let (submit_error, job) = match error {
+                std::sync::mpsc::TrySendError::Full(job) => (PoolSubmitError::Full, job),
+                std::sync::mpsc::TrySendError::Disconnected(job) => {
+                    (PoolSubmitError::ShuttingDown, job)
+                }
+            };
+            (job.completion)(InvocationExecution {
+                request_id,
+                result: Err(Error::State(submit_error.to_string())),
+                profile: ExecutionProfile::default(),
+                submit_error: Some(submit_error),
+            });
+            return Err(submit_error);
+        }
+        Ok(())
+    }
 }
 
+#[expect(clippy::too_many_arguments, reason = "owner-thread pool resources")]
 fn run_resident_owner(
     queue: Arc<ResidentQueue>,
     active: Arc<AtomicUsize>,
@@ -432,6 +544,7 @@ fn run_resident_owner(
     policy: ResidentPolicy,
     retirements: Arc<AtomicU64>,
     resident_requests_served: Arc<AtomicU64>,
+    live_vms: Arc<AtomicUsize>,
 ) {
     let mut resident: Option<ResidentWorkerSandbox> = None;
     while let Some(job) = queue.pop() {
@@ -446,6 +559,7 @@ fn run_resident_owner(
                     &admitted,
                     &retirements,
                     &resident_requests_served,
+                    &live_vms,
                 );
             }
             ResidentJob::Reserve(job) => {
@@ -458,6 +572,7 @@ fn run_resident_owner(
                     &admitted,
                     &retirements,
                     &resident_requests_served,
+                    &live_vms,
                 );
             }
         }
@@ -477,6 +592,7 @@ fn ensure_fresh_vm(
     worker: &WorkerVersionSandbox,
     policy: ResidentPolicy,
     retirements: &Arc<AtomicU64>,
+    live_vms: &Arc<AtomicUsize>,
 ) -> Result<()> {
     let needs_fresh_vm = resident
         .as_ref()
@@ -489,7 +605,9 @@ fn ensure_fresh_vm(
         old.retire();
         retirements.fetch_add(1, Ordering::AcqRel);
     }
-    *resident = Some(worker.restore_resident()?);
+    let mut restored = worker.restore_resident()?;
+    restored.observe_live(live_vms.clone());
+    *resident = Some(restored);
     Ok(())
 }
 
@@ -503,14 +621,32 @@ fn run_submit_job(
     admitted: &Arc<AtomicUsize>,
     retirements: &Arc<AtomicU64>,
     resident_requests_served: &Arc<AtomicU64>,
+    live_vms: &Arc<AtomicUsize>,
 ) {
-    let request_id = job.request.request_id.clone();
+    let request_id = job.request.request_id().to_string();
     let ready_wait_ms = elapsed_ms(job.admitted_at);
+    if job.cancellation.is_cancelled() || job.admitted_at.elapsed() >= job.timeout {
+        (job.completion)(InvocationExecution {
+            request_id,
+            result: Err(if job.cancellation.is_cancelled() {
+                Error::Cancelled
+            } else {
+                Error::Timeout
+            }),
+            profile: ExecutionProfile {
+                ready_wait_ms,
+                ..Default::default()
+            },
+            submit_error: None,
+        });
+        admitted.fetch_sub(1, Ordering::AcqRel);
+        return;
+    }
     active.fetch_add(1, Ordering::AcqRel);
 
-    if let Err(error) = ensure_fresh_vm(resident, worker, policy, retirements) {
+    if let Err(error) = ensure_fresh_vm(resident, worker, policy, retirements, live_vms) {
         active.fetch_sub(1, Ordering::AcqRel);
-        (job.completion)(RequestExecution {
+        (job.completion)(InvocationExecution {
             request_id,
             result: Err(error),
             profile: ExecutionProfile {
@@ -529,7 +665,11 @@ fn run_submit_job(
         .as_mut()
         .expect("resident VM was just restored or was already alive");
     let execution = catch_unwind(AssertUnwindSafe(|| {
-        sandbox.execute(job.request, job.timeout)
+        job.request.execute_resident(
+            sandbox,
+            job.timeout.saturating_sub(job.admitted_at.elapsed()),
+            job.cancellation,
+        )
     }));
     active.fetch_sub(1, Ordering::AcqRel);
     let (result, mut profile) = match execution {
@@ -542,7 +682,7 @@ fn run_submit_job(
     profile.ready_wait_ms = ready_wait_ms;
     profile.admission_wait_ms = ready_wait_ms;
     resident_requests_served.fetch_add(1, Ordering::AcqRel);
-    (job.completion)(RequestExecution {
+    (job.completion)(InvocationExecution {
         request_id,
         result,
         profile,
@@ -571,15 +711,16 @@ fn run_reservation(
     admitted: &Arc<AtomicUsize>,
     retirements: &Arc<AtomicU64>,
     resident_requests_served: &Arc<AtomicU64>,
+    live_vms: &Arc<AtomicUsize>,
 ) {
-    if ensure_fresh_vm(resident, worker, policy, retirements).is_err() {
+    if ensure_fresh_vm(resident, worker, policy, retirements, live_vms).is_err() {
         // Dropping `job.ack` tells `reserve()`'s caller no reservation could
         // be granted; the admission slot it already holds is released here
         // since no `ResidentHandle` will ever exist to release it.
         admitted.fetch_sub(1, Ordering::AcqRel);
         return;
     }
-    let (reserved_tx, reserved_rx) = std::sync::mpsc::channel::<ReservedJob>();
+    let (reserved_tx, reserved_rx) = std::sync::mpsc::sync_channel::<ReservedJob>(1);
     if job.ack.send(reserved_tx).is_err() {
         // The caller gave up waiting before we could hand back the channel;
         // release the admission slot but keep the VM resident for the next
@@ -588,7 +729,7 @@ fn run_reservation(
         return;
     }
     while let Ok(reserved) = reserved_rx.recv() {
-        let request_id = reserved.request.request_id.clone();
+        let request_id = reserved.request.request_id().to_string();
         // Deliberately *not* `ensure_fresh_vm`'s proactive-retirement check:
         // a reservation's whole purpose is serving every request on the
         // same VM. Only an actually-dead VM (a prior request failed) is
@@ -600,10 +741,19 @@ fn run_reservation(
                 old.retire();
                 retirements.fetch_add(1, Ordering::AcqRel);
             }
-            *resident = worker.restore_resident().ok();
+            match worker.restore_resident() {
+                Ok(mut restored) => {
+                    restored.observe_live(live_vms.clone());
+                    *resident = Some(restored);
+                }
+                Err(error) => {
+                    tracing::error!(%error, "reserved resident restore failed");
+                    *resident = None;
+                }
+            }
         }
         let Some(sandbox) = resident.as_mut() else {
-            let _ = reserved.reply.send(RequestExecution {
+            (reserved.completion)(InvocationExecution {
                 request_id,
                 result: Err(Error::State("resident VM could not be restored".into())),
                 profile: ExecutionProfile::default(),
@@ -613,7 +763,13 @@ fn run_reservation(
         };
         active.fetch_add(1, Ordering::AcqRel);
         let execution = catch_unwind(AssertUnwindSafe(|| {
-            sandbox.execute(reserved.request, reserved.timeout)
+            reserved.request.execute_resident(
+                sandbox,
+                reserved
+                    .timeout
+                    .saturating_sub(reserved.admitted_at.elapsed()),
+                reserved.cancellation,
+            )
         }));
         active.fetch_sub(1, Ordering::AcqRel);
         let (result, profile) = match execution {
@@ -624,7 +780,7 @@ fn run_reservation(
             ),
         };
         resident_requests_served.fetch_add(1, Ordering::AcqRel);
-        let _ = reserved.reply.send(RequestExecution {
+        (reserved.completion)(InvocationExecution {
             request_id,
             result,
             profile,

@@ -14,6 +14,10 @@ pub const MAX_BODY_BYTES: usize = 32 * 1024;
 pub const MAX_ENVELOPE_BYTES: usize = 60 * 1024;
 pub const MAX_BUNDLE_SOURCE_BYTES: usize = 48 * 1024;
 pub const MAX_MODULE_SOURCE_BYTES: usize = 48 * 1024;
+pub const PACKAGE_PROTOCOL_VERSION: u16 = 4;
+pub const MAX_PACKAGE_JSON_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_PACKAGE_SOURCE_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_PACKAGE_MODULE_BYTES: usize = 1024 * 1024;
 pub const MAX_MODULES: usize = 32;
 pub const MAX_COMPATIBILITY_FLAGS: usize = 32;
 pub const MAX_HEADERS: usize = 64;
@@ -120,10 +124,21 @@ impl WorkerModule {
         if self.module_type != ModuleType::Wasm {
             return Ok(self.source.len());
         }
+
         STANDARD
             .decode(&self.source)
             .map(|bytes| bytes.len())
             .map_err(|_| invalid("invalid Wasm module base64"))
+    }
+
+    pub(super) fn source_bytes(&self) -> Result<Vec<u8>> {
+        if self.module_type == ModuleType::Wasm {
+            STANDARD
+                .decode(&self.source)
+                .map_err(|error| invalid(&error.to_string()))
+        } else {
+            Ok(self.source.as_bytes().to_vec())
+        }
     }
 }
 
@@ -145,6 +160,8 @@ pub enum WorkerBindingKind {
     Cache,
     D1,
     DurableObject,
+    Webhook,
+    ProviderWebsocket,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -259,6 +276,135 @@ pub struct QueueResponse {
     pub retry_messages: Vec<QueueMessageRetry>,
 }
 
+/// Invocation style is independent of disposable/resident execution mode.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "request",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum InvocationRequest {
+    Fetch(RequestEnvelope),
+    Scheduled(ScheduledRequest),
+    Queue(QueueRequest),
+}
+
+impl InvocationRequest {
+    pub(super) fn to_budgeted_json(&self, lifetime_budget_ms: u32) -> Result<String> {
+        #[derive(Serialize)]
+        struct Budgeted<'a> {
+            protocol_version: u16,
+            lifetime_budget_ms: u32,
+            #[serde(flatten)]
+            invocation: &'a InvocationRequest,
+        }
+        if lifetime_budget_ms == 0 {
+            return Err(Error::Timeout);
+        }
+        self.encode()?;
+        let encoded = serde_json::to_string(&Budgeted {
+            protocol_version: 2,
+            lifetime_budget_ms,
+            invocation: self,
+        })?;
+        bounded(encoded.as_bytes())?;
+        Ok(encoded)
+    }
+
+    pub fn from_control_json(bytes: &[u8]) -> Result<Self> {
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+        enum WireInvocation {
+            Fetch {
+                protocol_version: u16,
+                request: RequestEnvelope,
+            },
+            Scheduled {
+                protocol_version: u16,
+                request: ScheduledRequest,
+            },
+            Queue {
+                protocol_version: u16,
+                request: QueueRequest,
+            },
+        }
+        if bytes.len() > MAX_ENVELOPE_BYTES {
+            return Err(Error::Protocol(
+                "invocation envelope exceeds size limit".into(),
+            ));
+        }
+        let (version, invocation) = match serde_json::from_slice(bytes)? {
+            WireInvocation::Fetch {
+                protocol_version,
+                request,
+            } => (protocol_version, Self::Fetch(request)),
+            WireInvocation::Scheduled {
+                protocol_version,
+                request,
+            } => (protocol_version, Self::Scheduled(request)),
+            WireInvocation::Queue {
+                protocol_version,
+                request,
+            } => (protocol_version, Self::Queue(request)),
+        };
+        if version != PROTOCOL_VERSION {
+            return Err(Error::Protocol(
+                "unsupported invocation protocol version".into(),
+            ));
+        }
+        invocation.encode()?;
+        Ok(invocation)
+    }
+
+    pub fn request_id(&self) -> &str {
+        match self {
+            Self::Fetch(request) => &request.request_id,
+            Self::Scheduled(request) => &request.request_id,
+            Self::Queue(request) => &request.request_id,
+        }
+    }
+
+    pub(super) fn encode(&self) -> Result<(&'static str, String)> {
+        match self {
+            Self::Fetch(request) => Ok(("fetch", request.to_json()?)),
+            Self::Scheduled(request) => Ok(("scheduled", request.to_json()?)),
+            Self::Queue(request) => Ok(("queue", request.to_json()?)),
+        }
+    }
+}
+
+impl From<RequestEnvelope> for InvocationRequest {
+    fn from(request: RequestEnvelope) -> Self {
+        Self::Fetch(request)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "response",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum InvocationResponse {
+    Fetch(ResponseEnvelope),
+    Scheduled(ScheduledResponse),
+    Queue(QueueResponse),
+    /// Internal completion only; never a serialized guest response.
+    #[serde(skip)]
+    StreamComplete,
+}
+
+impl InvocationResponse {
+    pub(super) fn into_fetch(self) -> Result<ResponseEnvelope> {
+        match self {
+            Self::Fetch(response) => Ok(response),
+            _ => Err(Error::State("non-fetch response on fetch admission".into())),
+        }
+    }
+}
+
 fn invalid(message: &str) -> Error {
     Error::Protocol(message.into())
 }
@@ -320,6 +466,25 @@ fn bounded(input: &[u8]) -> Result<()> {
 }
 
 impl WorkerBundle {
+    pub fn from_package_path(path: impl AsRef<Path>) -> Result<Self> {
+        let mut bytes = Vec::new();
+        File::open(path)?
+            .take((MAX_PACKAGE_JSON_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > MAX_PACKAGE_JSON_BYTES {
+            return Err(invalid("immutable package JSON exceeds size limit"));
+        }
+        let mut bundle: Self = serde_json::from_slice(&bytes)?;
+        if bundle.protocol_version != PACKAGE_PROTOCOL_VERSION {
+            return Err(invalid(
+                "chunked package requires explicit protocol version four",
+            ));
+        }
+        bundle.canonicalize()?;
+        bundle.validate()?;
+        Ok(bundle)
+    }
+
     pub fn from_json(input: &[u8]) -> Result<Self> {
         bounded(input)?;
         let mut bundle: Self = serde_json::from_slice(input)?;
@@ -331,8 +496,22 @@ impl WorkerBundle {
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self> {
         let mut bytes = Vec::new();
         File::open(path)?
-            .take((MAX_ENVELOPE_BYTES + 1) as u64)
+            .take((MAX_PACKAGE_JSON_BYTES + 1) as u64)
             .read_to_end(&mut bytes)?;
+        #[derive(Deserialize)]
+        struct ProtocolProbe {
+            protocol_version: u16,
+        }
+        if bytes.len() > MAX_PACKAGE_JSON_BYTES {
+            return Err(invalid("bundle file exceeds size limit"));
+        }
+        let probe: ProtocolProbe = serde_json::from_slice(&bytes)?;
+        if probe.protocol_version == PACKAGE_PROTOCOL_VERSION {
+            let mut bundle: Self = serde_json::from_slice(&bytes)?;
+            bundle.canonicalize()?;
+            bundle.validate()?;
+            return Ok(bundle);
+        }
         Self::from_json(&bytes)
     }
 
@@ -361,7 +540,10 @@ impl WorkerBundle {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.protocol_version != PROTOCOL_VERSION {
+        if !matches!(
+            self.protocol_version,
+            PROTOCOL_VERSION | PACKAGE_PROTOCOL_VERSION
+        ) {
             return Err(invalid("unsupported protocol version"));
         }
         validate_date(&self.compatibility_date)?;
@@ -409,24 +591,45 @@ impl WorkerBundle {
                 return Err(invalid("modules are not unique and canonically ordered"));
             }
             let module_source_bytes = module.decoded_source_len()?;
-            if module_source_bytes > MAX_MODULE_SOURCE_BYTES {
+            let module_limit = if self.protocol_version == PACKAGE_PROTOCOL_VERSION {
+                MAX_PACKAGE_MODULE_BYTES
+            } else {
+                MAX_MODULE_SOURCE_BYTES
+            };
+            if module_source_bytes > module_limit {
                 return Err(invalid("module source exceeds size limit"));
             }
             source_bytes += module_source_bytes;
         }
-        if source_bytes > MAX_BUNDLE_SOURCE_BYTES {
+        let bundle_limit = if self.protocol_version == PACKAGE_PROTOCOL_VERSION {
+            MAX_PACKAGE_SOURCE_BYTES
+        } else {
+            MAX_BUNDLE_SOURCE_BYTES
+        };
+        if source_bytes > bundle_limit {
             return Err(invalid("aggregate module source exceeds size limit"));
         }
         let json = serde_json::to_vec(self)?;
-        bounded(&json)?;
+        self.bound_canonical_json(&json)?;
         Ok(())
     }
 
     pub fn to_canonical_json(&self) -> Result<String> {
         self.validate()?;
         let json = serde_json::to_string(self)?;
-        bounded(json.as_bytes())?;
+        self.bound_canonical_json(json.as_bytes())?;
         Ok(json)
+    }
+
+    fn bound_canonical_json(&self, json: &[u8]) -> Result<()> {
+        if self.protocol_version == PACKAGE_PROTOCOL_VERSION {
+            if json.len() > MAX_PACKAGE_JSON_BYTES {
+                return Err(invalid("immutable package JSON exceeds size limit"));
+            }
+            Ok(())
+        } else {
+            bounded(json)
+        }
     }
 
     pub(super) fn to_executor_init_json_with_bindings<'a>(
@@ -478,6 +681,38 @@ impl WorkerBundle {
                 return Err(invalid("duplicate executor binding"));
             }
             previous = Some(binding.name);
+        }
+        if self.protocol_version == PACKAGE_PROTOCOL_VERSION {
+            #[derive(Serialize)]
+            struct Manifest<'a> {
+                protocol_version: u16,
+                worker_version: &'a WorkerVersionId,
+                bundle_sha256: String,
+                compatibility_date: &'a str,
+                compatibility_flags: &'a [String],
+                main_module: &'a str,
+                modules: Vec<super::bundle::ModuleDescriptor<'a>>,
+                storage: Vec<ExecutorStorageBinding<'a>>,
+                bindings: Vec<ExecutorBinding<'a>>,
+            }
+            let modules = self
+                .modules
+                .iter()
+                .map(super::bundle::descriptor)
+                .collect::<Result<Vec<_>>>()?;
+            let init = serde_json::to_string(&Manifest {
+                protocol_version: PACKAGE_PROTOCOL_VERSION,
+                worker_version: &self.worker_version,
+                bundle_sha256: self.sha256()?,
+                compatibility_date: &self.compatibility_date,
+                compatibility_flags: &self.compatibility_flags,
+                main_module: &self.main_module,
+                modules,
+                storage,
+                bindings,
+            })?;
+            bounded(init.as_bytes())?;
+            return Ok(init);
         }
         let protocol_version = if bindings.is_empty() {
             if storage.is_empty() {
@@ -1057,5 +1292,49 @@ mod tests {
             let bundle = WorkerBundle::from_path(root.join(name)).unwrap();
             bundle.to_canonical_json().unwrap();
         }
+    }
+
+    #[test]
+    fn budgeted_events_preserve_canonical_v1_nested_field_order_byte_for_byte() {
+        let scheduled = ScheduledRequest {
+            protocol_version: 1,
+            request_id: "scheduled-1".into(),
+            scheduled_time_unix_ms: 1767225600000,
+            cron: "0 0 * * *".into(),
+        };
+        let expected = scheduled.to_json().unwrap();
+        let encoded = InvocationRequest::Scheduled(scheduled)
+            .to_budgeted_json(1000)
+            .unwrap();
+        assert!(
+            encoded.contains(&format!("\"request\":{expected}")),
+            "{encoded}"
+        );
+        assert!(encoded.starts_with("{\"protocol_version\":2,\"lifetime_budget_ms\":1000,"));
+        let queue = QueueRequest {
+            protocol_version: 1,
+            request_id: "queue-1".into(),
+            queue: "jobs".into(),
+            messages: vec![QueueMessage {
+                id: "message-1".into(),
+                timestamp_unix_ms: 1767225600000,
+                body_base64: "aGk=".into(),
+                content_type: Some("text".into()),
+                attempts: 1,
+            }],
+            metadata: QueueMetadata {
+                backlog_count: 1.0,
+                backlog_bytes: 2.0,
+                oldest_message_timestamp_unix_ms: None,
+            },
+        };
+        let expected = queue.to_json().unwrap();
+        let encoded = InvocationRequest::Queue(queue)
+            .to_budgeted_json(1000)
+            .unwrap();
+        assert!(
+            encoded.contains(&format!("\"request\":{expected}")),
+            "{encoded}"
+        );
     }
 }

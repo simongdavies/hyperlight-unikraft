@@ -101,6 +101,24 @@ pub enum NetworkPolicy {
 }
 
 impl NetworkPolicy {
+    pub(crate) fn authority_json(&self) -> serde_json::Value {
+        let (kind, ips, hostnames) = match self {
+            Self::AllowAll => return serde_json::json!({"kind": "allow_all"}),
+            Self::AllowList(list) => ("allow_list", &list.allowed_ips, &list.hostnames),
+            Self::BlockList(list) => ("block_list", &list.blocked_ips, &list.hostnames),
+        };
+        let mut ips: Vec<_> = ips.iter().map(|ip| canonical(*ip).to_string()).collect();
+        ips.sort();
+        ips.dedup();
+        let mut hostnames: Vec<_> = hostnames
+            .iter()
+            .map(|name| name.trim_end_matches('.').to_ascii_lowercase())
+            .collect();
+        hostnames.sort();
+        hostnames.dedup();
+        serde_json::json!({"kind": kind, "ips": ips, "hostnames": hostnames})
+    }
+
     /// Whether the guest may reach `addr`, on a UDP socket or not.
     pub(crate) fn allows(&self, addr: &SocketAddr, udp: bool) -> bool {
         self.allows_with(
@@ -485,7 +503,7 @@ fn dns_resolvers() -> &'static HashSet<IpAddr> {
         // Well-known public DNS the guest's initrd may hardcode.
         for ip in [
             "8.8.8.8", "8.8.4.4", // Google
-            "1.1.1.1", "1.0.0.1", // Cloudflare
+            "1.1.1.1", "1.0.0.1",
         ] {
             set.insert(ip.parse::<IpAddr>().unwrap());
         }

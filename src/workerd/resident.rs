@@ -21,7 +21,10 @@
 //! bounded even when no error ever occurs.
 
 use super::sandbox::RestoredWorkerVersionSandbox;
-use super::{Error, ExecutionProfile, RequestEnvelope, ResponseEnvelope, Result, WorkerVersionId};
+use super::{
+    Error, ExecutionProfile, InvocationCancellation, InvocationRequest, InvocationResponse,
+    RequestEnvelope, ResponseEnvelope, Result, WorkerVersionId,
+};
 use std::time::{Duration, Instant};
 
 /// Proactive recycling knobs for a resident VM. `None`/`None` means "recycle
@@ -39,26 +42,70 @@ pub struct ResidentPolicy {
 pub struct ResidentWorkerSandbox {
     restored: Option<RestoredWorkerVersionSandbox>,
     worker_version: WorkerVersionId,
+    binding: super::SnapshotBinding,
     requests_served: u64,
+    incarnation_requests_served: u64,
     created_at: Instant,
+    checkpoint_layout: Option<std::sync::Arc<super::checkpoint::CheckpointLayout>>,
+    identity: super::InstanceIdentity,
+    live_observer: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl ResidentWorkerSandbox {
     pub(super) fn new(
         restored: RestoredWorkerVersionSandbox,
-        worker_version: WorkerVersionId,
+        binding: super::SnapshotBinding,
         _restore_ms: f64,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        Ok(Self {
             restored: Some(restored),
-            worker_version,
+            worker_version: binding.worker_version().clone(),
+            binding,
             requests_served: 0,
+            incarnation_requests_served: 0,
             created_at: Instant::now(),
+            checkpoint_layout: None,
+            identity: super::InstanceIdentity::new()?,
+            live_observer: None,
+        })
+    }
+
+    pub fn identity(&self) -> &super::InstanceIdentity {
+        &self.identity
+    }
+    pub(super) fn set_identity(&mut self, identity: super::InstanceIdentity) {
+        self.identity = identity;
+    }
+    pub(super) fn restore_host_state(
+        &mut self,
+        identity: super::InstanceIdentity,
+        requests_served: u64,
+    ) {
+        self.identity = identity;
+        self.requests_served = requests_served;
+        self.incarnation_requests_served = 0;
+    }
+
+    pub(super) fn observe_live(&mut self, counter: std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.live_observer = Some(counter);
+    }
+
+    fn release_live_observer(&mut self) {
+        if let Some(counter) = self.live_observer.take() {
+            counter.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         }
     }
 
     pub fn worker_version(&self) -> &WorkerVersionId {
         &self.worker_version
+    }
+
+    pub(super) fn retain_checkpoint_layout(
+        &mut self,
+        layout: std::sync::Arc<super::checkpoint::CheckpointLayout>,
+    ) {
+        self.checkpoint_layout = Some(layout);
     }
 
     /// Number of `execute()` calls this VM has served, including any call
@@ -77,6 +124,30 @@ impl ResidentWorkerSandbox {
         self.restored.is_some()
     }
 
+    pub fn checkpoint(
+        &mut self,
+        worker: &super::WorkerVersionSandbox,
+        request_id: &str,
+        timeout: Duration,
+    ) -> Result<super::VerifiedSnapshot> {
+        if worker.snapshot().binding() != &self.binding {
+            return Err(Error::Snapshot(
+                "resident checkpoint actual artifact or capability policy binding mismatch".into(),
+            ));
+        }
+        let binding = worker.checkpoint_binding()?;
+        self.restored
+            .as_mut()
+            .ok_or_else(|| Error::State("cannot checkpoint a retired resident".into()))?
+            .checkpoint(
+                binding,
+                request_id,
+                timeout,
+                self.identity.clone(),
+                self.requests_served,
+            )
+    }
+
     /// Run exactly one request on this VM without tearing it down. On
     /// success the VM remains resident and ready for the next `execute()`
     /// call. On error the VM is retired immediately: `is_alive()` becomes
@@ -86,6 +157,24 @@ impl ResidentWorkerSandbox {
         request: RequestEnvelope,
         timeout: Duration,
     ) -> (Result<ResponseEnvelope>, ExecutionProfile) {
+        let (result, profile) = self.execute_invocation(request.into(), timeout);
+        (result.and_then(InvocationResponse::into_fetch), profile)
+    }
+
+    pub fn execute_invocation(
+        &mut self,
+        request: InvocationRequest,
+        timeout: Duration,
+    ) -> (Result<InvocationResponse>, ExecutionProfile) {
+        self.execute_cancellable(request, timeout, InvocationCancellation::default())
+    }
+
+    pub fn execute_cancellable(
+        &mut self,
+        request: InvocationRequest,
+        timeout: Duration,
+        cancellation: InvocationCancellation,
+    ) -> (Result<InvocationResponse>, ExecutionProfile) {
         let total_started = Instant::now();
         let Some(restored) = self.restored.as_mut() else {
             return (
@@ -93,14 +182,42 @@ impl ResidentWorkerSandbox {
                 ExecutionProfile::default(),
             );
         };
-        let (result, profile) = restored.execute_resident(request, timeout, total_started);
+        let (result, profile) = restored.execute_resident_invocation_cancellable(
+            request,
+            timeout,
+            total_started,
+            cancellation,
+        );
         self.requests_served += 1;
+        self.incarnation_requests_served += 1;
         if result.is_err() {
             // Conservative default: any failure (including a watchdog kill)
             // retires the VM rather than risking reuse of unknown state.
             self.restored = None;
+            self.release_live_observer();
         }
         (result, profile)
+    }
+
+    pub fn execute_stream(
+        &mut self,
+        request: RequestEnvelope,
+        websocket: bool,
+        ingress: super::GuestIngress,
+        timeout: Duration,
+    ) -> Result<()> {
+        let result = self
+            .restored
+            .as_mut()
+            .ok_or_else(|| Error::State("resident VM already retired".into()))?
+            .execute_stream(request, websocket, ingress, timeout);
+        self.requests_served += 1;
+        self.incarnation_requests_served += 1;
+        if result.is_err() {
+            self.restored = None;
+            self.release_live_observer();
+        }
+        result
     }
 
     /// Whether this VM should be retired proactively under `policy`, even
@@ -111,7 +228,7 @@ impl ResidentWorkerSandbox {
             return true;
         }
         if let Some(max) = policy.max_requests_per_vm
-            && self.requests_served >= max
+            && self.incarnation_requests_served >= max
         {
             return true;
         }
@@ -127,6 +244,13 @@ impl ResidentWorkerSandbox {
     /// (e.g. going out of scope) has the same effect.
     pub fn retire(mut self) {
         self.restored = None;
+    }
+}
+
+impl Drop for ResidentWorkerSandbox {
+    fn drop(&mut self) {
+        self.restored = None;
+        self.release_live_observer();
     }
 }
 

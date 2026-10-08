@@ -80,10 +80,10 @@ fn connect(
             continue;
         }
         socket
-            .set_read_timeout(Some(executor.io_timeout))
+            .set_read_timeout(Some(executor.remaining_timeout(executor.io_timeout)?))
             .map_err(|_| BrokerHostError::new("udp_configuration"))?;
         socket
-            .set_write_timeout(Some(executor.io_timeout))
+            .set_write_timeout(Some(executor.remaining_timeout(executor.io_timeout)?))
             .map_err(|_| BrokerHostError::new("udp_configuration"))?;
         return Ok(socket);
     }

@@ -16,7 +16,8 @@ const KV_PROTOCOL_VERSION: u16 = 1;
 const MAX_WIRE_BYTES: usize = 64 * 1024;
 const MAX_LIST_LIMIT: u32 = 1000;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct KvLimits {
     pub max_operations: u64,
     pub max_request_bytes: u64,

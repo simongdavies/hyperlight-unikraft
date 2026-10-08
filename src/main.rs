@@ -66,6 +66,58 @@ enum Command {
     /// `AppConfig.snapshot_dir` to restore N apps without paying this
     /// boot+init cost again in each of their processes.
     WorkerdPrewarmSnapshot(WorkerdPrewarmSnapshotArgs),
+
+    /// Print canonical bundle and actual configured policy identities without booting a VM.
+    WorkerdIdentity(WorkerdIdentityArgs),
+}
+
+#[derive(clap::Args)]
+#[command(group(clap::ArgGroup::new("input").required(true).args(["bundle", "config"])))]
+struct WorkerdIdentityArgs {
+    #[arg(long, conflicts_with = "config")]
+    bundle: Option<PathBuf>,
+    #[arg(long, conflicts_with = "bundle")]
+    config: Option<PathBuf>,
+}
+
+fn cmd_workerd_identity(args: WorkerdIdentityArgs) -> CliResult<()> {
+    use hyperlight_unikraft::workerd::{HostConfig, WorkerBundle, WorkerCapabilityPolicyConfig};
+    let identity = |path: &PathBuf,
+                    policy: &WorkerCapabilityPolicyConfig,
+                    app_id: &str|
+     -> CliResult<serde_json::Value> {
+        let bundle = WorkerBundle::from_path(path)?;
+        Ok(serde_json::json!({
+            "worker_version": bundle.worker_version,
+            "bundle_protocol_version": bundle.protocol_version,
+            "bundle_sha256": bundle.sha256()?,
+            "capability_policy_sha256": policy.sha256_for(app_id,bundle.worker_version.as_str())?,
+        }))
+    };
+    if let Some(bundle) = args.bundle {
+        println!(
+            "{}",
+            identity(
+                &bundle,
+                &WorkerCapabilityPolicyConfig::default(),
+                "standalone"
+            )?
+        );
+    } else if let Some(config) = args.config {
+        let config = HostConfig::from_path(config)?;
+        let identities = config
+            .apps
+            .iter()
+            .map(|app| {
+                let mut value =
+                    identity(&app.bundle_path, &app.capability_policy, &app.route.app_id)?;
+                value["app_id"] = serde_json::json!(app.route.app_id);
+                Ok(value)
+            })
+            .collect::<CliResult<Vec<_>>>()?;
+        println!("{}", serde_json::to_string(&identities)?);
+    }
+    Ok(())
 }
 
 #[derive(Subcommand)]
@@ -218,6 +270,14 @@ struct WorkerdHostArgs {
     /// (exit code 1).
     #[arg(long, default_value_t = 10_000)]
     drain_timeout_ms: u64,
+
+    /// Maximum simultaneous app connections, including idle keep-alive sockets.
+    #[arg(long, default_value_t = 256, value_parser = clap::value_parser!(u32).range(1..))]
+    max_connections: u32,
+
+    /// Separate connection budget for management probes.
+    #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u32).range(1..))]
+    max_admin_connections: u32,
 }
 
 /// Arguments for `run` — boot the embedded kernel + initrd and dispatch.
@@ -759,19 +819,43 @@ fn workerd_host_surrogate_capacity(args: &WorkerdHostArgs) -> usize {
 fn cmd_workerd_host(args: WorkerdHostArgs) -> CliResult<()> {
     use hyperlight_unikraft::workerd::{
         AppHandle, AppRegistry, ConnectionAffinity, ConnectionMode, HostConfig, MAX_HEADER_BYTES,
-        RequestExecution, ResidentHandle, read_http_request, wants_keep_alive, write_http_error,
-        write_http_response,
+        RequestExecution, ResidentHandle, read_http_request_with_control, wants_keep_alive,
+        write_http_error, write_http_response,
     };
     use std::io::Write as _;
     use std::net::{TcpListener, TcpStream};
-    use std::sync::RwLock;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;
+    use std::sync::{Mutex, RwLock};
 
     const MAX_REQUEST_HEAD_BYTES: usize = MAX_HEADER_BYTES + 8 * 1024;
-    const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
     const CONNECTION_IO_TIMEOUT: Duration = Duration::from_secs(5);
     const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum ListenerRole {
+        Shared,
+        Application,
+        Admin,
+    }
+
+    struct HostConnection<'a> {
+        state: &'a Arc<RwLock<WorkerdHostState>>,
+        in_flight: &'a Arc<AtomicUsize>,
+        connection_sequence: u64,
+        role: ListenerRole,
+        shutting_down: &'a AtomicBool,
+        admission: &'a Mutex<()>,
+        data_port: u16,
+    }
+
+    struct ConnectionGuard(Arc<AtomicUsize>);
+
+    impl Drop for ConnectionGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
 
     /// Keeps a connection's `in_flight` accounting raised for the full
     /// request lifecycle — pool execution *and* writing the response back
@@ -814,30 +898,87 @@ fn cmd_workerd_host(args: WorkerdHostArgs) -> CliResult<()> {
         reserved: Option<&ResidentHandle>,
         envelope: hyperlight_unikraft::workerd::RequestEnvelope,
         timeout: Duration,
+        stream: &TcpStream,
     ) -> RequestExecution {
+        let request_id = envelope.request_id.clone();
+        let cancellation = hyperlight_unikraft::workerd::InvocationCancellation::default();
+        let (tx, rx) = mpsc::channel();
+        let completion = move |execution| {
+            if tx.send(execution).is_err() {
+                tracing::debug!("HTTP invocation receiver dropped");
+            }
+        };
+        let request = envelope.into();
         if let Some(resident) = reserved {
-            resident.execute(envelope, timeout)
+            let _ =
+                resident.try_submit_cancellable(request, timeout, cancellation.clone(), completion);
         } else {
-            let request_id = envelope.request_id.clone();
-            let (tx, rx) = mpsc::channel();
-            // On admission `try_submit`'s completion runs later on a pool
-            // owner thread; on rejection it already ran synchronously
-            // before `try_submit` returns. Either way `rx.recv()` below
-            // observes exactly one `RequestExecution`.
-            let _ = handle.try_submit(envelope, timeout, move |execution| {
-                let _ = tx.send(execution);
-            });
-            rx.recv().unwrap_or_else(|_| RequestExecution {
+            let _ =
+                handle.try_submit_cancellable(request, timeout, cancellation.clone(), completion);
+        }
+        match wait_for_invocation(rx, stream, cancellation) {
+            Ok(execution) => RequestExecution {
+                request_id: execution.request_id,
+                result: execution.result.and_then(|response| match response {
+                    hyperlight_unikraft::workerd::InvocationResponse::Fetch(response) => {
+                        Ok(response)
+                    }
+                    _ => Err(hyperlight_unikraft::workerd::Error::State(
+                        "non-fetch HTTP response".into(),
+                    )),
+                }),
+                profile: execution.profile,
+                submit_error: execution.submit_error,
+            },
+            Err(error) => RequestExecution {
                 request_id,
-                result: Err(hyperlight_unikraft::workerd::Error::State(
-                    "worker request pool unavailable".into(),
-                )),
+                result: Err(error),
                 profile: Default::default(),
                 submit_error: Some(hyperlight_unikraft::workerd::PoolSubmitError::ShuttingDown),
-            })
+            },
         }
     }
 
+    fn wait_for_invocation(
+        rx: mpsc::Receiver<hyperlight_unikraft::workerd::InvocationExecution>,
+        stream: &TcpStream,
+        cancellation: hyperlight_unikraft::workerd::InvocationCancellation,
+    ) -> hyperlight_unikraft::workerd::Result<hyperlight_unikraft::workerd::InvocationExecution>
+    {
+        if let Err(error) = stream.set_read_timeout(Some(Duration::from_millis(1))) {
+            cancellation.cancel();
+            return Err(error.into());
+        }
+        let result = loop {
+            match rx.recv_timeout(POLL_INTERVAL) {
+                Ok(execution) => break Ok(execution),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    cancellation.cancel();
+                    break Err(hyperlight_unikraft::workerd::Error::State(
+                        "invocation owner unavailable".into(),
+                    ));
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let mut byte = [0];
+                    match stream.peek(&mut byte) {
+                        Ok(0) => cancellation.cancel(),
+                        Ok(_) => {}
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                            ) => {}
+                        Err(error) => {
+                            tracing::debug!(%error, "HTTP disconnect cancels invocation");
+                            cancellation.cancel();
+                        }
+                    }
+                }
+            }
+        };
+        stream.set_read_timeout(Some(CONNECTION_IO_TIMEOUT))?;
+        result
+    }
     /// Writes `execution`'s outcome as an HTTP response with `connection`'s
     /// `Connection` header. Mirrors `examples/workerd-demo.rs`'s
     /// `finish_request` passthrough (header filtering, Content-Length) —
@@ -854,7 +995,9 @@ fn cmd_workerd_host(args: WorkerdHostArgs) -> CliResult<()> {
         }
         match execution.result {
             Ok(response) => {
-                let body = STANDARD.decode(response.body_base64).unwrap_or_default();
+                let body = STANDARD
+                    .decode(response.body_base64)
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
                 write!(
                     stream,
                     "HTTP/1.1 {} {}\r\n",
@@ -882,6 +1025,12 @@ fn cmd_workerd_host(args: WorkerdHostArgs) -> CliResult<()> {
             Err(hyperlight_unikraft::workerd::Error::Timeout) => {
                 write_http_error(stream, 504, "Worker timed out", connection)
             }
+            Err(hyperlight_unikraft::workerd::Error::Fence(_)) => {
+                write_http_error(stream, 409, "stale instance generation", connection)
+            }
+            Err(hyperlight_unikraft::workerd::Error::NotReady(_)) => {
+                write_http_error(stream, 503, "instance is not ready", connection)
+            }
             Err(_) => write_http_error(stream, 502, "Worker execution failed", connection),
         }
     }
@@ -902,20 +1051,34 @@ fn cmd_workerd_host(args: WorkerdHostArgs) -> CliResult<()> {
     /// *different* app (unusual, but HTTP permits a different `Host` header
     /// per request on a keep-alive connection) drops the stale reservation
     /// instead of misusing it.
-    fn handle_host_connection(
-        mut stream: TcpStream,
-        state: &Arc<RwLock<WorkerdHostState>>,
-        in_flight: &Arc<AtomicUsize>,
-        connection_sequence: u64,
-    ) {
-        let _ = stream.set_read_timeout(Some(CONNECTION_IO_TIMEOUT));
-        let _ = stream.set_write_timeout(Some(CONNECTION_IO_TIMEOUT));
+    fn handle_host_connection(mut stream: TcpStream, context: HostConnection<'_>) {
+        let HostConnection {
+            state,
+            in_flight,
+            connection_sequence,
+            role,
+            shutting_down,
+            admission,
+            data_port,
+        } = context;
+        if let Err(error) = stream
+            .set_read_timeout(Some(CONNECTION_IO_TIMEOUT))
+            .and_then(|()| stream.set_write_timeout(Some(CONNECTION_IO_TIMEOUT)))
+        {
+            eprintln!("workerd-host: connection timeout setup failed: {error}");
+            return;
+        }
         let mut reserved: Option<(String, ResidentHandle)> = None;
         let mut request_index: u64 = 0;
         loop {
             request_index += 1;
             let request_id = format!("host-{connection_sequence}-{request_index}");
-            let parsed = match read_http_request(&mut stream, request_id, MAX_REQUEST_HEAD_BYTES) {
+            let parsed = match read_http_request_with_control(
+                &mut stream,
+                request_id,
+                MAX_REQUEST_HEAD_BYTES,
+                role != ListenerRole::Application,
+            ) {
                 Ok(parsed) => parsed,
                 Err(error) => {
                     // Past the first request, a read failure almost always
@@ -935,7 +1098,48 @@ fn cmd_workerd_host(args: WorkerdHostArgs) -> CliResult<()> {
                 ConnectionMode::Close
             };
 
+            let fenced_http =
+                parsed.path.starts_with("/v1/instances/") && parsed.path.ends_with("/http");
+            if role == ListenerRole::Application
+                && (parsed.path.starts_with("/__hyperlight/")
+                    || parsed.path == "/v1/capabilities"
+                    || parsed.path.starts_with("/v1/apps/")
+                    || ((parsed.path == "/v1/instances"
+                        || parsed.path.starts_with("/v1/instances/"))
+                        && !fenced_http))
+            {
+                let _ = write_http_error(
+                    &mut stream,
+                    404,
+                    "management endpoint requires the admin listener",
+                    ConnectionMode::Close,
+                );
+                return;
+            }
             match parsed.path.as_str() {
+                "/v1/capabilities" if role != ListenerRole::Application => {
+                    let guard = state.read().expect("workerd-host state lock poisoned");
+                    let (status, body) = match &*guard {
+                        WorkerdHostState::Ready(registry)
+                            if !shutting_down.load(Ordering::SeqCst) =>
+                        {
+                            (200, registry.capabilities_json())
+                        }
+                        _ => (
+                            503,
+                            serde_json::json!({"protocol_version":1,"error":"runtime not ready for admission","capabilities":[]}),
+                        ),
+                    };
+                    let body = body.to_string();
+                    let _ = write_http_response(
+                        &mut stream,
+                        status,
+                        "application/json",
+                        body.as_bytes(),
+                        ConnectionMode::Close,
+                    );
+                    return;
+                }
                 "/__hyperlight/healthz" => {
                     let _ = write_http_response(
                         &mut stream,
@@ -947,25 +1151,46 @@ fn cmd_workerd_host(args: WorkerdHostArgs) -> CliResult<()> {
                     return;
                 }
                 "/__hyperlight/readyz" => {
-                    let ready = matches!(
-                        *state.read().expect("workerd-host state lock poisoned"),
-                        WorkerdHostState::Ready(_)
-                    );
-                    let (status, body): (u16, &[u8]) = if ready {
-                        (200, b"{\"status\":\"ready\"}")
+                    let guard = state.read().expect("workerd-host state lock poisoned");
+                    let (status, body) = if shutting_down.load(Ordering::SeqCst) {
+                        (503, serde_json::json!({"status":"draining"}))
                     } else {
-                        (503, b"{\"status\":\"initializing\"}")
+                        match &*guard {
+                            WorkerdHostState::Ready(registry) => (
+                                200,
+                                serde_json::json!({
+                                    "status": "ready", "apps": registry.status_json(),
+                                }),
+                            ),
+                            WorkerdHostState::Initializing => {
+                                (503, serde_json::json!({"status":"initializing"}))
+                            }
+                            WorkerdHostState::Failed(message) => {
+                                (503, serde_json::json!({"status":"failed","error":message}))
+                            }
+                        }
                     };
+                    let body = body.to_string();
                     let _ = write_http_response(
                         &mut stream,
                         status,
                         "application/json",
-                        body,
+                        body.as_bytes(),
                         ConnectionMode::Close,
                     );
                     return;
                 }
                 "/__hyperlight/status" => {
+                    if shutting_down.load(Ordering::SeqCst) {
+                        let _ = write_http_response(
+                            &mut stream,
+                            503,
+                            "application/json",
+                            b"{\"status\":\"draining\"}",
+                            ConnectionMode::Close,
+                        );
+                        return;
+                    }
                     let guard = state.read().expect("workerd-host state lock poisoned");
                     let (status, body) = match &*guard {
                         WorkerdHostState::Ready(registry) => {
@@ -980,12 +1205,12 @@ fn cmd_workerd_host(args: WorkerdHostArgs) -> CliResult<()> {
                         ),
                     };
                     drop(guard);
-                    let body = serde_json::to_vec(&body).unwrap_or_default();
+                    let body = body.to_string();
                     let _ = write_http_response(
                         &mut stream,
                         status,
                         "application/json",
-                        &body,
+                        body.as_bytes(),
                         ConnectionMode::Close,
                     );
                     return;
@@ -993,6 +1218,564 @@ fn cmd_workerd_host(args: WorkerdHostArgs) -> CliResult<()> {
                 _ => {}
             }
 
+            if fenced_http {
+                if role == ListenerRole::Admin {
+                    let _ = write_http_error(
+                        &mut stream,
+                        404,
+                        "instance HTTP transport requires the data listener",
+                        ConnectionMode::Close,
+                    );
+                    return;
+                }
+                let mut transport_admitted = false;
+                let result = (|| -> hyperlight_unikraft::workerd::Result<()> {
+                    use hyperlight_unikraft::workerd::{
+                        Error, HostIngress, InvocationCancellation, decode_buffered_input,
+                        pump_http_stream, websocket_requested,
+                    };
+                    let instance_id = parsed
+                        .path
+                        .strip_prefix("/v1/instances/")
+                        .and_then(|path| path.strip_suffix("/http"))
+                        .ok_or_else(|| Error::Protocol("invalid fenced HTTP route".into()))?;
+                    if instance_id.is_empty() || instance_id.contains('/') {
+                        return Err(Error::Protocol("invalid fenced instance ID".into()));
+                    }
+                    let header = |name: &str| -> hyperlight_unikraft::workerd::Result<String> {
+                        let values = parsed
+                            .envelope
+                            .headers
+                            .iter()
+                            .filter(|header| header.name.eq_ignore_ascii_case(name))
+                            .map(|header| header.value.clone())
+                            .collect::<Vec<_>>();
+                        if values.len() != 1 {
+                            return Err(Error::Protocol(format!(
+                                "exactly one trusted {name} header required"
+                            )));
+                        }
+                        Ok(values[0].clone())
+                    };
+                    let app_id = header("x-hyperloom-app")?;
+                    let revision = header("x-hyperloom-revision")?;
+                    let generation = header("x-hyperloom-generation")?
+                        .parse::<u64>()
+                        .map_err(|_| Error::Protocol("invalid instance generation".into()))?;
+                    if generation == 0 {
+                        return Err(Error::Protocol(
+                            "instance generation must be positive".into(),
+                        ));
+                    }
+                    let target = header("x-hyperloom-request-url")?;
+                    let admission_guard = admission.lock().expect("admission lock poisoned");
+                    if shutting_down.load(Ordering::SeqCst) {
+                        return Err(Error::State("host is draining".into()));
+                    }
+                    let _in_flight_guard = InFlightGuard::new(in_flight);
+                    drop(admission_guard);
+                    let guard = state.read().expect("workerd-host state lock poisoned");
+                    let WorkerdHostState::Ready(registry) = &*guard else {
+                        return Err(Error::State("host is not ready".into()));
+                    };
+                    let app = registry
+                        .app(&app_id)
+                        .ok_or_else(|| Error::State("unknown application".into()))?;
+                    if app.identity().worker_version.as_str() != revision {
+                        return Err(Error::Protocol("fenced HTTP revision mismatch".into()));
+                    }
+                    let AppHandle::Instances { home, .. } = app else {
+                        return Err(Error::State("application has no fenced home".into()));
+                    };
+                    let timeout = app.execute_timeout();
+                    let mut request = parsed.envelope.clone();
+                    request.url = target;
+                    request.headers.retain(|header| {
+                        !header.name.to_ascii_lowercase().starts_with("x-hyperloom-")
+                    });
+                    let (tx, rx) = mpsc::channel();
+                    if app.identity().streaming {
+                        let body = decode_buffered_input(&request)?;
+                        request.body_base64.clear();
+                        request.validate()?;
+                        let websocket = websocket_requested(&request);
+                        let (host, guest) = HostIngress::pair(
+                            &request.request_id,
+                            websocket,
+                            timeout,
+                            InvocationCancellation::default(),
+                        )?;
+                        home.try_submit_stream(
+                            &hyperlight_unikraft::workerd::InstanceIdentity {
+                                instance_id: instance_id.into(),
+                                generation,
+                            },
+                            request.clone(),
+                            websocket,
+                            guest,
+                            timeout,
+                            move |execution| {
+                                if tx.send(execution).is_err() {
+                                    tracing::debug!(
+                                        "fenced stream completion receiver disconnected"
+                                    );
+                                }
+                            },
+                        )?;
+                        transport_admitted = true;
+                        pump_http_stream(stream.try_clone()?, &request, &body, host, rx)?;
+                    } else {
+                        request.validate()?;
+                        let cancellation = InvocationCancellation::default();
+                        home.try_submit(
+                            instance_id,
+                            generation,
+                            request.into(),
+                            timeout,
+                            cancellation.clone(),
+                            move |execution| {
+                                if tx.send(execution).is_err() {
+                                    tracing::debug!("fenced HTTP completion receiver disconnected");
+                                }
+                            },
+                        )?;
+                        let execution = wait_for_invocation(rx, &stream, cancellation)?;
+                        let execution = RequestExecution {
+                            request_id: execution.request_id,
+                            result: execution.result.and_then(|response| match response {
+                                hyperlight_unikraft::workerd::InvocationResponse::Fetch(
+                                    response,
+                                ) => Ok(response),
+                                _ => Err(Error::Protocol(
+                                    "non-fetch result on HTTP instance route".into(),
+                                )),
+                            }),
+                            profile: execution.profile,
+                            submit_error: execution.submit_error,
+                        };
+                        write_execution_response(&mut stream, execution, ConnectionMode::Close)?;
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    eprintln!("workerd-host: fenced HTTP transport rejected:{error}");
+                    let status = match error {
+                        hyperlight_unikraft::workerd::Error::Protocol(_) => 400,
+                        hyperlight_unikraft::workerd::Error::Fence(_) => 409,
+                        _ => 503,
+                    };
+                    if !transport_admitted {
+                        let _ = write_http_error(
+                            &mut stream,
+                            status,
+                            &error.to_string(),
+                            ConnectionMode::Close,
+                        );
+                    }
+                }
+                return;
+            }
+            if role != ListenerRole::Application
+                && parsed.envelope.method == "GET"
+                && (parsed.path == "/v1/instances"
+                    || parsed
+                        .path
+                        .strip_prefix("/v1/instances/")
+                        .is_some_and(|id| !id.is_empty() && !id.contains('/')))
+            {
+                let result = (|| -> hyperlight_unikraft::workerd::Result<serde_json::Value> {
+                    use hyperlight_unikraft::workerd::Error;
+                    let url = reqwest::Url::parse(&parsed.envelope.url)
+                        .map_err(|error| Error::Protocol(error.to_string()))?;
+                    let query = url.query_pairs().collect::<Vec<_>>();
+                    if query.len() != 2 {
+                        return Err(Error::Protocol(
+                            "instance status requires exact app_id and revision query".into(),
+                        ));
+                    }
+                    let app = query
+                        .iter()
+                        .filter(|(name, _)| name == "app_id")
+                        .map(|(_, value)| value.as_ref())
+                        .collect::<Vec<_>>();
+                    let revision = query
+                        .iter()
+                        .filter(|(name, _)| name == "revision")
+                        .map(|(_, value)| value.as_ref())
+                        .collect::<Vec<_>>();
+                    if app.len() != 1 || revision.len() != 1 {
+                        return Err(Error::Protocol(
+                            "duplicate or missing status authority".into(),
+                        ));
+                    }
+                    let guard = state.read().expect("workerd-host state lock poisoned");
+                    let WorkerdHostState::Ready(registry) = &*guard else {
+                        return Err(Error::State("host is not ready".into()));
+                    };
+                    let app = registry
+                        .app(app[0])
+                        .ok_or_else(|| Error::State("unknown application".into()))?;
+                    if app.identity().worker_version.as_str() != revision[0] {
+                        return Err(Error::Protocol("status revision authority mismatch".into()));
+                    }
+                    let AppHandle::Instances { home, .. } = app else {
+                        return Err(Error::State("application has no fenced home".into()));
+                    };
+                    let statuses = home.status()?;
+                    if let Some(id) = parsed.path.strip_prefix("/v1/instances/") {
+                        let status = statuses
+                            .into_iter()
+                            .find(|status| status.identity.instance_id == id)
+                            .ok_or_else(|| Error::State("unknown instance".into()))?;
+                        Ok(
+                            serde_json::json!({"protocol_version":1,"app_id":app.app_id(),"revision":app.identity().worker_version,"instance":status}),
+                        )
+                    } else {
+                        Ok(
+                            serde_json::json!({"protocol_version":1,"app_id":app.app_id(),"revision":app.identity().worker_version,"instances":statuses}),
+                        )
+                    }
+                })();
+                let (status, body) = match result {
+                    Ok(body) => (200, body.to_string()),
+                    Err(error) => {
+                        eprintln!("workerd-host: instance status rejected:{error}");
+                        (
+                            if matches!(error, hyperlight_unikraft::workerd::Error::Protocol(_)) {
+                                400
+                            } else {
+                                503
+                            },
+                            serde_json::json!({"protocol_version":1,"error":error.to_string()})
+                                .to_string(),
+                        )
+                    }
+                };
+                let _ = write_http_response(
+                    &mut stream,
+                    status,
+                    "application/json",
+                    body.as_bytes(),
+                    ConnectionMode::Close,
+                );
+                return;
+            }
+            if role != ListenerRole::Application
+                && let Some(route) = parsed.path.strip_prefix("/v1/instances/")
+            {
+                let handle = (|| -> hyperlight_unikraft::workerd::Result<(u16, String)> {
+                    use hyperlight_unikraft::workerd::{
+                        InstanceIdentity, InstanceInvocation, LifecycleOperation, LifecycleRequest,
+                    };
+                    if parsed.envelope.method != "POST" {
+                        return Ok((
+                            405,
+                            serde_json::json!({"error":"instance operation requires POST"})
+                                .to_string(),
+                        ));
+                    }
+                    let Some((instance_id, operation)) = route.split_once('/') else {
+                        return Err(hyperlight_unikraft::workerd::Error::Protocol(
+                            "invalid instance route".into(),
+                        ));
+                    };
+                    if instance_id.is_empty() || operation.contains('/') {
+                        return Err(hyperlight_unikraft::workerd::Error::Protocol(
+                            "invalid instance route".into(),
+                        ));
+                    }
+                    let body = STANDARD
+                        .decode(&parsed.envelope.body_base64)
+                        .map_err(|error| {
+                            hyperlight_unikraft::workerd::Error::Protocol(error.to_string())
+                        })?;
+                    let admission_guard = admission.lock().expect("admission lock poisoned");
+                    if shutting_down.load(Ordering::SeqCst) {
+                        return Ok((
+                            503,
+                            serde_json::json!({"error":"host is draining"}).to_string(),
+                        ));
+                    }
+                    let _in_flight_guard = InFlightGuard::new(in_flight);
+                    drop(admission_guard);
+                    let guard = state.read().expect("workerd-host state lock poisoned");
+                    let WorkerdHostState::Ready(registry) = &*guard else {
+                        return Ok((
+                            503,
+                            serde_json::json!({"error":"host is not ready"}).to_string(),
+                        ));
+                    };
+                    if operation == "invoke" {
+                        let invocation: InstanceInvocation = serde_json::from_slice(&body)?;
+                        let app = registry.app(&invocation.app_id).ok_or_else(|| {
+                            hyperlight_unikraft::workerd::Error::State("unknown application".into())
+                        })?;
+                        invocation.validate(app, instance_id)?;
+                        let AppHandle::Instances { home, .. } = app else {
+                            return Ok((503, serde_json::json!({"error":"application has no fenced instance home"}).to_string()));
+                        };
+                        let timeout = Duration::from_millis(invocation.lifetime_budget_ms as u64)
+                            .min(app.execute_timeout());
+                        let cancellation =
+                            hyperlight_unikraft::workerd::InvocationCancellation::default();
+                        let (tx, rx) = mpsc::channel();
+                        home.try_submit(
+                            instance_id,
+                            invocation.expected_generation,
+                            invocation.invocation,
+                            timeout,
+                            cancellation.clone(),
+                            move |execution| {
+                                if tx.send(execution).is_err() {
+                                    tracing::debug!("fenced invocation receiver disconnected");
+                                }
+                            },
+                        )?;
+                        let execution = wait_for_invocation(rx, &stream, cancellation)?;
+                        let response = execution.result?;
+                        let mut response = serde_json::to_value(response)?;
+                        response["protocol_version"] = serde_json::json!(1);
+                        return Ok((200, response.to_string()));
+                    }
+                    let request: LifecycleRequest = serde_json::from_slice(&body)?;
+                    let app = registry.app(&request.app_id).ok_or_else(|| {
+                        hyperlight_unikraft::workerd::Error::State("unknown application".into())
+                    })?;
+                    request.validate(app)?;
+                    let AppHandle::Instances { home, .. } = app else {
+                        return Ok((
+                            503,
+                            serde_json::json!({"error":"application has no fenced instance home"})
+                                .to_string(),
+                        ));
+                    };
+                    if home.policy() != request.checkpoint_policy {
+                        return Err(hyperlight_unikraft::workerd::Error::Protocol(
+                            "checkpoint policy differs from admitted app".into(),
+                        ));
+                    }
+                    let status = match operation {
+                        "create" => home.create(instance_id, request.expected_generation)?,
+                        "park" => home.lifecycle(
+                            instance_id,
+                            request.expected_generation,
+                            LifecycleOperation::Park,
+                        )?,
+                        "resume" => {
+                            if home.contains(instance_id)? {
+                                home.lifecycle(
+                                    instance_id,
+                                    request.expected_generation,
+                                    LifecycleOperation::Resume,
+                                )?
+                            } else {
+                                home.recover(InstanceIdentity {
+                                    instance_id: instance_id.into(),
+                                    generation: request.expected_generation,
+                                })?
+                            }
+                        }
+                        "release" => home.lifecycle(
+                            instance_id,
+                            request.expected_generation,
+                            LifecycleOperation::Release,
+                        )?,
+                        _ => {
+                            return Err(hyperlight_unikraft::workerd::Error::Protocol(
+                                "unsupported lifecycle operation".into(),
+                            ));
+                        }
+                    };
+                    let mut body = serde_json::json!({
+                        "protocol_version":1,"request_id":request.request_id,
+                        "instance_id":status.identity.instance_id,"generation":status.identity.generation,"state":status.state,
+                    });
+                    if let Some(checkpoint_id) = status.checkpoint_id {
+                        body["checkpoint_id"] = serde_json::json!(checkpoint_id);
+                    }
+                    if status.state == hyperlight_unikraft::workerd::InstanceState::Active {
+                        body["endpoint"] = serde_json::json!(format!(
+                            "http://{}/v1/instances/{instance_id}/invoke",
+                            stream.local_addr()?,
+                        ));
+                        body["http_endpoint"] = serde_json::json!(format!(
+                            "http://{}/v1/instances/{instance_id}/http",
+                            std::net::SocketAddr::new(stream.local_addr()?.ip(), data_port),
+                        ));
+                    }
+                    Ok((200, body.to_string()))
+                })();
+                let (status, body) = match handle {
+                    Ok(response) => response,
+                    Err(error) => {
+                        eprintln!("workerd-host: instance operation rejected: {error}");
+                        let status = match error {
+                            hyperlight_unikraft::workerd::Error::Timeout => 504,
+                            hyperlight_unikraft::workerd::Error::Protocol(_)
+                            | hyperlight_unikraft::workerd::Error::Json(_) => 400,
+                            hyperlight_unikraft::workerd::Error::State(_) => 409,
+                            hyperlight_unikraft::workerd::Error::Fence(_) => 409,
+                            _ => 503,
+                        };
+                        (
+                            status,
+                            serde_json::json!({"protocol_version":1,"error":error.to_string()})
+                                .to_string(),
+                        )
+                    }
+                };
+                if let Err(error) = write_http_response(
+                    &mut stream,
+                    status,
+                    "application/json",
+                    body.as_bytes(),
+                    ConnectionMode::Close,
+                ) {
+                    eprintln!("workerd-host: instance response write failed: {error}");
+                }
+                return;
+            }
+            if role != ListenerRole::Application
+                && let Some(app_id) = parsed
+                    .path
+                    .strip_prefix("/v1/apps/")
+                    .and_then(|path| path.strip_suffix("/invoke"))
+            {
+                if parsed.envelope.method != "POST" {
+                    let _ = write_http_error(
+                        &mut stream,
+                        405,
+                        "invocation requires POST",
+                        ConnectionMode::Close,
+                    );
+                    return;
+                }
+                let invocation = STANDARD
+                    .decode(&parsed.envelope.body_base64)
+                    .map_err(|error| error.to_string())
+                    .and_then(|bytes| {
+                        hyperlight_unikraft::workerd::InvocationRequest::from_control_json(&bytes)
+                            .map_err(|error| error.to_string())
+                    });
+                let invocation = match invocation {
+                    Ok(invocation) => invocation,
+                    Err(error) => {
+                        let _ = write_http_error(&mut stream, 400, &error, ConnectionMode::Close);
+                        return;
+                    }
+                };
+                let admission_guard = admission.lock().expect("admission lock poisoned");
+                if shutting_down.load(Ordering::SeqCst) {
+                    drop(admission_guard);
+                    let _ = write_http_error(
+                        &mut stream,
+                        503,
+                        "host is draining",
+                        ConnectionMode::Close,
+                    );
+                    return;
+                }
+                let _in_flight_guard = InFlightGuard::new(in_flight);
+                drop(admission_guard);
+                let guard = state.read().expect("workerd-host state lock poisoned");
+                let WorkerdHostState::Ready(registry) = &*guard else {
+                    let _ = write_http_error(
+                        &mut stream,
+                        503,
+                        "host is not ready",
+                        ConnectionMode::Close,
+                    );
+                    return;
+                };
+                let Some(app) = registry.app(app_id) else {
+                    let _ = write_http_error(
+                        &mut stream,
+                        404,
+                        "unknown application",
+                        ConnectionMode::Close,
+                    );
+                    return;
+                };
+                let (tx, rx) = mpsc::channel();
+                let cancellation = hyperlight_unikraft::workerd::InvocationCancellation::default();
+                let _ = app.try_submit_cancellable(
+                    invocation,
+                    app.execute_timeout(),
+                    cancellation.clone(),
+                    move |execution| {
+                        if tx.send(execution).is_err() {
+                            tracing::debug!("invocation client disconnected before completion");
+                        }
+                    },
+                );
+                let execution = match wait_for_invocation(rx, &stream, cancellation) {
+                    Ok(execution) => execution,
+                    Err(error) => {
+                        eprintln!("workerd-host: invocation completion unavailable: {error}");
+                        let _ = write_http_error(
+                            &mut stream,
+                            503,
+                            "invocation unavailable",
+                            ConnectionMode::Close,
+                        );
+                        return;
+                    }
+                };
+                drop(guard);
+                let (status, body) = match execution.result {
+                    Ok(response) => {
+                        let mut body = serde_json::to_value(response)
+                            .expect("invocation response is serializable");
+                        body["protocol_version"] = serde_json::json!(1);
+                        (200, body.to_string())
+                    }
+                    Err(error) => {
+                        let status = if execution.submit_error.is_some() {
+                            503
+                        } else if matches!(error, hyperlight_unikraft::workerd::Error::Timeout) {
+                            504
+                        } else {
+                            502
+                        };
+                        eprintln!("workerd-host: invocation failed: {error}");
+                        (
+                            status,
+                            serde_json::json!({"protocol_version":1,"error":error.to_string()})
+                                .to_string(),
+                        )
+                    }
+                };
+                if let Err(error) = write_http_response(
+                    &mut stream,
+                    status,
+                    "application/json",
+                    body.as_bytes(),
+                    ConnectionMode::Close,
+                ) {
+                    eprintln!("workerd-host: invocation response write failed: {error}");
+                }
+                return;
+            }
+            if role == ListenerRole::Admin {
+                let _ = write_http_error(
+                    &mut stream,
+                    404,
+                    "admin listener does not serve applications",
+                    ConnectionMode::Close,
+                );
+                return;
+            }
+            // Linearize each invocation against shutdown, including requests
+            // arriving on sockets accepted before the signal.
+            let admission_guard = admission.lock().expect("admission lock poisoned");
+            if shutting_down.load(Ordering::SeqCst) {
+                drop(admission_guard);
+                let _ =
+                    write_http_error(&mut stream, 503, "host is draining", ConnectionMode::Close);
+                return;
+            }
+            let _in_flight_guard = InFlightGuard::new(in_flight);
+            drop(admission_guard);
             let host_header = parsed
                 .envelope
                 .headers
@@ -1028,6 +1811,61 @@ fn cmd_workerd_host(args: WorkerdHostArgs) -> CliResult<()> {
                     continue;
                 }
             };
+            if handle.identity().streaming {
+                use hyperlight_unikraft::workerd::{
+                    HostIngress, InvocationCancellation, decode_buffered_input, pump_http_stream,
+                    websocket_requested,
+                };
+                let timeout = handle.execute_timeout();
+                let websocket = websocket_requested(&parsed.envelope);
+                let body = match decode_buffered_input(&parsed.envelope) {
+                    Ok(body) => body,
+                    Err(error) => {
+                        let _ = write_http_error(
+                            &mut stream,
+                            400,
+                            &error.to_string(),
+                            ConnectionMode::Close,
+                        );
+                        return;
+                    }
+                };
+                let mut request = parsed.envelope;
+                request.body_base64.clear();
+                let (host_ingress, guest_ingress) = match HostIngress::pair(
+                    &request.request_id,
+                    websocket,
+                    timeout,
+                    InvocationCancellation::default(),
+                ) {
+                    Ok(pair) => pair,
+                    Err(error) => {
+                        let _ = write_http_error(
+                            &mut stream,
+                            400,
+                            &error.to_string(),
+                            ConnectionMode::Close,
+                        );
+                        return;
+                    }
+                };
+                let (tx, rx) = mpsc::channel();
+                let _ = handle.try_submit_stream(
+                    request.clone(),
+                    websocket,
+                    guest_ingress,
+                    timeout,
+                    move |execution| {
+                        if tx.send(execution).is_err() {
+                            tracing::debug!("stream completion receiver disconnected");
+                        }
+                    },
+                );
+                if let Err(error) = pump_http_stream(stream, &request, &body, host_ingress, rx) {
+                    eprintln!("workerd-host: streaming transport failed:{error}");
+                }
+                return;
+            }
             if reserved
                 .as_ref()
                 .is_some_and(|(app_id, _)| app_id != handle.app_id())
@@ -1053,12 +1891,12 @@ fn cmd_workerd_host(args: WorkerdHostArgs) -> CliResult<()> {
             // including on early `return`/`continue` paths) — see
             // `InFlightGuard`'s doc comment for why this must cover the
             // write too, not just pool execution.
-            let _in_flight_guard = InFlightGuard::new(in_flight);
             let execution = execute_request(
                 handle,
                 reserved.as_ref().map(|(_, resident)| resident),
                 parsed.envelope,
-                DEFAULT_REQUEST_TIMEOUT,
+                handle.execute_timeout(),
+                &stream,
             );
             drop(guard);
             if let Err(error) = write_execution_response(&mut stream, execution, connection_mode) {
@@ -1095,6 +1933,7 @@ fn cmd_workerd_host(args: WorkerdHostArgs) -> CliResult<()> {
             std::process::exit(4);
         }
     };
+    let data_port = listener.local_addr()?.port();
     listener.set_nonblocking(true)?;
     let admin_listener = match &args.admin_bind {
         Some(addr) => match TcpListener::bind(addr) {
@@ -1121,7 +1960,7 @@ fn cmd_workerd_host(args: WorkerdHostArgs) -> CliResult<()> {
 
     // Step 3: build every app's worker + pool off the accept thread.
     let state = Arc::new(RwLock::new(WorkerdHostState::Initializing));
-    {
+    let initializer = {
         let state = state.clone();
         std::thread::spawn(move || {
             let built = AppRegistry::from_host_config(config);
@@ -1130,19 +1969,25 @@ fn cmd_workerd_host(args: WorkerdHostArgs) -> CliResult<()> {
                 Ok(registry) => WorkerdHostState::Ready(registry),
                 Err(error) => WorkerdHostState::Failed(error.to_string()),
             };
-        });
-    }
+        })
+    };
 
     let shutting_down = Arc::new(AtomicBool::new(false));
+    let admission = Arc::new(Mutex::new(()));
     {
         let shutting_down = shutting_down.clone();
+        let admission = admission.clone();
         ctrlc::set_handler(move || {
+            let _guard = admission.lock().expect("admission lock poisoned");
             shutting_down.store(true, Ordering::SeqCst);
         })?;
     }
 
     let in_flight = Arc::new(AtomicUsize::new(0));
     let sequence = Arc::new(AtomicUsize::new(1));
+    let app_connections = Arc::new(AtomicUsize::new(0));
+    let admin_connections = Arc::new(AtomicUsize::new(0));
+    let mut connections: Vec<std::thread::JoinHandle<()>> = Vec::new();
     let drain_timeout = Duration::from_millis(args.drain_timeout_ms);
     let mut fatal_exit_code: Option<i32> = None;
     let mut logged_ready = false;
@@ -1168,12 +2013,42 @@ fn cmd_workerd_host(args: WorkerdHostArgs) -> CliResult<()> {
         if fatal_exit_code.is_some() {
             break;
         }
-        for incoming in [Some(&listener), admin_listener.as_ref()]
-            .into_iter()
-            .flatten()
-        {
+        let mut index = 0;
+        while index < connections.len() {
+            if connections[index].is_finished() {
+                if connections.swap_remove(index).join().is_err() {
+                    eprintln!("error: workerd-host connection handler panicked");
+                    fatal_exit_code = Some(1);
+                }
+            } else {
+                index += 1;
+            }
+        }
+        let app_role = if admin_listener.is_some() {
+            ListenerRole::Application
+        } else {
+            ListenerRole::Shared
+        };
+        let listeners = [
+            Some((&listener, app_role, &app_connections, args.max_connections)),
+            admin_listener.as_ref().map(|listener| {
+                (
+                    listener,
+                    ListenerRole::Admin,
+                    &admin_connections,
+                    args.max_admin_connections,
+                )
+            }),
+        ];
+        for (incoming, role, counter, limit) in listeners.into_iter().flatten() {
             match incoming.accept() {
                 Ok((stream, _addr)) => {
+                    if counter.load(Ordering::Acquire) >= limit as usize {
+                        // Close rather than block the accept thread writing to
+                        // a slow peer. Admin probes have an independent budget.
+                        drop(stream);
+                        continue;
+                    }
                     // The accepted socket inherits the listening socket's
                     // non-blocking mode on Windows (unlike POSIX, where a
                     // fresh accepted socket starts blocking regardless of
@@ -1194,10 +2069,34 @@ fn cmd_workerd_host(args: WorkerdHostArgs) -> CliResult<()> {
                     }
                     let state = state.clone();
                     let in_flight = in_flight.clone();
+                    let shutting_down = shutting_down.clone();
+                    let admission = admission.clone();
+                    counter.fetch_add(1, Ordering::AcqRel);
+                    let connection_guard = ConnectionGuard(counter.clone());
                     let request_sequence = sequence.fetch_add(1, Ordering::Relaxed) as u64;
-                    std::thread::spawn(move || {
-                        handle_host_connection(stream, &state, &in_flight, request_sequence);
-                    });
+                    match std::thread::Builder::new()
+                        .name("workerd-connection".into())
+                        .spawn(move || {
+                            let _connection_guard = connection_guard;
+                            handle_host_connection(
+                                stream,
+                                HostConnection {
+                                    state: &state,
+                                    in_flight: &in_flight,
+                                    connection_sequence: request_sequence,
+                                    role,
+                                    shutting_down: &shutting_down,
+                                    admission: &admission,
+                                    data_port,
+                                },
+                            );
+                        }) {
+                        Ok(handle) => connections.push(handle),
+                        Err(error) => {
+                            eprintln!("error: workerd-host connection spawn failed: {error}");
+                            fatal_exit_code = Some(1);
+                        }
+                    }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(error) => eprintln!("workerd-host: accept failed: {error}"),
@@ -1209,10 +2108,32 @@ fn cmd_workerd_host(args: WorkerdHostArgs) -> CliResult<()> {
     // Drain: no new connections are accepted once we reach here; wait for
     // every in-flight request's response to finish.
     let drain_start = Instant::now();
-    while in_flight.load(Ordering::SeqCst) > 0 && drain_start.elapsed() < drain_timeout {
+    {
+        let _guard = admission.lock().expect("admission lock poisoned");
+        shutting_down.store(true, Ordering::SeqCst);
+    }
+    while (in_flight.load(Ordering::SeqCst) > 0
+        || connections.iter().any(|handle| !handle.is_finished())
+        || !initializer.is_finished())
+        && drain_start.elapsed() < drain_timeout
+    {
         std::thread::sleep(POLL_INTERVAL);
     }
-    let drained = in_flight.load(Ordering::SeqCst) == 0;
+    let drained = in_flight.load(Ordering::SeqCst) == 0
+        && connections.iter().all(std::thread::JoinHandle::is_finished)
+        && initializer.is_finished();
+    if drained {
+        for handle in connections {
+            if handle.join().is_err() {
+                eprintln!("error: workerd-host connection handler panicked during drain");
+                fatal_exit_code = Some(1);
+            }
+        }
+        if initializer.join().is_err() {
+            eprintln!("error: workerd-host initializer panicked");
+            fatal_exit_code = Some(1);
+        }
+    }
     // Dropping every app's pool runs its own `Drop` (already exercised and
     // validated by Boundaries 1-3): resident pools retire every resident
     // VM, disposable pools stop admitting and join their owners.
@@ -1222,7 +2143,9 @@ fn cmd_workerd_host(args: WorkerdHostArgs) -> CliResult<()> {
         std::process::exit(code);
     }
     if !drained {
-        eprintln!("error: drain timeout exceeded with requests still in flight");
+        eprintln!(
+            "error: drain timeout exceeded with live requests, connections or initialization"
+        );
         std::process::exit(1);
     }
     println!(
@@ -1702,6 +2625,7 @@ fn cli_main() -> CliResult<()> {
         Command::Workerd(args) => cmd_workerd(args),
         Command::WorkerdHost(args) => cmd_workerd_host(args),
         Command::WorkerdPrewarmSnapshot(args) => cmd_workerd_prewarm_snapshot(args),
+        Command::WorkerdIdentity(args) => cmd_workerd_identity(args),
         Command::Snapshot(cmd) => match cmd {
             SnapshotCommand::Save(args) => cmd_snapshot_save(args),
             SnapshotCommand::Run(args) => cmd_snapshot_run(args),
