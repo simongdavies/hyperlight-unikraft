@@ -345,7 +345,7 @@ description() {
         orchestrator-contract) echo "The workerd-host process exposes liveness, readiness, and status endpoints, and shuts down cleanly on SIGTERM." ;;
         benchmark-on-demand) echo "Measure requests when VMs are created or restored as they are needed." ;;
         benchmark-prewarmed) echo "Measure the same requests when ready VMs are available and replacements are prepared." ;;
-        benchmark-resident) echo "Drive real hey load across $benchmark_apps independently running resident workerd-host processes, each on its own loopback port, and capture per-app and aggregate throughput." ;;
+        benchmark-resident) echo "Drive real $benchmark_load_driver load across $benchmark_apps independently running resident workerd-host processes, each on its own loopback port, and capture per-app and aggregate throughput." ;;
         benchmark-multi-app) echo "Drive real hey load across $benchmark_apps apps routed by hostname through one workerd-host process, and capture per-app fairness and routing/queue counters in demo output files." ;;
         benchmark-orchestrator-contract) echo "Drive real hey load across $benchmark_apps apps, then send SIGTERM mid-flight and prove admitted requests drain while new traffic is not admitted." ;;
         *) return 1 ;;
@@ -404,7 +404,8 @@ takeaway() {
         multi-app) echo "One host process can route many independently configured apps by hostname." ;;
         orchestrator-contract) echo "An external orchestrator can rely on deterministic health, readiness, status, and shutdown behavior." ;;
         benchmark-on-demand|benchmark-prewarmed) echo "The same local request run shows the difference between creating VMs when needed and keeping VMs ready." ;;
-        benchmark-resident|benchmark-multi-app|benchmark-orchestrator-contract) echo "Real hey load, not just functional checks, backs the resident/multi-app/orchestrator-contract claims." ;;
+        benchmark-resident) echo "Real $benchmark_load_driver load, not just functional checks, backs the resident-host throughput claims." ;;
+        benchmark-multi-app|benchmark-orchestrator-contract) echo "Real hey load, not just functional checks, backs the multi-app/orchestrator-contract claims." ;;
         *) return 1 ;;
     esac
 }
@@ -526,6 +527,15 @@ render_demo() {
     print_wrapped "  " "$(takeaway "$demo")"
     printf '\n%bACTION%b\n' "$c_cyan" "$c_reset"
     print_wrapped "  " "$(action "$demo")"
+    if [[ "$demo" == benchmark-resident ]]; then
+        printf '\nLOAD DRIVER: %s\n' "$benchmark_load_driver"
+        if [[ "$benchmark_load_driver" == vegeta ]]; then
+            printf '  One shared vegeta attack process; %s workers across %s apps.\n' \
+                "$benchmark_concurrency" "$benchmark_apps"
+        else
+            printf '  Per-app hey processes; at most %s running concurrently.\n' "$hey_max_parallel_jobs"
+        fi
+    fi
 }
 
 print_wrapped() {
@@ -902,26 +912,49 @@ print_demo_evidence() {
             local dir="$output_dir/benchmark-resident"
             evidence_row "Apps" "$benchmark_apps independent resident processes"
             evidence_row "Total requests" "$benchmark_load_requests / aggregate concurrency $benchmark_concurrency"
-            evidence_row "Sum-of-rates throughput" "$(jq -r '.aggregate.sum_of_app_requests_per_sec' "$dir/summary.json") req/s (sum of each app's own hey rate; overstates true throughput once hey_waves > 1)"
-            evidence_row "End-to-end throughput" "$(jq -r '.aggregate.end_to_end_requests_per_sec' "$dir/summary.json") req/s (total_requests / first-wave-release-to-last-wave-finish seconds; includes inter-wave gaps -- the number to report/compare as this run's throughput)"
-            evidence_row "Active-wave throughput" "$(jq -r '.aggregate.active_wave_requests_per_sec' "$dir/summary.json") req/s (total_requests / sum of each wave's barrier-release-to-finish seconds; excludes all forking/spawn overhead AND inter-wave gaps -- narrower than end-to-end once hey_waves > 1, same value when hey_waves == 1)"
-            evidence_row "Hey waves / barrier scope" "$(jq -r '.aggregate.hey_waves' "$dir/summary.json") wave(s), barrier_scope=$(jq -r '.aggregate.barrier_scope' "$dir/summary.json") (apps=$benchmark_apps, max $(jq -r '.aggregate.max_parallel_hey_jobs' "$dir/summary.json") concurrent hey processes; the barrier only holds jobs within ONE wave together -- apps do not all launch simultaneously when hey_waves > 1)"
+            evidence_row "Load driver" "$(jq -r '.aggregate.load_driver' "$dir/summary.json")"
+            if [[ "$benchmark_load_driver" == vegeta ]]; then
+                evidence_row "Load processes" "1 shared vegeta attack / $benchmark_concurrency workers"
+                evidence_row "Vegeta requests" "$(jq -r '.requests' "$dir/vegeta-report.json") across all $benchmark_apps targets"
+                evidence_row "Throughput" "$(jq -r '.throughput' "$dir/vegeta-report.json") req/s (Vegeta)"
+                evidence_row "Success" "$(jq -r '.success * 100' "$dir/vegeta-report.json")% (Vegeta)"
+                evidence_row "Mean latency" "$(jq -r '.latencies.mean / 1000000' "$dir/vegeta-report.json") ms (Vegeta)"
+                evidence_row "P99 latency" "$(jq -r '.latencies["99th"] / 1000000' "$dir/vegeta-report.json") ms (Vegeta)"
+            else
+                evidence_row "Sum-of-rates throughput" "$(jq -r '.aggregate.sum_of_app_requests_per_sec' "$dir/summary.json") req/s (sum of each app's own hey rate; overstates true throughput once hey_waves > 1)"
+                evidence_row "End-to-end throughput" "$(jq -r '.aggregate.end_to_end_requests_per_sec' "$dir/summary.json") req/s (total_requests / first-wave-release-to-last-wave-finish seconds; includes inter-wave gaps -- the number to report/compare as this run's throughput)"
+                evidence_row "Active-wave throughput" "$(jq -r '.aggregate.active_wave_requests_per_sec' "$dir/summary.json") req/s (total_requests / sum of each wave's barrier-release-to-finish seconds; excludes all forking/spawn overhead AND inter-wave gaps -- narrower than end-to-end once hey_waves > 1, same value when hey_waves == 1)"
+                evidence_row "Hey waves / barrier scope" "$(jq -r '.aggregate.hey_waves' "$dir/summary.json") wave(s), barrier_scope=$(jq -r '.aggregate.barrier_scope' "$dir/summary.json") (apps=$benchmark_apps, max $(jq -r '.aggregate.max_parallel_hey_jobs' "$dir/summary.json") concurrent hey processes; the barrier only holds jobs within ONE wave together -- apps do not all launch simultaneously when hey_waves > 1)"
+            fi
             evidence_row "Phase timing" "$(jq -c '.timing' "$dir/summary.json")"
-            evidence_row "Weighted mean latency" "$(jq -r '.aggregate.weighted_mean_latency_ms' "$dir/summary.json") ms"
-            evidence_row "Per-app" "$(jq -c '[.apps[] | {app_id, requests, requests_per_sec}]' "$dir/summary.json")"
-            evidence_row "Raw hey output" "$dir/hey.txt (collected per-app reports; each app also keeps its own app-N/hey.txt)"
-            evidence_row "Log" "$dir/run.log (orchestration: config, launch/ready, hey waves, status, shutdown, phase totals)"
+            if [[ "$benchmark_load_driver" == hey ]]; then
+                evidence_row "Weighted mean latency" "$(jq -r '.aggregate.weighted_mean_latency_ms' "$dir/summary.json") ms"
+            fi
+            if [[ "$benchmark_load_driver" == vegeta ]]; then
+                evidence_row "Per-app summary" "$dir/summary.json (.apps; $benchmark_apps targets)"
+                evidence_row "Vegeta report" "$dir/vegeta.txt / vegeta-report.json (native aggregate reports)"
+                evidence_row "Per-app reports" "$dir/hey.txt (Vegeta-derived, hey-compatible format; app-N/hey.txt)"
+            else
+                evidence_row "Per-app summary" "$dir/summary.json (.apps; $benchmark_apps targets)"
+                evidence_row "Raw hey output" "$dir/hey.txt (collected per-app reports; each app also keeps its own app-N/hey.txt)"
+            fi
+            evidence_row "Log" "$dir/run.log (config, launch/ready, $benchmark_load_driver load, status, shutdown, phase totals)"
             printf '\n%bLSCPU OUTPUT%b\n\n' "$c_bold$c_green" "$c_reset"
             sed 's/^/  /' "$dir/lscpu.txt"
-            printf '\n%bSUMMARY JSON%b\n\n' "$c_bold$c_green" "$c_reset"
-            jq '.' "$dir/summary.json" | sed 's/^/  /'
-            printf '\n%bRAW HEY OUTPUT%b\n\n' "$c_bold$c_green" "$c_reset"
-            if ((benchmark_apps > 1)); then
-                printf '  (omitted from terminal/log display: %d hey clients; full raw' \
-                    "$benchmark_apps"
-                printf ' per-app reports remain on disk in %s and each app-N/hey.txt)\n' "$dir/hey.txt"
+            if [[ "$benchmark_load_driver" == vegeta ]]; then
+                printf '\n%bVEGETA SUMMARY - ALL TARGETS%b\n\n' "$c_bold$c_green" "$c_reset"
+                sed 's/^/  /' "$dir/vegeta.txt"
             else
-                sed 's/^/  /' "$dir/hey.txt"
+                printf '\n%bSUMMARY JSON%b\n\n' "$c_bold$c_green" "$c_reset"
+                jq 'del(.apps)' "$dir/summary.json" | sed 's/^/  /'
+                printf '\n%bRAW HEY OUTPUT%b\n\n' "$c_bold$c_green" "$c_reset"
+                if ((benchmark_apps > 1)); then
+                    printf '  (omitted from terminal/log display: %d hey clients; full raw' \
+                        "$benchmark_apps"
+                    printf ' per-app reports remain on disk in %s and each app-N/hey.txt)\n' "$dir/hey.txt"
+                else
+                    sed 's/^/  /' "$dir/hey.txt"
+                fi
             fi
             ;;
         benchmark-multi-app)
@@ -933,14 +966,14 @@ print_demo_evidence() {
             evidence_row "Active-wave throughput" "$(jq -r '.aggregate.active_wave_requests_per_sec' "$dir/summary.json") req/s (total_requests / sum of each wave's barrier-release-to-finish seconds; excludes all forking/spawn overhead AND inter-wave gaps -- narrower than end-to-end once hey_waves > 1, same value when hey_waves == 1)"
             evidence_row "Hey waves / barrier scope" "$(jq -r '.aggregate.hey_waves' "$dir/summary.json") wave(s), barrier_scope=$(jq -r '.aggregate.barrier_scope' "$dir/summary.json") (apps=$benchmark_apps, max $(jq -r '.aggregate.max_parallel_hey_jobs' "$dir/summary.json") concurrent hey processes; the barrier only holds jobs within ONE wave together -- apps do not all launch simultaneously when hey_waves > 1)"
             evidence_row "Phase timing" "$(jq -c '.timing' "$dir/summary.json")"
-            evidence_row "Status" "$(jq -c '[.[] | {app_id, kind}]' "$dir/status.json")"
-            evidence_row "Per-app" "$(jq -c '[.apps[] | {app_id, requests, requests_per_sec}]' "$dir/summary.json")"
+            evidence_row "Per-app status" "$dir/status.json"
+            evidence_row "Per-app summary" "$dir/summary.json (.apps; $benchmark_apps targets)"
             evidence_row "Raw hey output" "$dir/hey.txt (collected per-app reports; each app also keeps its own app-N-hey.txt)"
             evidence_row "Log" "$dir/run.log (orchestration: config, launch/ready, hey waves, status, shutdown, phase totals)"
             printf '\n%bLSCPU OUTPUT%b\n\n' "$c_bold$c_green" "$c_reset"
             sed 's/^/  /' "$dir/lscpu.txt"
             printf '\n%bSUMMARY JSON%b\n\n' "$c_bold$c_green" "$c_reset"
-            jq '.' "$dir/summary.json" | sed 's/^/  /'
+            jq 'del(.apps)' "$dir/summary.json" | sed 's/^/  /'
             printf '\n%bRAW HEY OUTPUT%b\n\n' "$c_bold$c_green" "$c_reset"
             if ((benchmark_apps > 1)); then
                 printf '  (omitted from terminal/log display: %d hey clients; full raw' \
@@ -973,7 +1006,8 @@ print_demo_evidence() {
             evidence_row "Shutdown duration" "$(jq -r '.shutdown_duration_ms' "$dir/summary.json") ms"
             evidence_row "Exit code" "$(jq -r '.exit_code' "$dir/summary.json") (0 = clean shutdown)"
             printf '\n%bSUMMARY JSON%b\n\n' "$c_bold$c_green" "$c_reset"
-            jq '.' "$dir/summary.json" | sed 's/^/  /'
+            evidence_row "Per-app details" "$dir/summary.json (pre_drain.apps / during_drain.apps)"
+            jq 'del(.pre_drain.apps, .during_drain.apps)' "$dir/summary.json" | sed 's/^/  /'
             ;;
         component)
             local component="$output_dir/component/proof.json"
@@ -1133,13 +1167,20 @@ require_runtime() {
             exit 2
         }
     done
-    for required in cargo curl docker hey jq lscpu python3 sha256sum sqlite3; do
+    for required in cargo curl docker jq lscpu python3 sha256sum sqlite3; do
         command -v "$required" >/dev/null || {
             echo "missing required command: $required" >&2
             exit 2
         }
     done
-    if [[ "${benchmark_load_driver:-hey}" == vegeta ]]; then
+    if [[ "$mode" != one || "$selected" != benchmark-resident || "$benchmark_load_driver" != vegeta ]]; then
+        command -v hey >/dev/null || {
+            echo "missing required command: hey" >&2
+            exit 2
+        }
+    fi
+    if [[ "$benchmark_load_driver" == vegeta ]] &&
+        [[ "$mode" != one || "$selected" == benchmark-resident ]]; then
         command -v vegeta >/dev/null || {
             echo "missing required command: vegeta (required by --benchmark-load-driver vegeta)" >&2
             exit 2
@@ -1766,6 +1807,39 @@ self_test() {
     assert_alloc 7 7 "1 1 1 1 1 1 1"
     assert_alloc 0 4 "0 0 0 0"
 
+    local driver_position driver_preview driver_preview_dir
+    driver_preview_dir="$(mktemp -d)"
+    for driver_position in before after; do
+        local -a driver_args=(--benchmark-apps 512 --benchmark-load-requests 51200 --benchmark-concurrency 512)
+        if [[ "$driver_position" == before ]]; then
+            driver_args+=(--benchmark-load-driver vegeta --describe benchmark-resident)
+        else
+            driver_args+=(--describe benchmark-resident --benchmark-load-driver vegeta)
+        fi
+        driver_preview="$(HYPERLIGHT_DEMO_OUTPUT="$driver_preview_dir" \
+            bash "$root/tools/hyperlight-demo" "${driver_args[@]}")"
+        if [[ "$driver_preview" != *"LOAD DRIVER: vegeta"* ||
+            "$driver_preview" != *"512 workers across 512 apps"* ||
+            "$driver_preview" == *"real hey load"* ]]; then
+            printf 'FAIL vegeta selection/display with driver argument %s demo\n' "$driver_position" >&2
+            failures=$((failures + 1))
+        fi
+    done
+    rm -f "$driver_preview_dir/worker-code/benchmark-resident.json"
+    rmdir "$driver_preview_dir/worker-code" "$driver_preview_dir"
+    local request_records
+    request_records="$(filter_vegeta_request_results <<'JSON'
+{"code":0,"method":"","url":"","error":"no targets to attack"}
+{"code":200,"method":"GET","url":"http://example.test/","error":""}
+{"code":0,"method":"GET","url":"http://example.test/","error":"connection refused"}
+JSON
+)"
+    if ! jq -s -e 'length == 2 and .[0].code == 200 and .[1].error == "connection refused"' \
+        <<<"$request_records" >/dev/null; then
+        echo "FAIL vegeta EOF filtering: real request successes/errors must remain" >&2
+        failures=$((failures + 1))
+    fi
+
     # Regression guard for run_one's fail-fast fix: bash disables errexit
     # for a compound command (and everything nested inside it, including
     # nested `set -e`) whenever that compound command is the left-hand
@@ -2296,7 +2370,7 @@ FAKE_HEY
     unset -f assert_progress_bar
 
     if ((failures == 0)); then
-        echo "self-test: all allocate_evenly, benchmark-flag-validation, helper-executability, post-signal-probe-classification, phase-b-batch-sizing, hey-request-snapping, request-conservation, request-conservation-fairness, launch_hey_jobs-barrier-timing, monotonic-clock, and progress-bar assertions passed"
+        echo "self-test: all allocate_evenly, benchmark-flag-validation, vegeta-selection/display, vegeta-EOF-filtering, helper-executability, post-signal-probe-classification, phase-b-batch-sizing, hey-request-snapping, request-conservation, request-conservation-fairness, launch_hey_jobs-barrier-timing, monotonic-clock, and progress-bar assertions passed"
         return 0
     fi
     echo "self-test: $failures assertion(s) failed" >&2
@@ -2587,6 +2661,11 @@ launch_hey_jobs() {
 # process itself exits nonzero, in which case every index is marked
 # failed together (there is no per-index process boundary to isolate a
 # single app's failure from another's).
+filter_vegeta_request_results() {
+    jq -c 'select((.error == "no targets to attack" and
+        .url == "" and .method == "" and .code == 0) | not)'
+}
+
 launch_vegeta_load() {
     local -n _lvl_reqs="$1" _lvl_concs="$2" _lvl_urls="$3" _lvl_hosts="$4"
     local -n _lvl_timeouts="$5" _lvl_outfiles="$6" _lvl_statuses="$7"
@@ -2677,14 +2756,23 @@ launch_vegeta_load() {
     fi
 
     if ((total_requests > 0)); then
-        vegeta encode -to=json "$results_bin" >"$records_json"
-        vegeta report -type=json "$results_bin" >"$report_json"
+        # Lazy target exhaustion produces a synthetic result, not an HTTP
+        # request. Keep real request errors, excluding only this EOF marker.
+        vegeta encode -to=json "$results_bin" |
+            filter_vegeta_request_results >"$records_json"
+        vegeta report -type=json "$records_json" >"$report_json"
+        vegeta report "$records_json" >"$_lvl_workdir/vegeta.txt"
+        if ! jq -e --argjson expected "$total_requests" '.requests == $expected' "$report_json" >/dev/null; then
+            printf 'FAILURE: Vegeta reported %s requests; expected %s (see %s)\n' \
+                "$(jq -r '.requests' "$report_json")" "$total_requests" "$report_json" >&2
+            return 1
+        fi
     else
         : >"$records_json"
         printf '{"duration":0}' >"$report_json"
     fi
     local overall_duration_s
-    overall_duration_s="$(jq -r '(.duration // 0) / 1000000000' "$report_json")"
+    overall_duration_s="$(jq -r '((.duration // 0) + (.wait // 0)) / 1000000000' "$report_json")"
 
     # One jq invocation covering every app at once: groups every observed
     # request record by its URL (unique per app), joins against the
@@ -2740,8 +2828,14 @@ launch_vegeta_load() {
 write_collected_hey_report() {
     local output="$1"
     local -n _wchr_ids="$2" _wchr_addrs="$3" _wchr_cmds="$4" _wchr_files="$5"
+    local load_driver="${6:-hey}"
     {
-        echo "# Collected raw hey reports: one independent hey run per app below."
+        if [[ "$load_driver" == vegeta ]]; then
+            echo "# Vegeta-derived per-app reports in hey-compatible format."
+            echo "# One shared vegeta attack; native aggregate: vegeta-report.json."
+        else
+            echo "# Collected raw hey reports: one independent hey run per app below."
+        fi
         echo "# NOT a combined statistical distribution -- see summary.json for"
         echo "# the computed aggregate (sum of throughput, weighted mean latency)."
         local i n="${#_wchr_ids[@]}"
@@ -3899,10 +3993,10 @@ run_benchmark_resident() {
         # was left empty on failure. Printing the diagnostic to stderr
         # here ensures it lands in both logs.
         if [[ "${statuses[i]}" != 0 ]]; then
-            log_line "$run_log" "FAILURE: app bench-$i hey exit=${statuses[i]}" \
+            log_line "$run_log" "FAILURE: app bench-$i $benchmark_load_driver exit=${statuses[i]}" \
                 "see ${outfiles[i]} and $dir/app-$i/server.log"
-            printf 'FAILURE: app bench-%d hey exited %s (see %s and %s)\n' \
-                "$i" "${statuses[i]}" "${outfiles[i]}" "$dir/app-$i/server.log" >&2
+            printf 'FAILURE: app bench-%d %s exited %s (see %s and %s)\n' \
+                "$i" "$benchmark_load_driver" "${statuses[i]}" "${outfiles[i]}" "$dir/app-$i/server.log" >&2
             return 1
         fi
         if ((reqs[i] > 0)) &&
@@ -3965,7 +4059,7 @@ run_benchmark_resident() {
     local app_summaries
     app_summaries="$(printf '%s\n' "${app_summary_list[@]}" | jq -cs '.')"
 
-    write_collected_hey_report "$dir/hey.txt" app_ids urls cmds outfiles
+    write_collected_hey_report "$dir/hey.txt" app_ids urls cmds outfiles "$benchmark_load_driver"
     jq -s '.' "$dir"/app-*/status.json >"$dir/status.json"
     log_line "$run_log" "shutdown start"
     stop_processes
@@ -3982,6 +4076,11 @@ run_benchmark_resident() {
     [[ "$benchmark_load_driver" == vegeta ]] && effective_max_parallel=0
     write_benchmark_summary "benchmark-resident" "$app_summaries" "$timing_json" \
         "$effective_max_parallel" "$dir/summary.json" "$benchmark_load_driver"
+    if [[ "$benchmark_load_driver" == vegeta ]]; then
+        jq --slurpfile report "$dir/vegeta-report.json" '.vegeta = $report[0]' \
+            "$dir/summary.json" >"$dir/summary.json.tmp"
+        mv "$dir/summary.json.tmp" "$dir/summary.json"
+    fi
     log_line "$run_log" "benchmark-resident complete: total_elapsed=$(seconds_between "$t_start" "$t_end")s"
     echo "All $benchmark_load_requests requests across $benchmark_apps independent resident apps succeeded; see $dir/summary.json, $dir/hey.txt, and $run_log"
 }
@@ -4613,6 +4712,11 @@ run_one() {
     printf 'LOG\n  %s\n\n' "$log" >&2
     printf '%bLAST 30 LOG LINES%b\n' "$c_yellow" "$c_reset" >&2
     tail -n 30 "$log" | sed 's/^/  /' >&2
+    if [[ "$demo" == benchmark-resident && "$benchmark_load_driver" == vegeta &&
+        -f "$output_dir/$demo/vegeta.txt" ]]; then
+        printf '\nVEGETA SUMMARY - ALL TARGETS\n\n' >&2
+        sed 's/^/  /' "$output_dir/$demo/vegeta.txt" >&2
+    fi
     return 1
 }
 

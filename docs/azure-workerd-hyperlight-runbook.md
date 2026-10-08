@@ -604,7 +604,7 @@ run makes both drivers available without any extra steps.
 Under vegeta, per-app results are synthesized back into the exact same
 `hey`-report-format text file (`Total:`/`Average:`/`Requests/sec:`/
 `[200] N responses`) that `hey` itself would have produced, from
-vegeta's own `report -type=json` (overall duration) and
+vegeta's own `report -type=json` (attack duration plus completion wait) and
 `encode -to=json` (per-request records, grouped by target URL) — so
 every downstream consumer (`build_app_summary`, the collected
 `hey.txt`, `summary.json`'s aggregate fields) works unmodified
@@ -625,6 +625,28 @@ the other aggregate throughput numbers remain meaningful for either
 driver (vegeta's single-attack timing plays the same role hey's
 barrier-anchored timing does for `active_wave_requests_per_sec`/
 `end_to_end_requests_per_sec`, since there is only one "wave").
+
+The driver flag can appear before or after `--demo benchmark-resident`.
+The terminal announces `LOAD DRIVER: vegeta` before setup and reports one
+shared attack rather than hey waves. The headline throughput, success,
+mean latency, and P99 latency come directly from Vegeta's native report,
+and its complete text output is displayed under
+`VEGETA SUMMARY - ALL TARGETS`. This is one aggregate over every target,
+not a sum or average of independently calculated per-app rates.
+`vegeta.txt` and `vegeta-report.json` retain the native aggregate reports;
+`summary.json.vegeta` also contains the unmodified native JSON report.
+The retained `hey.txt` filenames contain explicitly
+labelled Vegeta-derived, hey-compatible per-app reports, not hey runs.
+Legacy aggregate fields remain for compatibility, not as the headline
+Vegeta metrics. Finite lazy-target exhaustion markers (`no targets to
+attack`, with no method or URL) are excluded before reporting because
+they are not HTTP requests; actual HTTP/network failures remain included.
+The native report's request count must equal the configured total.
+A Vegeta-only resident demo requires `vegeta`, not `hey`; demos that use
+hey still require it.
+For all three multi-app load benchmarks, the terminal shows aggregate
+results and progress rather than per-app JSON breakdowns. Full app
+details remain in `summary.json`, per-app reports, and orchestration logs.
 
 ### Raw `hey` output, logs, timing, and throughput metrics
 
