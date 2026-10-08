@@ -1116,6 +1116,7 @@ list_demos() {
 }
 
 stop_processes() {
+    finish_progress
     # Two-phase shutdown: signal every tracked process first, then wait on
     # all of them. Each process's shutdown (closing its VM, flushing
     # hyperlight resources) then proceeds concurrently instead of being
@@ -2390,8 +2391,8 @@ FAKE_HEY
     # Regression guard for the benchmark-resident "is it hung?" progress
     # indicator (print_progress_bar): when stdout is NOT a terminal --
     # the only path self-test/CI can reliably capture via $(...); the
-    # interactive \r bar path requires a real tty and isn't exercised
-    # here -- it must still emit periodic plain-line progress, always
+    # the pseudo-TTY regression below covers the interactive path;
+    # captured output must emit periodic plain-line progress, always
     # including the very first and last step, and must not error on
     # TOTAL=0 (guards the division-by-zero edge case).
     # _LHJ_TEST_NO_TTY_ESCAPE forces print_progress_bar's fd-1 fallback
@@ -2409,6 +2410,23 @@ FAKE_HEY
             printf 'FAIL print_progress_bar: last step (100/100) not printed\n' >&2
             failures=$((failures + 1))
         fi
+        if [[ "$out" == *$'\r'* || "$out" == *$'\033'* ]]; then
+            echo "FAIL print_progress_bar: terminal controls leaked into captured output" >&2
+            failures=$((failures + 1))
+        fi
+        local large_out
+        # shellcheck disable=SC2030,SC2031 # Captured rendering deliberately uses its own override.
+        large_out="$(export _LHJ_TEST_NO_TTY_ESCAPE=1
+            for ((i = 1; i <= 4096; i++)); do
+                print_progress_bar "$i" 4096 "setup: resident hosts ready" "$i"
+            done
+            phase_message "next phase"
+            stop_processes)"
+        if [[ "$large_out" != *"4096/4096"* || "$large_out" == *$'\r'* ||
+            "$large_out" == *$'\033'* ]]; then
+            echo "FAIL 4096-host captured progress: missing completion or terminal controls" >&2
+            failures=$((failures + 1))
+        fi
         local lines
         lines=$(grep -c . <<<"$out")
         if ((lines < 2 || lines > 45)); then
@@ -2423,6 +2441,89 @@ FAKE_HEY
     }
     assert_progress_bar
     unset -f assert_progress_bar
+    if ! python3 - "$root/tools/hyperlight-demo" <<'PY'
+import errno
+import os
+import pty
+import subprocess
+import sys
+
+master, slave = pty.openpty()
+script = r"""
+set -euo pipefail
+eval "$(sed '/^mode=interactive$/,$d' "$DEMO_SCRIPT")"
+unset COLUMNS
+stty cols 180 <&1
+print_progress_bar 997 4096 "setup: resident hosts ready very long previous label" 12345
+print_progress_bar 997 4096 "setup: resident hosts ready" 27
+phase_message "next phase"
+stty cols 60 <&1
+print_progress_bar 1 4096 "shrinking terminal" 12345
+stty cols 100 <&1
+print_progress_bar 4096 4096 "complete" 15
+print_progress_bar 1 4096 "failure in progress" 9
+stop_processes
+printf 'failure message\n'
+"""
+try:
+    process = subprocess.Popen(
+        ["bash"], stdin=subprocess.PIPE, stdout=slave, stderr=slave,
+        env=dict(os.environ, DEMO_SCRIPT=sys.argv[1], _LHJ_TEST_NO_TTY_ESCAPE="1"),
+    )
+    os.close(slave)
+    slave = None
+    process.stdin.write(script.encode())
+    process.stdin.close()
+    chunks = []
+    while True:
+        try:
+            chunk = os.read(master, 65536)
+        except OSError as error:
+            if error.errno != errno.EIO:
+                raise
+            break
+        if not chunk:
+            break
+        chunks.append(chunk)
+    assert process.wait(timeout=10) == 0
+    text = b"".join(chunks).decode()
+    rows, row, column, erased_rows = [], [], 0, []
+    index = 0
+    while index < len(text):
+        if text.startswith("\x1b[2K", index):
+            erased_rows.append("".join(row))
+            row = []
+            index += 4
+            continue
+        char = text[index]
+        if char == "\r":
+            column = 0
+        elif char == "\n":
+            rows.append("".join(row))
+            row, column = [], 0
+        else:
+            while len(row) <= column:
+                row.append(" ")
+            row[column] = char
+            column += 1
+        index += 1
+    assert rows[0] == "  setup: resident hosts ready [#######                       ] 997/4096 (24%, 27s)", rows
+    assert rows[1] == "next phase", rows
+    assert len(erased_rows[3]) == 59, erased_rows
+    assert len(rows[2]) < 100 and rows[2].endswith("(100%, 15s)"), rows
+    assert rows[3].endswith("(0%, 9s)") and rows[4] == "failure message", rows
+    assert row == [], "completion/failure did not end on a clean newline"
+    assert text.count("\r\x1b[2K") == 5, repr(text)
+    print("self-test: pseudo-TTY 4096-app redraw, shorter text, width changes, phase messages and failure newline passed")
+finally:
+    os.close(master)
+    if slave is not None:
+        os.close(slave)
+PY
+    then
+        echo "FAIL pseudo-TTY progress rendering" >&2
+        failures=$((failures + 1))
+    fi
 
     if ((failures == 0)); then
         echo "self-test: all allocate_evenly, benchmark-flag-validation, vegeta-selection/display, vegeta-EOF-filtering, helper-executability, post-signal-probe-classification, phase-b-batch-sizing, hey-request-snapping, request-conservation, request-conservation-fairness, launch_hey_jobs-barrier-timing, monotonic-clock, and progress-bar assertions passed"
@@ -3037,12 +3138,44 @@ log_line() {
 }
 
 phase_message() {
+    finish_progress
     printf '%s\n' "$*"
     # shellcheck disable=SC2031 # The self-test override is intentionally subshell-local.
     if [[ ! -t 1 && -z "${_LHJ_TEST_NO_TTY_ESCAPE:-}" ]] &&
         { exec 3>/dev/tty; } 2>/dev/null; then
         printf '%s\n' "$*" >&3
         exec 3>&-
+    fi
+}
+
+finish_progress() {
+    [[ "${_progress_line_active:-false}" == true ]] || return 0
+    local out_fd=1
+    # shellcheck disable=SC2031 # The self-test override is intentionally subshell-local.
+    if [[ -z "${_LHJ_TEST_NO_TTY_ESCAPE:-}" ]] &&
+        { exec 3>/dev/tty; } 2>/dev/null; then
+        out_fd=3
+    fi
+    [[ ! -t "$out_fd" ]] || printf '\n' >&"$out_fd"
+    _progress_line_active=false
+    if ((out_fd == 3)); then exec 3>&-; fi
+}
+
+render_progress_line() {
+    local out_fd="$1" text="$2" complete="$3"
+    local columns terminal_size terminal_fd
+    exec {terminal_fd}<&"$out_fd"
+    terminal_size="$(stty size <&"$terminal_fd" 2>/dev/null)" || terminal_size=""
+    exec {terminal_fd}<&-
+    columns="${terminal_size##* }"
+    [[ "$columns" =~ ^[1-9][0-9]*$ ]] || columns="${COLUMNS:-80}"
+    [[ "$columns" =~ ^[1-9][0-9]*$ ]] || columns=80
+    # Leave the last column unused to prevent terminal auto-wrap.
+    printf '\r\033[2K%s' "${text:0:columns-1}" >&"$out_fd"
+    _progress_line_active=true
+    if [[ "$complete" == true ]]; then
+        printf '\n' >&"$out_fd"
+        _progress_line_active=false
     fi
 }
 
@@ -3107,14 +3240,14 @@ print_progress_bar() {
         ((filled > width)) && filled=$width
         local bar
         bar="$(printf '%*s' "$filled" '' | tr ' ' '#')$(printf '%*s' $((width - filled)) '')"
-        printf '\r  %s [%s] %d/%d (%d%%, %ds)' "$label" "$bar" "$current" "$total" "$pct" "$elapsed" >&"$out_fd"
-        if ((current >= total)); then
-            printf '\n' >&"$out_fd"
-        fi
+        local text complete=false
+        printf -v text '  %s [%s] %d/%d (%d%%, %ds)' "$label" "$bar" "$current" "$total" "$pct" "$elapsed"
+        ((current < total)) || complete=true
+        render_progress_line "$out_fd" "$text" "$complete"
     else
         local step=$(((total + 39) / 40))
         ((step < 1)) && step=1
-        if ((current % step == 0 || current >= total)); then
+        if ((current == 1 || current % step == 0 || current >= total)); then
             printf '  %s: %d/%d (%d%%, %ds)\n' "$label" "$current" "$total" "$pct" "$elapsed" >&"$out_fd"
         fi
     fi
@@ -4059,7 +4192,7 @@ run_benchmark_resident() {
             log_line "$run_log" "app bench-$i launched: pid=$app_pid bind=$bind" \
                 "server_log=$app_dir/server.log"
             log_line "$run_log" "app bench-$i ready: elapsed=$(seconds_between "${app_t0s[i]}" "$app_t1")s"
-            print_progress_bar "$((i + 1))" "$benchmark_apps" "setup: resident apps ready" \
+            print_progress_bar "$((i + 1))" "$benchmark_apps" "setup: resident hosts ready" \
                 "$(printf '%.0f' "$(seconds_between "$t_start" "$app_t1")")"
         done
         for app_pid in "${ready_tracks[@]}"; do unset "extra_pids[$app_pid]"; done

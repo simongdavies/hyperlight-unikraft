@@ -509,6 +509,12 @@ Long Vegeta decoding/report/grouping commands emit a `still working`
 elapsed-time update every five seconds, followed by completion or an
 explicit failure. Post-load collection retains its aggregate progress
 bar; detailed app data remains on disk.
+Terminal progress redraws erase the previous line before writing and
+stay within the terminal width. Phase changes and failure cleanup finish
+the active progress row with a newline. Non-terminal progress uses
+periodic complete lines without carriage returns or ANSI erase codes.
+`setup: resident hosts ready` counts hosts whose readiness probes have
+passed; it does not mean benchmark requests have completed.
 
 When requests or concurrency do not divide evenly across apps, the
 presenter allocates the remainder deterministically (earlier apps receive
