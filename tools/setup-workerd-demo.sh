@@ -11,11 +11,20 @@ BAZELISK_VERSION=1.28.1
 BAZELISK_SHA256=22e7d3a188699982f661cf4687137ee52d1f24fec1ec893d91a6c4d791a75de8
 LLVM_VERSION=22
 # Ubuntu jammy's golang-go package is 1.18, too old for vegeta's go.mod
-# (requires go 1.22+). Pin a newer toolchain, fetched on demand via
-# golang.org/dl (Go's own SDK installer, verified against the official
-# checksum database), used only for the hey/vegeta `go install`s below;
-# the system golang-go stays untouched.
+# (requires go 1.22+). Pin a newer toolchain, used only for the
+# hey/vegeta `go install`s below; the system golang-go stays untouched.
+#
+# Preferred path: golang.org/dl (Go's own SDK installer), fetched via the
+# module proxy/checksum database (GOSUMDB) rather than a raw binary
+# download. This requires the *existing* `go` to be 1.19+: its
+# internal/version package uses the "unix" build-tag meta-constraint,
+# which older `go` toolchains (e.g. jammy's 1.18) do not recognize, so
+# the file defining signalsToIgnore is silently excluded and the build
+# fails with "undefined: signalsToIgnore". When the existing `go` is
+# older than 1.19, fall back to a direct, checksum-verified download of
+# the official tarball from go.dev instead.
 GO_TOOLCHAIN_VERSION=1.27.1
+GO_TOOLCHAIN_LINUX_AMD64_SHA256=63d339f0da5ab53635a56f2490a7984dfe12dfcff22ad749f63edaf590168445
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cache_root="${XDG_CACHE_HOME:-$HOME/.cache}/hyperlight-workerd"
@@ -113,18 +122,58 @@ installed_docker_ce_packages() {
 }
 
 pinned_go=""
+system_go_supports_dl_installer() {
+    # golang.org/dl's internal/version package gates a file on the
+    # "unix" build-tag meta-constraint, only recognized by go1.19+. If
+    # the existing `go` predates that, the golang.org/dl install itself
+    # fails to compile ("undefined: signalsToIgnore"), regardless of
+    # GO_TOOLCHAIN_VERSION.
+    local existing_version major minor
+    existing_version="$(go env GOVERSION 2>/dev/null || true)"
+    [[ "$existing_version" =~ ^go([0-9]+)\.([0-9]+) ]] || return 1
+    major="${BASH_REMATCH[1]}"
+    minor="${BASH_REMATCH[2]}"
+    ((major > 1 || (major == 1 && minor >= 19)))
+}
+
 ensure_pinned_go() {
     [[ -n "$pinned_go" ]] && return
-    if ! command -v "go$GO_TOOLCHAIN_VERSION" >/dev/null; then
-        step "Installing a pinned Go $GO_TOOLCHAIN_VERSION toolchain"
-        go install "golang.org/dl/go$GO_TOOLCHAIN_VERSION@latest"
+    if system_go_supports_dl_installer; then
+        if ! command -v "go$GO_TOOLCHAIN_VERSION" >/dev/null; then
+            step "Installing a pinned Go $GO_TOOLCHAIN_VERSION toolchain (golang.org/dl)"
+            go install "golang.org/dl/go$GO_TOOLCHAIN_VERSION@latest"
+        fi
+        # Idempotent: no-ops if the SDK is already downloaded. Fetched
+        # via Go's own module proxy/checksum database (GOSUMDB), not a
+        # raw binary download.
+        "go$GO_TOOLCHAIN_VERSION" download
+        pinned_go="go$GO_TOOLCHAIN_VERSION"
+        return
     fi
-    # Idempotent: no-ops if the SDK is already downloaded. Fetched via
-    # Go's own module proxy/checksum database (GOSUMDB), not a raw
-    # binary download, so it doesn't depend on go.dev serving a tarball
-    # intact over whatever network path this host has.
-    "go$GO_TOOLCHAIN_VERSION" download
-    pinned_go="go$GO_TOOLCHAIN_VERSION"
+
+    # Fall back to a direct, checksum-verified download of the official
+    # tarball: the existing `go` is too old to build golang.org/dl.
+    local go_root="$cache_root/go-$GO_TOOLCHAIN_VERSION"
+    if [[ ! -x "$go_root/bin/go" ]]; then
+        step "Installing a pinned Go $GO_TOOLCHAIN_VERSION toolchain (direct download)"
+        local tarball
+        tarball="$(mktemp)"
+        curl --proto '=https' --tlsv1.2 --fail --show-error --silent \
+            --retry 3 --retry-all-errors --retry-delay 2 \
+            -o "$tarball" \
+            "https://go.dev/dl/go$GO_TOOLCHAIN_VERSION.linux-amd64.tar.gz"
+        if ! echo "$GO_TOOLCHAIN_LINUX_AMD64_SHA256  $tarball" | sha256sum -c - >/dev/null; then
+            rm -f -- "$tarball"
+            fail "downloaded Go $GO_TOOLCHAIN_VERSION toolchain failed checksum" \
+                "verification; this host's network path to go.dev may be" \
+                "altering the download (retried 3 times already)"
+        fi
+        rm -rf -- "$go_root"
+        mkdir -p "$go_root"
+        tar -xzf "$tarball" -C "$go_root" --strip-components=1
+        rm -f -- "$tarball"
+    fi
+    pinned_go="$go_root/bin/go"
 }
 
 [[ "$(uname -s)" == Linux ]] || fail "this setup script requires Linux"
