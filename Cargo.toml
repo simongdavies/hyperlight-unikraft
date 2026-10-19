@@ -60,7 +60,7 @@ cap-std = "4"
 # Entropy for the guest's CSPRNG (GetRandomBytes); already in the tree
 # through hyperlight-host.
 getrandom = "0.4"
-rustix = { version = "1", features = ["net", "event", "fs"] }
+rustix = { version = "1", features = ["net", "event", "fs", "process"] }
 
 # Optional — CLI only.
 clap = { version = "4", features = ["derive"], optional = true }

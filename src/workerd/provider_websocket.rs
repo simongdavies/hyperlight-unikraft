@@ -508,6 +508,15 @@ impl ProviderWebSockets {
         {
             return reply(&query.request_id, "denied", "connection_limit");
         }
+        let Some(connect_deadline) = Instant::now()
+            .checked_add(Duration::from_millis(policy.limits.connect_timeout_ms))
+            .map(|connect| connect.min(deadline))
+        else {
+            return reply(&query.request_id, "host_error", "deadline");
+        };
+        if policy.credential.preflight(connect_deadline).is_err() {
+            return reply(&query.request_id, "host_error", "credential_failed");
+        }
         let (commands, input) = mpsc::sync_channel(policy.limits.queue_frames);
         let (output, events) = mpsc::sync_channel(policy.limits.queue_frames);
         let cancel = Arc::new(AtomicBool::new(false));
@@ -528,6 +537,7 @@ impl ProviderWebSockets {
                     url,
                     protocols,
                     deadline,
+                    connect_deadline,
                     roots,
                     cancel: worker_cancel,
                     commands: input,
@@ -791,6 +801,7 @@ struct Worker {
     url: reqwest::Url,
     protocols: Vec<String>,
     deadline: Instant,
+    connect_deadline: Instant,
     roots: Arc<rustls::RootCertStore>,
     cancel: Arc<AtomicBool>,
     commands: mpsc::Receiver<Command>,
@@ -806,6 +817,7 @@ fn run(worker: Worker) -> std::result::Result<(), &'static str> {
         url,
         protocols,
         deadline,
+        connect_deadline,
         roots,
         cancel,
         commands,
@@ -855,8 +867,10 @@ fn run(worker: Worker) -> std::result::Result<(), &'static str> {
         None => roots,
     };
     let network = policy.network(roots).map_err(|_| "policy_failed")?;
-    let connect_deadline =
-        deadline.min(Instant::now() + Duration::from_millis(policy.limits.connect_timeout_ms));
+    policy
+        .credential
+        .preflight(connect_deadline)
+        .map_err(|_| "credential_failed")?;
     let transport = provider_tls_transport(&network, &endpoint, connect_deadline)
         .map_err(|_| "connect_failed")?;
     if cancel.load(Ordering::Acquire) {
@@ -879,7 +893,7 @@ fn run(worker: Worker) -> std::result::Result<(), &'static str> {
     }
     policy
         .credential
-        .inject(&url, request.headers_mut())
+        .inject(&url, request.headers_mut(), connect_deadline)
         .map_err(|_| "credential_failed")?;
     let mut config = tungstenite::protocol::WebSocketConfig::default();
     config.write_buffer_size = 0;
@@ -1085,6 +1099,7 @@ mod tests {
                 scheme: "https".into(),
                 host: "127.0.0.1".into(),
                 port,
+                source: None,
             },
             limits: ProviderWebSocketLimits {
                 max_connections: 4,
@@ -1245,6 +1260,166 @@ mod tests {
             assert_eq!(denied["status"], "denied", "{denied}");
             assert!(broker.is_quiescent().unwrap());
         }
+    }
+
+    #[cfg(unix)]
+    fn publish_expiring(path: &std::path::Path, generation: &str, expires: u64, header: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let next = path.with_extension("next");
+        std::fs::write(
+            &next,
+            serde_json::to_vec(&serde_json::json!({
+                "version":1,"reference":"test-provider","generation":generation,
+                "expires_at_unix_ms":expires,"header_value":header
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&next, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::rename(next, path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Tungstenite requires its unboxed HTTP handshake error"
+    )]
+    fn expiring_tls_fixture(expire_during_tls: bool) {
+        let temporary = tempfile::tempdir().unwrap();
+        let secret = temporary.path().join("credential");
+        let CertifiedKey { cert, signing_key } =
+            generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+        let certificate = cert.der().clone();
+        let server = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![certificate.clone()],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der())),
+            )
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut policy = config(port, secret.clone());
+        policy.credential.source = Some(super::super::CredentialSource::ExpiringHeaderV1 {
+            safety_margin_ms: 30_000,
+        });
+        let mut broker = ProviderWebSockets::new(&[policy]).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(certificate).unwrap();
+        broker.roots = Arc::new(roots);
+        broker
+            .set_deadline(Instant::now() + Duration::from_secs(8))
+            .unwrap();
+        let open = || {
+            serde_json::json!({
+                "protocol_version":1,"request_id":"expiry-open","binding":"transcribe",
+                "url":format!("wss://127.0.0.1:{port}/realtime?intent=transcription"),"subprotocols":[]
+            })
+        };
+        // A dead refresher leaves its last publication behind, not a revocation callback.
+        publish_expiring(&secret, "dead-helper", 1, "Bearer expired");
+        let denied = call(&broker, "WorkerdWebSocketV1Open", open());
+        assert_eq!(denied["code"], "credential_failed");
+        assert!(denied.get("handle_id").is_none());
+        assert_eq!(broker.next_handle().unwrap(), 1);
+        assert!(broker.is_quiescent().unwrap());
+        assert!(
+            matches!(listener.accept(),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock)
+        );
+
+        publish_expiring(&secret, "before-tls", u64::MAX, "Bearer before");
+        listener.set_nonblocking(false).unwrap();
+        let rotated = secret.clone();
+        let fixture = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            // Acceptance proves the pre-dial read already passed. Rotate before TLS finishes.
+            publish_expiring(
+                &rotated,
+                "after-tls",
+                if expire_during_tls { 1 } else { u64::MAX },
+                "Bearer after",
+            );
+            let mut tls = rustls::StreamOwned::new(
+                rustls::ServerConnection::new(Arc::new(server)).unwrap(),
+                stream,
+            );
+            if expire_during_tls {
+                while tls.conn.is_handshaking() {
+                    tls.conn.complete_io(&mut tls.sock).unwrap();
+                }
+                let mut byte = [0];
+                match std::io::Read::read(&mut tls, &mut byte) {
+                    Ok(0) => (),
+                    Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => (),
+                    other => panic!("expired source transmitted application bytes: {other:?}"),
+                }
+            } else {
+                let mut socket = tungstenite::accept_hdr(
+                    tls,
+                    |request: &tungstenite::handshake::server::Request, response| {
+                        assert_eq!(request.headers()["authorization"], "Bearer after");
+                        Ok(response)
+                    },
+                )
+                .unwrap();
+                let message = socket.read().unwrap();
+                assert_eq!(message, Message::Text("still-open".into()));
+                socket.send(message).unwrap();
+                socket
+                    .close(Some(tungstenite::protocol::CloseFrame {
+                        code: 1000.into(),
+                        reason: "complete".into(),
+                    }))
+                    .unwrap();
+            }
+        });
+        let opened = call(&broker, "WorkerdWebSocketV1Open", open());
+        let handle = opened["handle_id"].as_u64().unwrap();
+        let event = read(&broker, handle, 0);
+        if expire_during_tls {
+            assert_eq!(event["status"], "host_error", "{event}");
+            joined_cancel(&broker, handle);
+        } else {
+            assert_eq!(event["kind"], "open", "{event}");
+            publish_expiring(&secret, "dead-refresher-after-open", 1, "Bearer expired");
+            assert_eq!(
+                call(&broker, "WorkerdWebSocketV1Open", open())["code"],
+                "credential_failed"
+            );
+            assert_eq!(broker.next_handle().unwrap(), 2);
+            let sent = call(
+                &broker,
+                "WorkerdWebSocketV1Send",
+                serde_json::json!({
+                    "protocol_version":1,"request_id":"expiry-send","binding":"transcribe",
+                    "handle_id":handle,"sequence":0,"opcode":1,"body_base64":STANDARD.encode("still-open")
+                }),
+            );
+            assert_eq!(sent["accepted"], true);
+            assert_eq!(read(&broker, handle, 1)["kind"], "message");
+            assert_eq!(read(&broker, handle, 2)["kind"], "close");
+        }
+        assert!(broker.is_quiescent().unwrap());
+        fixture.join().unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn expiring_tls_rotation_is_fresh_and_dead_refresher_does_not_cancel_open_socket() {
+        expiring_tls_fixture(false);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn expiring_tls_rejects_rotation_to_expired_before_authentication() {
+        expiring_tls_fixture(true);
     }
 
     #[test]

@@ -82,6 +82,56 @@ fn disposable_app(app_id: &str, hostname: &str, bundle_path: PathBuf) -> AppConf
 }
 
 #[test]
+#[cfg(unix)]
+fn expiry_capability_and_policy_identity_do_not_read_credential_publications() {
+    use hyperlight_unikraft::workerd::{
+        CredentialSource, EXPIRING_CREDENTIAL_CAPABILITY, FetchCredential,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let bundle = write_script_bundle(directory.path(), "expiry.json", "expiry-v1");
+    let mut app = disposable_app("expiry", "expiry.example.test", bundle);
+    let value_file = directory.path().join("not-published");
+    app.capability_policy.fetch.credential = Some(FetchCredential {
+        reference: "provider".into(),
+        value_file: value_file.clone(),
+        header: "authorization".into(),
+        scheme: "https".into(),
+        host: "api.example.test".into(),
+        port: 443,
+        source: Some(CredentialSource::ExpiringHeaderV1 {
+            safety_margin_ms: 30_000,
+        }),
+    });
+    let before = app
+        .capability_policy
+        .sha256_for("expiry", "expiry-v1")
+        .unwrap();
+    std::fs::write(&value_file, b"deliberately invalid credential envelope").unwrap();
+    assert_eq!(
+        before,
+        app.capability_policy
+            .sha256_for("expiry", "expiry-v1")
+            .unwrap()
+    );
+    let (rootfs_path, executor_path) = artifacts();
+    let registry = AppRegistry::from_host_config(HostConfig {
+        rootfs_path,
+        executor_path,
+        apps: vec![app],
+    })
+    .unwrap();
+    assert!(
+        registry
+            .app("expiry")
+            .unwrap()
+            .identity()
+            .capabilities
+            .iter()
+            .any(|capability| capability == EXPIRING_CREDENTIAL_CAPABILITY)
+    );
+}
+
+#[test]
 fn standard_sql_api_is_not_ready_when_actual_guest_lacks_its_capability() {
     let directory = tempfile::tempdir().unwrap();
     let bundle = write_script_bundle(directory.path(), "api.json", "sql-api-v1");

@@ -19,6 +19,7 @@ mod bundle;
 mod cancellation;
 mod checkpoint;
 mod control;
+mod credential;
 mod extensions;
 mod fetch;
 mod fetch_scope;
@@ -53,6 +54,7 @@ pub use control::{
     ControlRequest, FrameKind, GuestCapabilities, InstanceInvocation, LifecycleRequest,
     MAX_FRAME_BYTES, SafePoint, StreamFrame, StreamState,
 };
+pub use credential::{CredentialSource, EXPIRING_CREDENTIAL_CAPABILITY};
 pub use extensions::*;
 pub use fetch::{
     FetchBroker, FetchBrokerConfig, FetchCredential, FetchErrorCode, FetchLimits, FetchPolicy,

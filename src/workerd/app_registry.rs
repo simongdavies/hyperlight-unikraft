@@ -716,8 +716,8 @@ impl AppRegistry {
         let rootfs_path = &config.rootfs_path;
         let executor_path = &config.executor_path;
 
-        let results: Vec<std::result::Result<RouteEntry, AppRegistryError>> =
-            std::thread::scope(|scope| {
+        let results: Vec<std::result::Result<RouteEntry, AppRegistryError>> = std::thread::scope(
+            |scope| {
                 let handles: Vec<_> = config
                     .apps
                     .into_iter()
@@ -823,6 +823,15 @@ impl AppRegistry {
                                     source,
                                 })?;
                             identity.capabilities.push("tracked-work-drain".into());
+                            if app.capability_policy.fetch.credential.as_ref()
+                                .is_some_and(|credential| credential.source.is_some())
+                                || app.capability_policy.bindings.iter().any(|binding| {
+                                    matches!(binding, super::LogicalBindingConfig::ProviderWebsocket(policy)
+                                        if policy.credential.source.is_some())
+                                })
+                            {
+                                identity.capabilities.push(super::EXPIRING_CREDENTIAL_CAPABILITY.into());
+                            }
                             if negotiated
                                 .extensions
                                 .iter()
@@ -977,7 +986,8 @@ impl AppRegistry {
                             .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
                     })
                     .collect()
-            });
+            },
+        );
 
         let mut entries = Vec::with_capacity(results.len());
         for result in results {

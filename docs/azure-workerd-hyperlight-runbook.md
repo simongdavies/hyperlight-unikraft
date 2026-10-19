@@ -110,6 +110,15 @@ Start with the focused pages rather than a single long script/log:
 - [Authorize capabilities and host-only credential references](workerd-runtime/capabilities.md)
 - [Streaming, tested guarantees and bounded load](workerd-runtime/qualification.md)
 
+Refreshable provider headers can select the optional
+[`expiring_header_v1` source](workerd-runtime/capabilities.md#expiry-aware-private-headers).
+Use the exact `credential-expiry-v1` capability on the served app/revision,
+an atomic owner-private envelope, genuine provider expiry, and a trusted
+host clock. The native deadline gates reject new authentication after a
+refresher dies; readiness alone is not revocation, and existing WebSockets
+are not cancelled retroactively. Raw API-key files remain unchanged. Local
+synthetic TLS qualification does not claim live Entra, MAI or AKS acceptance.
+
 ## 3. Choose a demo
 
 List the presenter menu:

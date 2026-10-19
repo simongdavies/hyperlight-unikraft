@@ -257,6 +257,12 @@ pub struct FetchCredential {
     pub scheme: String,
     pub host: String,
     pub port: u16,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::credential::deserialize_source"
+    )]
+    pub source: Option<super::CredentialSource>,
 }
 
 impl std::fmt::Debug for FetchCredential {
@@ -268,12 +274,16 @@ impl std::fmt::Debug for FetchCredential {
             .field("scheme", &self.scheme)
             .field("host", &self.host)
             .field("port", &self.port)
+            .field("source", &self.source)
             .finish_non_exhaustive()
     }
 }
 
 impl FetchCredential {
     pub(super) fn validate(&self) -> Result<()> {
+        if let Some(source) = &self.source {
+            source.validate()?;
+        }
         if self.reference.is_empty()
             || self.reference.len() > 128
             || !self
@@ -314,15 +324,9 @@ impl FetchCredential {
         &self,
         url: &Url,
         headers: &mut HeaderMap,
+        deadline: Instant,
     ) -> std::result::Result<(), FetchFailure> {
-        if url.scheme() != self.scheme
-            || url.host_str() != Some(&self.host)
-            || url.port_or_known_default() != Some(self.port)
-        {
-            return Err(FetchFailure::policy(
-                "credential reference is not authorized for this destination",
-            ));
-        }
+        self.authorize_destination(url)?;
         let header = HeaderName::from_str(&self.header)
             .map_err(|_| FetchFailure::policy("invalid credential header policy"))?;
         if headers.contains_key(&header)
@@ -336,14 +340,42 @@ impl FetchCredential {
                 "guest supplied conflicting authentication headers",
             ));
         }
+        let mut value = self.read_value(deadline)?;
+        value.set_sensitive(true);
+        headers.insert(header, value);
+        Ok(())
+    }
+
+    fn authorize_destination(&self, url: &Url) -> std::result::Result<(), FetchFailure> {
+        if url.scheme() != self.scheme
+            || url.host_str() != Some(&self.host)
+            || url.port_or_known_default() != Some(self.port)
+        {
+            return Err(FetchFailure::policy(
+                "credential reference is not authorized for this destination",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn preflight(&self, deadline: Instant) -> std::result::Result<(), FetchFailure> {
+        if self.source.is_some() {
+            self.read_value(deadline)?;
+        }
+        Ok(())
+    }
+
+    fn read_value(&self, deadline: Instant) -> std::result::Result<HeaderValue, FetchFailure> {
+        if let Some(source) = &self.source {
+            return source
+                .read(&self.value_file, &self.reference, deadline)
+                .map_err(|_| FetchFailure::credential());
+        }
         let mut bytes = super::secret::read_private_secret(&self.value_file)
             .map_err(|_| FetchFailure::credential())?;
         let value = HeaderValue::from_bytes(&bytes).map_err(|_| FetchFailure::credential());
         bytes.fill(0);
-        let mut value = value?;
-        value.set_sensitive(true);
-        headers.insert(header, value);
-        Ok(())
+        value
     }
 }
 
@@ -710,7 +742,7 @@ impl FetchBroker {
                 remaining,
                 tokio::task::spawn_blocking(move || {
                     let _admission = admission;
-                    credential.inject(&destination, &mut headers)?;
+                    credential.inject(&destination, &mut headers, broker_deadline)?;
                     Ok::<_, FetchFailure>(headers)
                 }),
             )
@@ -1111,6 +1143,29 @@ impl FetchSession {
             .unwrap_or_else(|error| error.into_inner())
     }
 
+    fn preflight_credential(&self, destination: &str) -> std::result::Result<(), FetchFailure> {
+        let Some(credential) = self
+            .inner
+            .broker
+            .inner
+            .credential
+            .as_ref()
+            .filter(|credential| credential.source.is_some())
+        else {
+            return Ok(());
+        };
+        let url =
+            Url::parse(destination).map_err(|_| FetchFailure::invalid("invalid fetch URL"))?;
+        self.inner.broker.inner.config.policy.authorize_url(&url)?;
+        credential.authorize_destination(&url)?;
+        let deadline = Instant::now()
+            .checked_add(self.inner.broker.inner.config.limits.total_timeout)
+            .ok_or_else(FetchFailure::timeout)?
+            .min(self.deadline());
+        check_deadline(deadline)?;
+        credential.preflight(deadline)
+    }
+
     fn start_json(&self, json: &str) -> Result<String> {
         let result = self.start(json);
         let value = match result {
@@ -1143,6 +1198,7 @@ impl FetchSession {
         let request: FetchRequest = serde_json::from_str(json)
             .map_err(|error| FetchFailure::invalid(format!("malformed fetch envelope: {error}")))?;
         request.validate(&self.inner.broker.inner.config.limits)?;
+        self.preflight_credential(&request.url)?;
         let admission = Admission::acquire(self.inner.broker.inner.clone())?;
         let operation_id = self.inner.next_id.fetch_add(1, Ordering::AcqRel);
         if operation_id == 0 || operation_id > MAX_OPERATION_ID {
@@ -1489,6 +1545,7 @@ impl FetchSession {
                 "header block must contain a JSON array",
             ));
         }
+        self.preflight_credential(&request.url)?;
         let admission = Admission::acquire(self.inner.broker.inner.clone())?;
         let operation_id = self.inner.v2_next_id.fetch_add(1, Ordering::AcqRel);
         if operation_id == 0 || operation_id > MAX_OPERATION_ID {
@@ -3094,6 +3151,91 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn expiring_http_preflight_reserves_attempt_budget_without_handles_or_dials() {
+        use std::os::unix::fs::PermissionsExt;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let temporary = tempfile::tempdir().unwrap();
+        let value_file = temporary.path().join("credential");
+        let publish = |expires| {
+            std::fs::write(
+                &value_file,
+                serde_json::to_vec(&serde_json::json!({
+                    "version":1,"reference":"synthetic","generation":"test-generation",
+                    "expires_at_unix_ms":expires,"header_value":"Bearer test"
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            std::fs::set_permissions(&value_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        let policy = FetchPolicy::new(
+            NetworkPolicy::AllowList(crate::AllowList::from_hosts(&["127.0.0.1"]).unwrap()),
+            ["http"],
+            [port],
+        )
+        .allow_loopback(true)
+        .with_methods(["GET".into()])
+        .unwrap()
+        .with_ip_ranges(vec!["127.0.0.0/8".parse().unwrap()]);
+        let broker = FetchBroker::new(FetchBrokerConfig {
+            policy,
+            limits: Default::default(),
+        })
+        .unwrap()
+        .with_credential(FetchCredential {
+            reference: "synthetic".into(),
+            value_file: value_file.clone(),
+            header: "authorization".into(),
+            scheme: "http".into(),
+            host: "127.0.0.1".into(),
+            port,
+            source: Some(super::super::CredentialSource::ExpiringHeaderV1 {
+                safety_margin_ms: 30_000,
+            }),
+        })
+        .unwrap();
+        let session = broker.session(Instant::now() + Duration::from_secs(10));
+        let mut get = request(port, "GET", "/", &[]);
+        get.url = format!("http://127.0.0.1:{port}/");
+        let v1 = serde_json::to_string(&get).unwrap();
+        let v2 = serde_json::json!({
+            "protocol_version":2,"request_id":"expiry-http","method":"GET","url":get.url,
+            "header_block_length":2,"body_length":0,"preferred_write_chunk":16,"preferred_read_chunk":16
+        }).to_string();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        for expires in [1, u64::try_from(now + 35_000).unwrap()] {
+            publish(expires);
+            assert!(session.start(&v1).is_err());
+            assert!(session.v2_start(&v2).is_err());
+            assert_eq!(session.inner.next_id.load(Ordering::Acquire), 1);
+            assert_eq!(session.inner.v2_next_id.load(Ordering::Acquire), 1);
+            assert!(session.is_quiescent().unwrap());
+            assert!(
+                matches!(listener.accept(),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock)
+            );
+        }
+        publish(u64::MAX);
+        let first = session
+            .start(&v1)
+            .unwrap_or_else(|_| panic!("fresh credential rejected"));
+        let second = session
+            .v2_start(&v2)
+            .unwrap_or_else(|_| panic!("fresh credential rejected"))
+            .0;
+        assert_eq!((first, second), (1, 1));
+        assert_eq!(session.cancel(first), 0);
+        assert_eq!(session.v2_cancel(second), 0);
+        session.cancel_all();
+        assert!(session.is_quiescent().unwrap());
+    }
+
+    #[test]
     fn destination_credentials_rotate_host_only_and_denials_send_zero_requests() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -3153,6 +3295,7 @@ mod tests {
             scheme: "http".into(),
             host: "127.0.0.1".into(),
             port,
+            source: None,
         };
         let allowed_policy = FetchPolicy::new(
             NetworkPolicy::AllowList(crate::AllowList::from_hosts(&["127.0.0.1"]).unwrap()),
@@ -3227,6 +3370,7 @@ mod tests {
             scheme: "https".into(),
             host: "api.example.test".into(),
             port: 443,
+            source: None,
         };
         for name in [
             "authorization",
@@ -3244,6 +3388,7 @@ mod tests {
                 .inject(
                     &Url::parse("https://api.example.test/").unwrap(),
                     &mut headers,
+                    Instant::now() + Duration::from_secs(1),
                 )
                 .unwrap_err();
             assert!(error.message.contains("conflicting"), "{name}");

@@ -131,6 +131,7 @@ fn real_tls_provider_duplex_scope_close_and_durable_quiescence() {
                             scheme: "https".into(),
                             host: "127.0.0.1".into(),
                             port,
+                            source: None,
                         },
                         limits: ProviderWebSocketLimits {
                             max_connections: 4,

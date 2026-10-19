@@ -80,6 +80,52 @@ and cannot be loaded as pristine revision templates. Restores conservatively
 require the same host OS/architecture/backend and CPU-feature compatibility
 digest as well as artifact/policy identities.
 
+### Expiry-aware private headers
+
+An optional host-only credential source supports refreshable provider
+credentials without changing the guest protocol or legacy raw API-key files:
+
+```json
+"source": {"kind": "expiring_header_v1", "safety_margin_ms": 30000}
+```
+
+Place this field inside the existing fetch or authenticated provider
+WebSocket `credential`. Its `value_file` must contain one atomic JSON envelope:
+
+```json
+{"version":1,"reference":"example-api","generation":"unique-publication-id","expires_at_unix_ms":1893456000000,"header_value":"Bearer <opaque-provider-token>"}
+```
+
+The [versioned source contract](../workerd-credential-source-v1.json) specifies
+all bounds. The complete file is limited to 8 KiB, the complete printable
+ASCII header to 4 KiB. Files must be regular, owned by the host's effective
+Unix UID, and exactly mode `0600`; the host checks and reads one no-follow
+descriptor. `reference` must match the admitted authority exactly. The
+producer uses the provider's actual UTC Unix-millisecond expiry and adds
+`Bearer` once; the runtime neither parses JWT claims nor adds a prefix.
+
+The host rejects new operation/connection admission without allocating a
+handle when credentials lack enough lifetime for the remaining bounded
+attempt plus the safety margin. WebSocket workers recheck before dialing
+and reread after TLS before authentication. HTTP rereads before sending,
+reserving the whole remaining attempt budget, including retries. An expired
+file left by a killed refresher therefore cannot authenticate new
+connections, even through cached routes. Existing WebSockets are **not**
+retroactively cancelled. Accurate trusted host UTC is required: invalid
+clocks and arithmetic fail closed, but arbitrary wall-clock skew is not
+detectable from an opaque credential.
+
+Publish complete private files by atomic rename. A stable separate writer
+lock must cover both publication and generation-owned cleanup, so an old
+helper cannot unlink a newer publication. The runtime never deletes a file.
+Source kind, margin, path/reference and destination affect policy identity;
+rotating values, expiry and generation do not. Identity and capability
+discovery never read credential files. Configured apps advertise native
+`credential-expiry-v1`; this is support negotiation, not a token-freshness or
+cloud-qualification assertion. Omitting `source` preserves legacy raw-header
+behavior and identity; explicit null/unknown sources fail closed. Kubernetes
+readiness alone does not prevent new connections through cached routes.
+
 Typed persistent `kv` and `sql` bindings reconstruct distinct per-VM
 authority/session state against stable external backing files; their policy
 contains names, paths and limits, not credentials. Azure KV/CAS/TTL, AI

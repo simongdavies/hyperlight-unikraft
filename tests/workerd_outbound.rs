@@ -72,6 +72,7 @@ fn credential_configuration_never_prints_values_and_requires_scoped_destination(
         scheme: "http".into(),
         host: "example.com".into(),
         port: 80,
+        source: None,
     };
     assert!(
         FetchBroker::denied()
