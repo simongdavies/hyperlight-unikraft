@@ -81,6 +81,35 @@ fn disposable_app(app_id: &str, hostname: &str, bundle_path: PathBuf) -> AppConf
     }
 }
 
+#[test]
+fn standard_sql_api_is_not_ready_when_actual_guest_lacks_its_capability() {
+    let directory = tempfile::tempdir().unwrap();
+    let bundle = write_script_bundle(directory.path(), "api.json", "sql-api-v1");
+    let mut app = disposable_app("sql-api", "sql.example.test", bundle);
+    app.capability_policy.bindings = vec![hyperlight_unikraft::workerd::LogicalBindingConfig::D1 {
+        name: "DB".into(),
+        api: Some(hyperlight_unikraft::workerd::WorkerBindingApi::D1),
+        backing_path: directory.path().join("store.sqlite"),
+        read_only: false,
+        limits: Default::default(),
+    }];
+    let (rootfs_path, executor_path) = artifacts();
+    match AppRegistry::from_host_config(HostConfig {
+        rootfs_path,
+        executor_path,
+        apps: vec![app],
+    }) {
+        Err(AppRegistryError::WorkerInit { source, .. }) => {
+            assert!(
+                matches!(source, hyperlight_unikraft::workerd::Error::Protocol(message)
+                if message == "guest capability negotiation failed")
+            );
+        }
+        Err(error) => panic!("unexpected admission failure: {error}"),
+        Ok(_) => panic!("guest without the native SQL API was admitted as ready"),
+    }
+}
+
 /// Same shape as [`disposable_app`], but configured to restore the worker
 /// from a prebuilt `snapshot_dir` instead of booting `bundle_path` fresh
 /// (see `WorkerVersionSandbox::initialize_from_snapshot_dir`).

@@ -801,6 +801,18 @@ impl AppRegistry {
                             }) {
                                 required.push("authenticated-egress-websocket-v1");
                             }
+                            if app.capability_policy.bindings.iter().any(|binding| {
+                                matches!(
+                                    binding,
+                                    super::LogicalBindingConfig::D1 {
+                                        api: Some(super::WorkerBindingApi::D1),
+                                        ..
+                                    }
+                                )
+                            }) {
+                                required.push("binding-d1-api-v1");
+                                required.push("invocation-budget-v2");
+                            }
                             let negotiated = worker
                                 .negotiated_extensions(
                                     &required,
@@ -850,12 +862,15 @@ impl AppRegistry {
                             }
                             for binding in &app.capability_policy.bindings {
                                 match binding {
-                                    super::LogicalBindingConfig::D1 { .. } => {
+                                    super::LogicalBindingConfig::D1 { api, .. } => {
                                         identity.capabilities.extend(
                                             ["binding-sql", "binding-d1"]
                                                 .into_iter()
                                                 .map(str::to_string),
                                         );
+                                        if api.is_some() {
+                                            identity.capabilities.push("binding-d1-api-v1".into());
+                                        }
                                     }
                                     super::LogicalBindingConfig::Kv { .. } => {
                                         identity.capabilities.push("binding-kv".into())

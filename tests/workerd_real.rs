@@ -1062,6 +1062,7 @@ export default {async fetch(request,env){
                 vec![
                     LogicalBindingConfig::D1 {
                         name: "store".into(),
+                        api: None,
                         backing_path: tmp.path().join("data.sqlite"),
                         read_only: false,
                         limits: Default::default(),

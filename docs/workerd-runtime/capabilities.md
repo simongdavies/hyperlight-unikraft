@@ -105,6 +105,59 @@ SQL allocation limits, incremental result-size checks and a progress deadline
 bound work; response quota failures roll back before mutation acknowledgement.
 These are not a claim of total external database-storage quota enforcement.
 
+### Standard SQL API opt-in
+
+Logical SQL/data names preserve case, up to 64 ASCII bytes:
+`[A-Za-z_][A-Za-z0-9_-]{0,63}`, except `__proto__`. `DB` and `db` are
+different authorities; names are never lowercased into another binding.
+Existing lowercase names and legacy hyphens remain supported. Storage-mount
+and provider-specific naming restrictions have not changed.
+
+An admitted SQL resource can explicitly select the standard database API:
+
+```json
+{"kind":"sql","name":"DB","api":"d1","backing_path":"/state/DB/store.sqlite","read_only":false}
+```
+
+The `d1` selector and capability `binding-d1-api-v1` are compatibility
+identifiers, not a hosted-service dependency. Omitting `api` retains the
+legacy Fetcher and its byte-identical two-field executor manifest. Null,
+unknown, or wrong-kind selectors are rejected. The explicit selector is
+part of the policy/checkpoint identity. The actual guest must advertise the
+capability before the app becomes ready; each serving VM negotiates through
+the existing budgeted invocation protocol before standard SQL calls.
+
+The selected interface uses the real upstream database wrapper for
+`prepare`, `bind`, `all`, `first`, `raw`, `run`, `batch`, and `exec`, over a
+private Fetcher. An app can keep a separate legacy `env.store.fetch` binding.
+A batch maps to one admitted typed SQL transaction, not independent
+statement RPCs. Sessions/bookmarks, dump, and unsupported RPC compatibility
+modes fail explicitly. No wrapper can select another resource or expose
+host paths or credentials.
+
+Statement metadata contains actual elapsed milliseconds and measured
+backend fields only. Local SQLite supplies statement changes and an insert
+ID only when the ID observably changed during a statement that changed rows.
+Unmeasured cloud/storage metrics are absent, not invented zeros. A SELECT
+or DDL statement does not inherit a previous mutation's change count.
+Local response metadata, unsafe integers, and both native JSON response
+formats are checked before transaction commit; blob byte-array expansion
+and repeated object-row column names count toward the conservative 60 KiB
+native response bound. Failures roll back the entire local batch.
+
+Legacy typed integer/real/blob wire values remain unchanged. The selected
+API requires JavaScript-safe integer values. An opt-in provider may return
+the additive result-only `number` tag for a finite JavaScript Number without
+claiming its original SQLite storage class; unsafe integral magnitudes are
+rejected. This is not a new request-parameter type.
+
+Real local SQLite/KVM checks cover both execution modes, init3/init4, the
+standard methods, typed values, legacy isolation, read-only denial, atomic
+failure/quota behavior, and changed-state durable park/resume. Remote
+provider qualification is separate. A post-dispatch remote transport or
+validation failure can be an unknown mutation outcome: never claim local
+rollback or automatically retry it.
+
 The additive native `webhook` binding invokes a host-only HMAC verifier against
 an operator-owned private key reference and trusted-host replay clock. The
 scaffold may alias `env.webhook` to `WEBHOOK`; no signing key is passed to the

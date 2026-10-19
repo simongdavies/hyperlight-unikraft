@@ -15,7 +15,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 EXECUTOR = "workerd-sandbox-executor"
 IMAGE = "workerd-hyperlight-builder"
-COMMIT = "27d537f458c6a74b99957e114ccbe6f16d6323b0"
+COMMIT = "c13c119d07047350ddba6596eff3a6c072a10a32"
 
 
 def stub():

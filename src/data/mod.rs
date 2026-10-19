@@ -14,12 +14,14 @@ pub use cache::{
     CacheService, CacheStatus, SystemCacheClock,
 };
 pub use d1::{
-    D1Binding, D1Limits, D1Operation, D1Parameter, D1Request, D1Response, D1ResultSet, D1Service,
-    D1Statement, D1Status, D1Value,
+    D1Binding, D1Limits, D1Operation, D1Parameter, D1Request, D1Response, D1ResultMetadata,
+    D1ResultSet, D1Service, D1Statement, D1Status, D1Value,
 };
 pub use d1::{
     D1Binding as SqlBinding, D1Limits as SqlLimits, D1Operation as SqlOperation,
-    D1Parameter as SqlParameter, D1Service as SqlService, D1Statement as SqlStatement,
+    D1Parameter as SqlParameter, D1ResultMetadata as SqlResultMetadata,
+    D1ResultSet as SqlResultSet, D1Service as SqlService, D1Statement as SqlStatement,
+    D1Value as SqlValue, sql_api_response_bound,
 };
 pub use durable::{
     DurableDeliveryContext, DurableObjectBinding, DurableObjectError, DurableObjectLimits,
@@ -42,6 +44,12 @@ const MAX_CACHE_KEY_BYTES: usize = 4096;
 pub enum DataError {
     #[error("invalid data binding name")]
     InvalidBinding,
+    #[error("SQL API number must be finite and integral values must be JavaScript-safe")]
+    InvalidApiNumber,
+    #[error("SQL API result requires finite measured duration and JavaScript-safe metadata")]
+    InvalidApiMetadata,
+    #[error("SQL API result blob must use standard base64")]
+    InvalidApiBlob,
     #[error("invalid data request ID")]
     InvalidRequestId,
     #[error("invalid data key")]
@@ -71,9 +79,11 @@ pub type Result<T> = std::result::Result<T, DataError>;
 fn validate_binding(value: &str) -> Result<()> {
     if value.is_empty()
         || value.len() > MAX_BINDING_NAME_BYTES
+        || value == "__proto__"
         || !value.bytes().enumerate().all(|(index, byte)| {
-            byte.is_ascii_lowercase()
-                || (index > 0 && (byte.is_ascii_digit() || byte == b'-' || byte == b'_'))
+            byte.is_ascii_alphabetic()
+                || byte == b'_'
+                || (index > 0 && (byte.is_ascii_digit() || byte == b'-'))
         })
     {
         return Err(DataError::InvalidBinding);
@@ -138,5 +148,56 @@ fn safe_code(value: &str) -> &str {
         "host_error"
     } else {
         value
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn binding_names_preserve_ascii_case_and_legacy_spelling() {
+        for name in [
+            "DB",
+            "Store",
+            "_DB",
+            "_",
+            "store",
+            "legacy-store",
+            "store_1",
+            "constructor",
+            "prototype",
+        ] {
+            assert!(validate_binding(name).is_ok(), "{name}");
+            assert_eq!(
+                D1Binding::in_memory(name, false, D1Limits::default())
+                    .unwrap()
+                    .name(),
+                name
+            );
+        }
+        assert!(validate_binding(&"A".repeat(MAX_BINDING_NAME_BYTES)).is_ok());
+    }
+
+    #[test]
+    fn binding_names_reject_unsafe_syntax_and_keep_the_existing_byte_bound() {
+        for name in [
+            "",
+            "1DB",
+            "-DB",
+            "__proto__",
+            "DB.name",
+            "DB/name",
+            "DB\\name",
+            "DB:name",
+            "DB name",
+            "DB\n",
+            "DB\r",
+            "DB\0",
+            "\u{00c9}DB",
+        ] {
+            assert!(validate_binding(name).is_err(), "{name:?}");
+        }
+        assert!(validate_binding(&"A".repeat(MAX_BINDING_NAME_BYTES + 1)).is_err());
     }
 }

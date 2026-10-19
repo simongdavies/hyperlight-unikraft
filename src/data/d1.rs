@@ -77,6 +77,7 @@ pub struct D1Binding {
     backing: Option<PathBuf>,
     read_only: bool,
     limits: D1Limits,
+    api_metadata: bool,
 }
 
 impl D1Binding {
@@ -110,6 +111,7 @@ impl D1Binding {
             backing,
             read_only,
             limits: limits.validate()?,
+            api_metadata: false,
         })
     }
 
@@ -127,6 +129,12 @@ impl D1Binding {
 
     pub fn limits(&self) -> D1Limits {
         self.limits
+    }
+
+    /// Include measured statement metadata for an explicitly selected D1 API.
+    pub fn with_d1_api_metadata(mut self) -> Self {
+        self.api_metadata = true;
+        self
     }
 }
 
@@ -193,6 +201,46 @@ pub struct D1ResultSet {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<D1Value>>,
     pub rows_affected: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<D1ResultMetadata>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct D1ResultMetadata {
+    /// Actual elapsed statement execution time, in milliseconds.
+    pub duration: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_row_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rows_read: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rows_written: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changed_db: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_after: Option<u64>,
+}
+
+fn result_metadata(
+    enabled: bool,
+    started: Instant,
+    connection: &Connection,
+    changes: u64,
+    previous_row_id: i64,
+) -> Option<D1ResultMetadata> {
+    enabled.then(|| D1ResultMetadata {
+        duration: started.elapsed().as_secs_f64() * 1000.0,
+        changes: Some(changes),
+        last_row_id: (changes > 0 && connection.last_insert_rowid() != previous_row_id)
+            .then(|| connection.last_insert_rowid()),
+        rows_read: None,
+        rows_written: None,
+        changed_db: None,
+        size_after: None,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -203,6 +251,167 @@ pub enum D1Value {
     Real(f64),
     Text(String),
     Blob(String),
+    /// An opt-in SQL API JavaScript number, not a SQLite storage-class assertion.
+    Number(
+        #[serde(
+            serialize_with = "serialize_api_number",
+            deserialize_with = "deserialize_api_number"
+        )]
+        f64,
+    ),
+}
+
+fn checked_api_number(value: f64) -> Result<f64> {
+    if !value.is_finite() || (value.fract() == 0.0 && value.abs() > 9_007_199_254_740_991.0) {
+        return Err(DataError::InvalidApiNumber);
+    }
+    Ok(value)
+}
+
+fn serialize_api_number<S>(value: &f64, serializer: S) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    checked_api_number(*value)
+        .map_err(serde::ser::Error::custom)?
+        .serialize(serializer)
+}
+
+fn deserialize_api_number<'de, D>(deserializer: D) -> std::result::Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    checked_api_number(f64::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+}
+
+impl D1Value {
+    /// Preserve a standard SQL API number without claiming its original SQLite type.
+    pub fn api_number(value: f64) -> Result<Self> {
+        checked_api_number(value).map(Self::Number)
+    }
+}
+
+fn json_size_bound(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Null => 4,
+        serde_json::Value::Bool(value) => {
+            if *value {
+                4
+            } else {
+                5
+            }
+        }
+        serde_json::Value::Number(_) => 64,
+        serde_json::Value::String(value) => string_size_bound(value),
+        serde_json::Value::Array(values) => values.iter().fold(
+            2usize.saturating_add(values.len().saturating_sub(1)),
+            |size, value| size.saturating_add(json_size_bound(value)),
+        ),
+        serde_json::Value::Object(values) => values.iter().fold(
+            2usize.saturating_add(values.len().saturating_sub(1)),
+            |size, (name, value)| {
+                size.saturating_add(string_size_bound(name))
+                    .saturating_add(1)
+                    .saturating_add(json_size_bound(value))
+            },
+        ),
+    }
+}
+
+fn string_size_bound(value: &str) -> usize {
+    2usize.saturating_add(value.len().saturating_mul(6))
+}
+
+fn api_cell_bound(value: &D1Value) -> Result<usize> {
+    match value {
+        D1Value::Null => Ok(4),
+        D1Value::Integer(value)
+            if (-9_007_199_254_740_991..=9_007_199_254_740_991).contains(value) =>
+        {
+            Ok(64)
+        }
+        D1Value::Real(value) if value.is_finite() => Ok(64),
+        D1Value::Number(value) => checked_api_number(*value).map(|_| 64),
+        D1Value::Text(value) => Ok(string_size_bound(value)),
+        D1Value::Blob(value) => {
+            let bytes = STANDARD
+                .decode(value)
+                .map_err(|_| DataError::InvalidApiBlob)?;
+            Ok(if bytes.is_empty() {
+                2
+            } else {
+                1usize.saturating_add(bytes.len().saturating_mul(4))
+            })
+        }
+        _ => Err(DataError::InvalidApiNumber),
+    }
+}
+
+/// Conservative compact native SQL JSON size, including blob byte-array expansion.
+/// The array form also bounds a single result. Strings allow six bytes per UTF-8
+/// byte and numbers 64 bytes, covering the guest JSON codec before commit.
+pub fn sql_api_response_bound(results: &[D1ResultSet]) -> Result<usize> {
+    let mut size = 2usize.saturating_add(results.len().saturating_sub(1));
+    for result in results {
+        let meta = result.meta.as_ref().ok_or(DataError::InvalidApiMetadata)?;
+        if !meta.duration.is_finite()
+            || meta.duration < 0.0
+            || meta.last_row_id.is_some_and(|value| {
+                !(-9_007_199_254_740_991..=9_007_199_254_740_991).contains(&value)
+            })
+            || [
+                meta.changes,
+                meta.rows_read,
+                meta.rows_written,
+                meta.size_after,
+            ]
+            .into_iter()
+            .flatten()
+            .any(|value| value > 9_007_199_254_740_991)
+        {
+            return Err(DataError::InvalidApiMetadata);
+        }
+        let prefix = br#"{"success":true,"meta":"#
+            .len()
+            .saturating_add(json_size_bound(
+                &serde_json::to_value(meta).map_err(|_| DataError::InvalidApiMetadata)?,
+            ));
+        let mut row_columns = prefix
+            .saturating_add(br#","results":{"columns":["#.len())
+            .saturating_add(result.columns.len().saturating_sub(1));
+        for name in &result.columns {
+            row_columns = row_columns.saturating_add(string_size_bound(name));
+        }
+        row_columns = row_columns
+            .saturating_add(br#"],"rows":["#.len())
+            .saturating_add(result.rows.len().saturating_sub(1));
+        let mut row_objects = prefix
+            .saturating_add(br#","results":["#.len())
+            .saturating_add(result.rows.len().saturating_sub(1));
+        for row in &result.rows {
+            if row.len() != result.columns.len() {
+                return Err(DataError::InvalidApiMetadata);
+            }
+            row_columns = row_columns
+                .saturating_add(2)
+                .saturating_add(row.len().saturating_sub(1));
+            row_objects = row_objects
+                .saturating_add(2)
+                .saturating_add(row.len().saturating_sub(1));
+            for (name, value) in result.columns.iter().zip(row) {
+                let value = api_cell_bound(value)?;
+                row_columns = row_columns.saturating_add(value);
+                row_objects = row_objects
+                    .saturating_add(string_size_bound(name))
+                    .saturating_add(1)
+                    .saturating_add(value);
+            }
+        }
+        row_columns = row_columns.saturating_add(b"]}}".len());
+        row_objects = row_objects.saturating_add(b"]}".len());
+        size = size.saturating_add(row_columns.max(row_objects));
+    }
+    Ok(size)
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -368,6 +577,9 @@ impl D1Store {
         let mut total_result_bytes = 0u64;
         let mut results = Vec::with_capacity(statements.len());
         for statement in statements {
+            let started = Instant::now();
+            let changes_before = transaction.total_changes();
+            let previous_row_id = transaction.last_insert_rowid();
             let parameters = statement
                 .parameters
                 .into_iter()
@@ -390,13 +602,26 @@ impl D1Store {
                 .map(|name| (*name).to_string())
                 .collect::<Vec<_>>();
             if columns.is_empty() {
-                let rows_affected = prepared
+                prepared
                     .execute(params_from_iter(parameters))
-                    .map_err(|_| "sqlite_execute")? as u64;
+                    .map_err(|_| "sqlite_execute")?;
+                let rows_affected =
+                    if prepared.readonly() || transaction.total_changes() == changes_before {
+                        0
+                    } else {
+                        transaction.changes()
+                    };
                 let result = D1ResultSet {
                     columns,
                     rows: Vec::new(),
                     rows_affected,
+                    meta: result_metadata(
+                        self.binding.api_metadata,
+                        started,
+                        &transaction,
+                        rows_affected,
+                        previous_row_id,
+                    ),
                 };
                 charge_result_bytes(
                     &mut total_result_bytes,
@@ -414,6 +639,7 @@ impl D1Store {
                 columns: columns.clone(),
                 rows: Vec::new(),
                 rows_affected: 0,
+                meta: None,
             };
             let mut encoded_bytes = serde_json::to_vec(&empty_result)
                 .map_err(|_| "sqlite_value")?
@@ -442,10 +668,24 @@ impl D1Store {
                 }
                 values.push(row_values);
             }
+            drop(rows);
+            let rows_affected =
+                if prepared.readonly() || transaction.total_changes() == changes_before {
+                    0
+                } else {
+                    transaction.changes()
+                };
             let result = D1ResultSet {
                 columns,
                 rows: values,
-                rows_affected: 0,
+                rows_affected,
+                meta: result_metadata(
+                    self.binding.api_metadata,
+                    started,
+                    &transaction,
+                    rows_affected,
+                    previous_row_id,
+                ),
             };
             charge_result_bytes(
                 &mut total_result_bytes,
@@ -453,6 +693,15 @@ impl D1Store {
                 self.binding.limits.max_result_bytes,
             )?;
             results.push(result);
+        }
+        if self.binding.api_metadata {
+            let size = sql_api_response_bound(&results).map_err(|error| match error {
+                DataError::InvalidApiNumber => "unsafe_integer",
+                _ => "api_response_invalid",
+            })?;
+            if size > 60 * 1024 {
+                return Err("api_response_bytes_quota");
+            }
         }
         #[derive(Serialize)]
         struct BorrowedResponse<'a> {
@@ -719,6 +968,7 @@ impl LogicalWireService for D1Service {
                 code @ ("operation_quota"
                 | "request_bytes_quota"
                 | "response_bytes_quota"
+                | "api_response_bytes_quota"
                 | "statement_quota"
                 | "statement_size"
                 | "parameter_quota"
@@ -727,7 +977,7 @@ impl LogicalWireService for D1Service {
             ) => {
                 return Self::rejection(request.request_id, D1Status::QuotaExceeded, code);
             }
-            Err(code @ ("invalid_real" | "invalid_base64")) => {
+            Err(code @ ("invalid_real" | "invalid_base64" | "unsafe_integer")) => {
                 return Self::rejection(request.request_id, D1Status::InvalidRequest, code);
             }
             Err(code) => return Self::rejection(request.request_id, D1Status::HostError, code),
@@ -785,6 +1035,211 @@ mod tests {
 
     fn response(runtime: &BrokerRuntime, request: &[u8]) -> D1Response {
         serde_json::from_slice(&runtime.dispatch_logical(request)).unwrap()
+    }
+
+    fn api_query(runtime: &BrokerRuntime, statements: &[&str]) -> D1Response {
+        response(
+            runtime,
+            &serde_json::to_vec(&D1Request {
+                version: 1,
+                request_id: "api-query".into(),
+                binding: "DB".into(),
+                operation: D1Operation::Batch {
+                    statements: statements
+                        .iter()
+                        .map(|sql| D1Statement {
+                            sql: (*sql).into(),
+                            parameters: vec![],
+                        })
+                        .collect(),
+                },
+            })
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn api_metadata_measures_returning_and_never_reuses_prior_statement_changes() {
+        let runtime = runtime(
+            D1Binding::in_memory("DB", false, Default::default())
+                .unwrap()
+                .with_d1_api_metadata(),
+        );
+        let result = api_query(
+            &runtime,
+            &[
+                "CREATE TABLE items(value TEXT)",
+                "INSERT INTO items(value) VALUES('first') RETURNING rowid",
+                "SELECT value FROM items",
+                "CREATE TABLE other(value TEXT)",
+                "UPDATE items SET value='second' RETURNING value",
+                "SELECT value FROM items",
+            ],
+        );
+        assert_eq!(result.status, D1Status::Ok, "{result:?}");
+        assert_eq!(
+            result
+                .results
+                .iter()
+                .map(|result| result.rows_affected)
+                .collect::<Vec<_>>(),
+            [0, 1, 0, 0, 1, 0]
+        );
+        for result in &result.results {
+            let meta = result.meta.as_ref().unwrap();
+            assert!(meta.duration.is_finite() && meta.duration >= 0.0);
+            assert_eq!(meta.changes, Some(result.rows_affected));
+            assert_eq!(
+                (
+                    meta.rows_read,
+                    meta.rows_written,
+                    meta.changed_db,
+                    meta.size_after
+                ),
+                (None, None, None, None)
+            );
+        }
+        assert_eq!(
+            result.results[1].meta.as_ref().unwrap().last_row_id,
+            Some(1)
+        );
+        assert_eq!(result.results[2].meta.as_ref().unwrap().last_row_id, None);
+        assert_eq!(result.results[3].meta.as_ref().unwrap().last_row_id, None);
+        assert_eq!(result.results[4].meta.as_ref().unwrap().last_row_id, None);
+    }
+
+    #[test]
+    fn api_result_failures_roll_back_mutation_before_commit() {
+        let runtime = runtime(
+            D1Binding::in_memory("DB", false, Default::default())
+                .unwrap()
+                .with_d1_api_metadata(),
+        );
+        assert_eq!(
+            api_query(&runtime, &["CREATE TABLE items(value INTEGER)"]).status,
+            D1Status::Ok
+        );
+        let repeated_columns = format!(
+            "INSERT INTO items(value) VALUES {} RETURNING value AS \"{}\"",
+            (0..70).map(|_| "(1)").collect::<Vec<_>>().join(","),
+            "column".repeat(171),
+        );
+        for (sql, expected) in [
+            (
+                "INSERT INTO items(value) VALUES(9007199254740992) RETURNING value",
+                "unsafe_integer",
+            ),
+            (
+                "INSERT INTO items(value) VALUES(1) RETURNING randomblob(20000)",
+                "api_response_bytes_quota",
+            ),
+            (repeated_columns.as_str(), "api_response_bytes_quota"),
+        ] {
+            let result = api_query(&runtime, &[sql]);
+            assert_eq!(result.code, expected, "{result:?}");
+            assert!(result.results.is_empty());
+            let check = api_query(&runtime, &["SELECT COUNT(*) FROM items"]);
+            assert_eq!(check.results[0].rows[0][0], D1Value::Integer(0));
+        }
+        let failed = api_query(
+            &runtime,
+            &["INSERT INTO items VALUES(1)", "SELECT missing FROM items"],
+        );
+        assert_eq!(failed.status, D1Status::HostError);
+        assert_eq!(
+            api_query(&runtime, &["SELECT COUNT(*) FROM items"]).results[0].rows[0][0],
+            D1Value::Integer(0)
+        );
+    }
+
+    #[test]
+    fn api_numbers_are_explicit_result_values_and_reject_unsafe_or_nonfinite_values() {
+        for number in [0.0, 1.0, -1.25, 9_007_199_254_740_991.0] {
+            let value = D1Value::api_number(number).unwrap();
+            let encoded = serde_json::to_value(&value).unwrap();
+            assert_eq!(encoded["type"], "number");
+            assert_eq!(encoded["value"].as_f64(), Some(number));
+            assert_eq!(serde_json::from_value::<D1Value>(encoded).unwrap(), value);
+        }
+        for number in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            9_007_199_254_740_992.0,
+            -9_007_199_254_740_992.0,
+        ] {
+            assert!(D1Value::api_number(number).is_err());
+            assert!(serde_json::to_vec(&D1Value::Number(number)).is_err());
+        }
+        assert!(
+            serde_json::from_value::<D1Parameter>(serde_json::json!({"type":"number","value":1}))
+                .is_err()
+        );
+        assert_eq!(
+            serde_json::to_string(&D1Value::Integer(1)).unwrap(),
+            r#"{"type":"integer","value":1}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&D1Value::Blob("AAE=".into())).unwrap(),
+            r#"{"type":"blob","value":"AAE="}"#
+        );
+    }
+
+    #[test]
+    fn legacy_sql_results_do_not_gain_api_metadata() {
+        let runtime = runtime(D1Binding::in_memory("DB", false, Default::default()).unwrap());
+        let response = api_query(&runtime, &["SELECT 1"]);
+        assert_eq!(response.status, D1Status::Ok);
+        assert!(response.results[0].meta.is_none());
+        assert!(
+            !serde_json::to_string(&response)
+                .unwrap()
+                .contains("\"meta\"")
+        );
+    }
+
+    #[test]
+    fn api_response_bound_covers_native_json_and_rejects_invalid_metadata() {
+        let mut result = D1ResultSet {
+            columns: ["n", "i", "r", "j", "t", "b"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            rows: vec![vec![
+                D1Value::Null,
+                D1Value::Integer(1),
+                D1Value::Real(1.25),
+                D1Value::api_number(1.0).unwrap(),
+                D1Value::Text("é\n\"\\\0".into()),
+                D1Value::Blob("AP8=".into()),
+            ]],
+            rows_affected: 0,
+            meta: Some(D1ResultMetadata {
+                duration: 0.25,
+                changes: Some(0),
+                last_row_id: None,
+                rows_read: None,
+                rows_written: None,
+                changed_db: None,
+                size_after: None,
+            }),
+        };
+        let native = serde_json::json!([{"success":true,"meta":{"duration":0.25,"changes":0},
+            "results":{"columns":["n","i","r","j","t","b"],"rows":[[null,1,1.25,1.0,"é\n\"\\\0",[0,255]]]}}]);
+        assert!(
+            sql_api_response_bound(&[result.clone()]).unwrap()
+                >= serde_json::to_vec(&native).unwrap().len()
+        );
+        let objects = serde_json::json!([{"success":true,"meta":{"duration":0.25,"changes":0},
+            "results":[{"n":null,"i":1,"r":1.25,"j":1.0,"t":"é\n\"\\\0","b":[0,255]}]}]);
+        assert!(
+            sql_api_response_bound(&[result.clone()]).unwrap()
+                >= serde_json::to_vec(&objects).unwrap().len()
+        );
+        result.meta.as_mut().unwrap().duration = -1.0;
+        assert!(sql_api_response_bound(&[result.clone()]).is_err());
+        result.meta = None;
+        assert!(sql_api_response_bound(&[result]).is_err());
     }
 
     #[test]

@@ -238,15 +238,18 @@ fn data_worker(
         WorkerBinding {
             name: "assets".into(),
             kind: WorkerBindingKind::Cache,
+            api: None,
         },
         WorkerBinding::sql("database"),
         WorkerBinding {
             name: "rooms".into(),
             kind: WorkerBindingKind::DurableObject,
+            api: None,
         },
         WorkerBinding {
             name: "settings".into(),
             kind: WorkerBindingKind::Kv,
+            api: None,
         },
     ];
     let policy = WorkerCapabilityPolicy::new(

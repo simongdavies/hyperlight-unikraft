@@ -4,7 +4,7 @@
 //! Reconstructable host-owned logical services. Only external persistent
 //! backing paths and finite policies are captured, never live handles or
 //! provider credentials. Each VM obtains a distinct runtime/session.
-use super::{Error, Result, WorkerBinding, WorkerBindingKind};
+use super::{Error, Result, WorkerBinding, WorkerBindingApi, WorkerBindingKind};
 use crate::broker::RequestIdentity;
 use crate::broker_runtime::{BrokerRuntime, LogicalServiceRouter};
 use crate::data::{D1Binding, D1Limits, D1Service, KvBinding, KvLimits, KvService};
@@ -24,6 +24,12 @@ pub enum LogicalBindingConfig {
     #[serde(rename(serialize = "d1", deserialize = "sql"), alias = "d1")]
     D1 {
         name: String,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "binding_api"
+        )]
+        api: Option<WorkerBindingApi>,
         backing_path: PathBuf,
         read_only: bool,
         #[serde(default)]
@@ -31,6 +37,13 @@ pub enum LogicalBindingConfig {
     },
     Webhook(super::WebhookPolicy),
     ProviderWebsocket(Box<super::ProviderWebSocketConfig>),
+}
+
+fn binding_api<'de, D>(deserializer: D) -> std::result::Result<Option<WorkerBindingApi>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    WorkerBindingApi::deserialize(deserializer).map(Some)
 }
 
 impl LogicalBindingConfig {
@@ -138,6 +151,7 @@ impl LogicalBindingsPolicy {
                     backing_path,
                     read_only,
                     limits,
+                    ..
                 } => {
                     D1Binding::persistent(&*name, &*backing_path, *read_only, *limits)
                         .map_err(|error| Error::State(error.to_string()))?;
@@ -171,6 +185,10 @@ impl LogicalBindingsPolicy {
                     LogicalBindingConfig::ProviderWebsocket(_) => {
                         WorkerBindingKind::ProviderWebsocket
                     }
+                },
+                api: match binding {
+                    LogicalBindingConfig::D1 { api, .. } => *api,
+                    _ => None,
                 },
             })
             .collect()
@@ -211,9 +229,15 @@ impl LogicalBindingsPolicy {
                     backing_path,
                     read_only,
                     limits,
+                    api,
                 } => {
                     let binding = D1Binding::persistent(name, backing_path, *read_only, *limits)
                         .map_err(|error| Error::State(error.to_string()))?;
+                    let binding = if api.is_some() {
+                        binding.with_d1_api_metadata()
+                    } else {
+                        binding
+                    };
                     let service = D1Service::new([binding])
                         .map_err(|error| Error::State(error.to_string()))?;
                     router.with_service(name, service)
@@ -267,6 +291,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sql_binding_names_are_case_sensitive_in_metadata_authority_and_dispatch() {
+        let temporary = tempfile::tempdir().unwrap();
+        let make = |names: &[&str]| {
+            LogicalBindingsPolicy::new(
+                "case-app",
+                "case-v1",
+                names
+                    .iter()
+                    .map(|name| LogicalBindingConfig::D1 {
+                        name: (*name).into(),
+                        api: None,
+                        backing_path: temporary.path().join(format!("{name}.sqlite")),
+                        read_only: false,
+                        limits: Default::default(),
+                    })
+                    .collect(),
+            )
+        };
+        let upper = make(&["DB"]).unwrap();
+        let lower = make(&["db"]).unwrap();
+        assert_ne!(upper.authority(), lower.authority());
+        assert_eq!(upper.worker_bindings()[0].name, "DB");
+        assert!(make(&["DB", "DB"]).is_err());
+        let policy = make(&["DB", "db", "store"]).unwrap();
+        let runtime = policy.runtime().unwrap();
+        for name in ["DB", "db", "store"] {
+            let payload = serde_json::to_vec(&crate::data::D1Request {
+                version: 2,
+                request_id: "case-query".into(),
+                binding: name.into(),
+                operation: crate::data::D1Operation::Batch {
+                    statements: vec![crate::data::D1Statement {
+                        sql: "SELECT 42 AS answer".into(),
+                        parameters: vec![],
+                    }],
+                },
+            })
+            .unwrap();
+            let response: serde_json::Value =
+                serde_json::from_slice(&runtime.dispatch_logical(&payload)).unwrap();
+            assert_eq!(response["status"], "ok", "{response}");
+        }
+        let only_upper = upper.runtime().unwrap();
+        let wrong_case = br#"{"version":2,"request_id":"case-query","binding":"db","operation":{"kind":"d1_batch","statements":[{"sql":"SELECT 42","parameters":[]}]}}"#;
+        let response: serde_json::Value =
+            serde_json::from_slice(&only_upper.dispatch_logical(wrong_case)).unwrap();
+        assert_eq!(response["status"], "denied");
+    }
+
+    #[test]
     fn public_sql_and_legacy_alias_keep_authority_and_guest_wire_identical() {
         let temporary = tempfile::tempdir().unwrap();
         let policy = |kind| {
@@ -287,6 +361,76 @@ mod tests {
             serde_json::to_string(&public.worker_bindings()[0]).unwrap(),
             r#"{"name":"store","kind":"d1"}"#
         );
+    }
+
+    #[test]
+    fn native_d1_api_is_explicit_strict_and_part_of_admitted_authority() {
+        let temporary = tempfile::tempdir().unwrap();
+        let value = serde_json::json!({
+            "kind":"d1","name":"DB","backing_path":temporary.path().join("db.sqlite"),
+            "read_only":false
+        });
+        let policy = |value: serde_json::Value| {
+            LogicalBindingsPolicy::new(
+                "api-app",
+                "api-v1",
+                vec![serde_json::from_value::<LogicalBindingConfig>(value).unwrap()],
+            )
+            .unwrap()
+        };
+        let legacy = policy(value.clone());
+        let mut explicit = value.clone();
+        explicit["api"] = "d1".into();
+        let native = policy(explicit);
+        assert_eq!(legacy.worker_bindings()[0].api, None);
+        assert_eq!(native.worker_bindings()[0].api, Some(WorkerBindingApi::D1));
+        let legacy_hash = super::super::WorkerCapabilityPolicy::default()
+            .with_logical_bindings(legacy)
+            .unwrap()
+            .sha256();
+        let native_hash = super::super::WorkerCapabilityPolicy::default()
+            .with_logical_bindings(native)
+            .unwrap()
+            .sha256();
+        assert_ne!(legacy_hash, native_hash);
+        for api in [
+            serde_json::Value::Null,
+            serde_json::json!(""),
+            serde_json::json!("fetcher"),
+            serde_json::json!(false),
+            serde_json::json!({}),
+        ] {
+            let mut invalid = value.clone();
+            invalid["api"] = api;
+            assert!(serde_json::from_value::<LogicalBindingConfig>(invalid).is_err());
+        }
+        let mut wrong_kind = value;
+        wrong_kind["kind"] = "kv".into();
+        wrong_kind["api"] = "d1".into();
+        assert!(serde_json::from_value::<LogicalBindingConfig>(wrong_kind).is_err());
+    }
+
+    #[test]
+    fn opaque_binding_authority_also_binds_the_explicit_api() {
+        let runtime =
+            BrokerRuntime::deny_all(RequestIdentity::new("api-app", "api-v1", 0).unwrap())
+                .with_logical(
+                    ["store".into()],
+                    D1Service::new([
+                        D1Binding::in_memory("store", false, Default::default()).unwrap()
+                    ])
+                    .unwrap(),
+                )
+                .unwrap();
+        let legacy = WorkerBinding::sql("store");
+        let mut native = legacy.clone();
+        native.api = Some(WorkerBindingApi::D1);
+        let policy = |binding| {
+            super::super::WorkerCapabilityPolicy::default()
+                .with_broker_runtime(runtime.clone(), vec![binding])
+                .unwrap()
+        };
+        assert_ne!(policy(legacy).sha256(), policy(native).sha256());
     }
 
     #[test]

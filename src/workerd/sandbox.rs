@@ -445,6 +445,7 @@ pub struct WorkerVersionSandbox {
     broker_runtime: Option<BrokerRuntime>,
     capability_policy_sha256: String,
     logical_policy: Option<super::LogicalBindingsPolicy>,
+    requires_sql_api: bool,
     allow_instance_checkpoint: bool,
 }
 
@@ -704,6 +705,9 @@ impl WorkerCapabilityPolicy {
             digest.update(b"\0");
             digest.update(format!("{:?}", binding.kind).as_bytes());
             digest.update(b"\0");
+            if binding.api == Some(super::WorkerBindingApi::D1) {
+                digest.update(b"api:d1\0");
+            }
         }
         digest
             .finalize()
@@ -905,6 +909,7 @@ impl WorkerVersionSandbox {
             bindings,
             logical_policy,
         } = policy;
+        let requires_sql_api = bindings.iter().any(|binding| binding.api.is_some());
         let policy_sha256 = WorkerCapabilityPolicy {
             fetch_broker: fetch_broker.clone(),
             timer_limits: timer_limits.clone(),
@@ -1035,6 +1040,7 @@ impl WorkerVersionSandbox {
                 broker_runtime,
                 capability_policy_sha256: policy_sha256,
                 logical_policy,
+                requires_sql_api,
                 allow_instance_checkpoint: false,
             },
             profile,
@@ -1068,6 +1074,7 @@ impl WorkerVersionSandbox {
             capability_policy_sha256,
             logical_policy: None,
             allow_instance_checkpoint: false,
+            requires_sql_api: false,
         }
     }
 
@@ -1090,6 +1097,7 @@ impl WorkerVersionSandbox {
             capability_policy_sha256,
             logical_policy: None,
             allow_instance_checkpoint: false,
+            requires_sql_api: false,
         }
     }
 
@@ -1131,6 +1139,7 @@ impl WorkerVersionSandbox {
             capability_policy_sha256: policy.sha256(),
             logical_policy: None,
             allow_instance_checkpoint: false,
+            requires_sql_api: false,
         })
     }
 
@@ -1171,6 +1180,7 @@ impl WorkerVersionSandbox {
             SnapshotBinding::from_artifacts_with_policy(bundle, rootfs, executor, policy_sha256)?;
         let image = VerifiedSnapshot::open(snapshot_dir, &expected)?;
         if policy.logical_policy.is_some() {
+            let requires_sql_api = policy.bindings.iter().any(|binding| binding.api.is_some());
             return Ok(Self {
                 image,
                 fetch_broker: policy.fetch_broker,
@@ -1180,6 +1190,7 @@ impl WorkerVersionSandbox {
                 capability_policy_sha256: expected.capability_policy_sha256().into(),
                 logical_policy: policy.logical_policy,
                 allow_instance_checkpoint: false,
+                requires_sql_api,
             });
         }
         Self::from_verified_snapshot_with_storage(
@@ -1235,7 +1246,9 @@ impl WorkerVersionSandbox {
         request: ScheduledRequest,
         timeout: Duration,
     ) -> Result<ScheduledResponse> {
-        if self.image.binding().bundle_protocol_version() == super::PACKAGE_PROTOCOL_VERSION {
+        if self.image.binding().bundle_protocol_version() == super::PACKAGE_PROTOCOL_VERSION
+            || self.requires_sql_api
+        {
             return self
                 .execute_invocation_profiled(
                     version,
@@ -1265,7 +1278,9 @@ impl WorkerVersionSandbox {
         request: QueueRequest,
         timeout: Duration,
     ) -> Result<QueueResponse> {
-        if self.image.binding().bundle_protocol_version() == super::PACKAGE_PROTOCOL_VERSION {
+        if self.image.binding().bundle_protocol_version() == super::PACKAGE_PROTOCOL_VERSION
+            || self.requires_sql_api
+        {
             return self
                 .execute_invocation_profiled(version, InvocationRequest::Queue(request), timeout)
                 .0
@@ -1289,7 +1304,9 @@ impl WorkerVersionSandbox {
         request: RequestEnvelope,
         timeout: Duration,
     ) -> (Result<ResponseEnvelope>, ExecutionProfile) {
-        if self.image.binding().bundle_protocol_version() == super::PACKAGE_PROTOCOL_VERSION {
+        if self.image.binding().bundle_protocol_version() == super::PACKAGE_PROTOCOL_VERSION
+            || self.requires_sql_api
+        {
             let (result, profile) =
                 self.execute_invocation_profiled(version, request.into(), timeout);
             return (result.and_then(InvocationResponse::into_fetch), profile);
@@ -1559,7 +1576,8 @@ impl WorkerVersionSandbox {
                 responses,
                 broker_runtime,
                 use_invoke_v2: self.image.binding().bundle_protocol_version()
-                    == super::PACKAGE_PROTOCOL_VERSION,
+                    == super::PACKAGE_PROTOCOL_VERSION
+                    || self.requires_sql_api,
                 reset_broker_per_invocation: self.logical_policy.as_ref().is_some_and(|policy| {
                     policy.budget_scope() == super::LogicalBudgetScope::Invocation
                 }),

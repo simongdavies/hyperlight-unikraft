@@ -164,10 +164,18 @@ pub enum WorkerBindingKind {
     ProviderWebsocket,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerBindingApi {
+    D1,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct WorkerBinding {
     pub name: String,
     pub kind: WorkerBindingKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api: Option<WorkerBindingApi>,
 }
 
 impl WorkerBinding {
@@ -175,6 +183,7 @@ impl WorkerBinding {
         Self {
             name: name.into(),
             kind: WorkerBindingKind::D1,
+            api: None,
         }
     }
 }
@@ -189,6 +198,8 @@ struct ExecutorStorageBinding<'a> {
 struct ExecutorBinding<'a> {
     name: &'a str,
     kind: WorkerBindingKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api: Option<WorkerBindingApi>,
 }
 
 #[derive(Serialize)]
@@ -668,6 +679,7 @@ impl WorkerBundle {
             .map(|binding| ExecutorBinding {
                 name: &binding.name,
                 kind: binding.kind,
+                api: binding.api,
             })
             .collect();
         bindings.sort_by(|left, right| left.name.cmp(right.name));
@@ -677,6 +689,9 @@ impl WorkerBundle {
         let mut previous = None;
         for binding in &bindings {
             identifier(binding.name, 64)?;
+            if binding.api.is_some() && binding.kind != WorkerBindingKind::D1 {
+                return Err(invalid("D1 API selector requires a SQL binding"));
+            }
             if previous.is_some_and(|name| name == binding.name) {
                 return Err(invalid("duplicate executor binding"));
             }
@@ -1094,6 +1109,7 @@ mod tests {
         let binding = WorkerBinding {
             name: "settings".into(),
             kind: WorkerBindingKind::Kv,
+            api: None,
         };
         let json = bundle()
             .to_executor_init_json_with_bindings(std::iter::empty(), [&binding])
@@ -1103,6 +1119,41 @@ mod tests {
             json,
             r#"{"protocol_version":3,"worker_version":"v1","compatibility_date":"2025-01-01","compatibility_flags":["nodejs_compat"],"main_module":"worker.js","modules":[{"name":"worker.js","type":"esModule","source":"export default { fetch() { return new Response('ok') } }"}],"storage":[],"bindings":[{"name":"settings","kind":"kv"}]}"#
         );
+    }
+
+    #[test]
+    fn d1_api_manifest_is_additive_ordered_and_restricted_to_sql() {
+        let mut binding = WorkerBinding {
+            name: "DB".into(),
+            kind: WorkerBindingKind::D1,
+            api: Some(WorkerBindingApi::D1),
+        };
+        for version in [PROTOCOL_VERSION, PACKAGE_PROTOCOL_VERSION] {
+            let mut bundle = bundle();
+            bundle.protocol_version = version;
+            let json = bundle
+                .to_executor_init_json_with_bindings(std::iter::empty(), [&binding])
+                .unwrap();
+            assert!(
+                json.contains(r#""bindings":[{"name":"DB","kind":"d1","api":"d1"}]"#),
+                "{json}"
+            );
+        }
+        binding.kind = WorkerBindingKind::Kv;
+        assert!(
+            bundle()
+                .to_executor_init_json_with_bindings(std::iter::empty(), [&binding])
+                .is_err()
+        );
+        let legacy = WorkerBinding::sql("store");
+        let json = bundle()
+            .to_executor_init_json_with_bindings(std::iter::empty(), [&legacy])
+            .unwrap();
+        assert!(
+            json.contains(r#""bindings":[{"name":"store","kind":"d1"}]"#),
+            "{json}"
+        );
+        assert!(!json.contains(r#""api""#));
     }
 
     #[test]
