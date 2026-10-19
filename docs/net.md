@@ -22,11 +22,11 @@ Python/Node app               hostnet.rs
 1. The guest calls `socket()`, `connect()`, `send()`, etc. through the standard POSIX socket API.
 2. Unikraft's socket layer dispatches to **hostsock** — a kernel driver registered for `AF_INET` and `AF_INET6`.
 3. hostsock serialises the call into `hl_param` structs and makes a synchronous host call (`hl_hcall_int` for integer results, `hl_hcall_vecbytes` for variable-length data).
-4. The host's **hostnet** module looks up the virtual fd in a `SocketTable`, checks policy, and makes the matching [`rustix`](https://docs.rs/rustix) call — `rustix::net::connect`, `rustix::net::sendto`, `rustix::event::poll`, … — on the real OS socket.  rustix is a safe wrapper over the POSIX/WinSock socket API, so the host side is the same code on Linux and Windows.
+4. The host's **hostnet** module looks up the virtual fd in a `SocketTable`, checks policy, and makes the matching [`rustix`](https://docs.rs/rustix) call — `rustix::net::connect`, `rustix::net::sendto`, `rustix::event::poll`, … — on the real OS socket.  rustix is a safe wrapper over the POSIX/WinSock socket API, so the host side is the same code on Linux, Windows and macOS.
 
 ### Host portability
 
-The host side is the same code on Linux and Windows.  The guest is a Linux-ABI unikernel, so the host always speaks Linux numbers to it: errno values, `POLL*` bits and `SOL_*`/`SO_*` option numbers are translated at the boundary (`src/errno.rs`, `src/hostnet.rs`), and socket options are served from an allow-list of the int-valued options runtimes use (unknown ones return `-ENOPROTOOPT`).
+The host side is the same code on Linux, Windows and macOS.  The guest is a Linux-ABI unikernel, so the host always speaks Linux numbers to it: errno values, `POLL*` bits and `SOL_*`/`SO_*` option numbers are translated at the boundary (`src/errno.rs`, `src/hostnet.rs`), and socket options are served from an allow-list of the int-valued options runtimes use (unknown ones return `-ENOPROTOOPT`).
 
 ### Blocking model and intra-guest networking
 
@@ -52,7 +52,7 @@ let mut guest = SandboxBuilder::from_initrd(rootfs)
     .boot()?;
 ```
 
-When `None` (the default), no `net_*` host functions are registered and guest socket calls fail.
+When `None` (the default) and no listen ports are set, the `net_*` host functions refuse every `socket()` with `EACCES`, so guest socket calls fail; with listen ports, see [ListenPorts](#listenports).  They are registered either way, so a snapshot saved under a policy restores without one (its sockets die on resume, as their peers would have) and a snapshot saved without a policy restores under one.
 
 ## Host functions
 
@@ -63,6 +63,7 @@ When `None` (the default), no `net_*` host functions are registered and guest so
 | `net_listen` | `(fd, backlog) → 0` | Start listening |
 | `net_accept` | `(fd) → [new_fd, addr]` | Accept a connection |
 | `net_connect` | `(fd, family, addr, port) → 0` | Connect to a remote address |
+| `net_disconnect` | `(fd) → 0` | Dissolve a datagram socket's association (`connect` with `AF_UNSPEC`) |
 | `net_send` | `(fd, data) → bytes_sent` | Send data |
 | `net_sendto` | `(fd, data, family, addr, port) → bytes_sent` | Send to a specific address |
 | `net_recvfrom` | `(fd, len) → [bytes, addr, data]` | Receive data |
@@ -79,7 +80,7 @@ All functions return negative `-errno` values on error.
 ## Limits
 
 - **Max sockets:** 1024 open sockets per sandbox (host-enforced).
-- **Transfer size:** 64 KiB per `recvfrom` / `write` / `sendmsg` call, the most one host call carries; a longer write returns a short count and the caller's loop continues. The guest takes the figure from the PEB I/O stack sizes the host chose.
+- **Transfer size:** 69,620 bytes per `write` / `sendmsg` call, the most one host call carries, and 69,593 per `recvfrom` (its reply also carries the source address); a longer write returns a short count and the caller's loop continues. The guest takes the figure from the virtqueue pool sizes the host chose.
 - **Protocols:** `AF_INET`/`AF_INET6` with `SOCK_STREAM`/`SOCK_DGRAM` reach the host. No raw sockets. `AF_UNIX` exists only inside the guest (`socketpair`, which asyncio's event loop needs), served by the kernel itself.
 
 ## Network policy
@@ -129,7 +130,13 @@ let mut guest = SandboxBuilder::from_initrd(rootfs)
     .boot()?;
 ```
 
-Ephemeral binds (port 0 — "assign any port") are always allowed.
+Listen ports need no outbound policy: without `.network(...)`, the guest may serve on them and reach nothing, as under an allow list that lists nothing — what a TCP server that only answers requests needs (its replies go over the accepted connections).  A UDP service cannot answer so: each reply is a `sendto()` to the client, an outbound destination like any other, so it needs a policy that allows its clients.
+
+Ephemeral binds (port 0 — "assign any port") are always allowed.  `ListenPorts::all()` permits every port, and `with_range(8000..=8010)` a range; on the command line these are `--port all` and `--port 8000-8010`, next to `--port 80`.  `all` is for an embedder whose own boundary already scopes what the guest exposes, such as a container runtime, where the guest binds inside the container's network namespace the way any container process does.
+
+### Resolver configuration
+
+The rootfs images ship an `/etc/resolv.conf` naming public resolvers, which is right on a laptop and wrong in a pod, where names resolve through the cluster's resolver and a search list that includes the pod's namespace.  That file belongs to the place the guest runs, so it is handed over at run time: `hluk run --resolv-conf FILE`, or `SandboxBuilder::resolv_conf(content)` in the library.  The kernel fetches it through the `GetResolvConf` host function once the rootfs is mounted and writes it as `/etc/resolv.conf`, and does so again on every restore, so a snapshot taken on one machine resolves names where it is resumed.  Without it the rootfs's file stands.  `options single-request` is added unless the file has it: glibc's parallel A and AAAA queries do not work through the socket layer.  Under an allow list, the file's nameservers are exempt on port 53 like the host's own, so a guest that may only reach listed names can still ask the resolver it was given.
 
 A guest restored from a snapshot binds its listeners again on its `resume` entry, so their ports must be in the restoring sandbox's `ListenPorts` too.
 
@@ -147,6 +154,9 @@ hluk run --net-block evil.com --net-block 1.2.3.4 ...
 
 # Restrict inbound listen ports:
 hluk run --net --port 80 --port 443 ...
+
+# Serve on a port, reach nothing:
+hluk run --port 8080 ...
 ```
 
 ## Examples

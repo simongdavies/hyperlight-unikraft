@@ -1945,7 +1945,7 @@ impl DnsAdmission {
     fn acquire(inner: Arc<FetchBrokerInner>) -> std::result::Result<Self, FetchFailure> {
         inner
             .dns_active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < inner.config.limits.max_concurrent_requests).then_some(active + 1)
             })
             .map_err(|_| FetchFailure::overloaded("DNS resolver limit reached"))?;
@@ -1976,7 +1976,7 @@ impl Admission {
     fn acquire(inner: Arc<FetchBrokerInner>) -> std::result::Result<Self, FetchFailure> {
         inner
             .active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < inner.config.limits.max_concurrent_requests).then_some(active + 1)
             })
             .map_err(|_| FetchFailure::overloaded("outbound request limit reached"))?;

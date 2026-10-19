@@ -33,8 +33,11 @@ scratch_bash       := "256"
 scratch_python     := "256"
 scratch_dotnet_aot := "256"
 scratch_node       := "512"
+scratch_java       := "512"
 scratch_dotnet_jit := "768"
 scratch_powershell := "1024"
+scratch_quickjs    := "64"
+scratch_wasmtime   := "256"
 scratch_agent        := "1536"
 scratch_python_shell   := "256"
 scratch_agent_custom := "256"
@@ -51,8 +54,11 @@ _scratch-mb runtime:
         else if runtime == "python" { scratch_python } \
         else if runtime == "dotnet-aot" { scratch_dotnet_aot } \
         else if runtime == "node" { scratch_node } \
+        else if runtime == "java" { scratch_java } \
         else if runtime == "dotnet-jit" { scratch_dotnet_jit } \
         else if runtime == "powershell" { scratch_powershell } \
+        else if runtime == "quickjs" { scratch_quickjs } \
+        else if runtime == "wasmtime" { scratch_wasmtime } \
         else if runtime == "agent" { scratch_agent } \
         else if runtime == "python-shell" { scratch_python_shell } \
         else if runtime == "agent-custom" { scratch_agent_custom } \
@@ -115,65 +121,73 @@ workerd-api-probe scratch="512":
 # ── Kernel ───────────────────────────────────────────────────────
 
 kernel_dir    := root_dir / "kernel"
-kernel_bin    := kernel_dir / "elfloader_hyperlight-x86_64"
 kernel_build  := kernel_dir / ".build"
 workerd_kernel_bin   := kernel_dir / "workerd_hyperlight-x86_64"
 workerd_kernel_build := kernel_dir / ".build-workerd"
+
+# The architectures the embedded kernel is built for, one binary each
+# (kernel/elfloader_hyperlight-<arch>): hluk embeds the one for its host.
+kernel_arches := "x86_64 arm64"
 
 # Native test-fixture kernel (a C main() compiled into the kernel — no
 # elfloader/initrd), used by tests/native_kernel.rs.
 native_kernel_dir := root_dir / "tests" / "fixtures" / "native-kernel"
 native_kernel_bin := native_kernel_dir / "helloworld-native_hyperlight-x86_64"
 
-# Build the Unikraft elfloader kernel from submodule sources.
+# Build the Unikraft elfloader kernel from submodule sources, for one
+# architecture (x86_64, arm64) or, by default, all of them.
 # Uses Docker for reproducible builds — the same binary on every machine.
 # Requires: Docker, and the kernel submodules (git submodule update --init).
 [unix]
-build-kernel:
+build-kernel arch="all":
     #!/usr/bin/env bash
     set -euo pipefail
+    arches="{{ if arch == "all" { kernel_arches } else { arch } }}"
+    for a in $arches; do
+        echo "==> Building the $a kernel inside Docker (reproducible toolchain)..."
+        just _kernel-docker "$a"
+        cp "{{kernel_build}}/elfloader_hyperlight-$a" "{{kernel_dir}}/elfloader_hyperlight-$a"
+        echo "==> Kernel built: {{kernel_dir}}/elfloader_hyperlight-$a"
+        echo "    sha256: $(sha256sum "{{kernel_dir}}/elfloader_hyperlight-$a" | cut -d' ' -f1)"
+    done
 
+[windows]
+build-kernel arch="all":
+    @Write-Error "build-kernel needs Docker on Linux. Build there (just build-kernel) and commit kernel/elfloader_hyperlight-*."; exit 1
+
+# Verify the committed kernel binaries match a fresh build (one
+# architecture, or by default all of them).
+# Returns exit 0 if they match, exit 1 if any differ.
+[unix]
+verify-kernel arch="all":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    arches="{{ if arch == "all" { kernel_arches } else { arch } }}"
     if [ ! -f "{{kernel_dir}}/unikraft/Makefile" ]; then
         echo "error: kernel submodules not initialised" >&2
         echo "run: git submodule update --init --recursive" >&2
         exit 1
     fi
-
-    echo "==> Building kernel builder image..."
-    docker build -q -t hluk-kernel-builder \
-        -f "{{kernel_dir}}/Dockerfile.build" "{{kernel_dir}}/"
-
-    echo "==> Building kernel inside Docker (reproducible toolchain)..."
-    docker run --rm \
-        -v "{{kernel_dir}}:/kernel" \
-        -v "{{root_dir}}/defconfig-elfloader:/defconfig-elfloader:ro" \
-        -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
-        hluk-kernel-builder bash -c '
-            set -euo pipefail
-            rm -rf .build
-            mkdir -p .build app-elfloader/workdir/libs
-            ln -sfn /kernel/unikraft app-elfloader/workdir/unikraft
-            ln -sfn /kernel/libs/libelf app-elfloader/workdir/libs/libelf
-            ln -sfn /kernel/.build app-elfloader/workdir/build
-            cp /defconfig-elfloader app-elfloader/.config
-            cd app-elfloader
-            yes "" 2>/dev/null | make WITH_LWIP=n olddefconfig || true
-            make WITH_LWIP=n -j$(nproc)
-            cd ..
-            cp .build/elfloader_hyperlight-x86_64 elfloader_hyperlight-x86_64
-            chown "$HOST_UID:$HOST_GID" elfloader_hyperlight-x86_64
-            chown -R "$HOST_UID:$HOST_GID" .build
-            rm -f app-elfloader/.config app-elfloader/.config.old
-            rm -f app-elfloader/workdir/unikraft app-elfloader/workdir/libs/libelf app-elfloader/workdir/build
-            rmdir app-elfloader/workdir/libs app-elfloader/workdir 2>/dev/null || true
-        '
-
-    echo "==> Kernel built: {{kernel_bin}}"
-    echo "    sha256: $(sha256sum "{{kernel_bin}}" | cut -d' ' -f1)"
+    rc=0
+    for a in $arches; do
+        committed="$(sha256sum "{{kernel_dir}}/elfloader_hyperlight-$a" | cut -d' ' -f1)"
+        just _kernel-docker "$a" > /dev/null 2>&1
+        fresh="$(sha256sum "{{kernel_build}}/elfloader_hyperlight-$a" | cut -d' ' -f1)"
+        if [ "$committed" = "$fresh" ]; then
+            echo "✓ $a kernel binary matches source (sha256: $committed)"
+        else
+            echo "✗ $a kernel binary does NOT match source" >&2
+            echo "  committed: $committed" >&2
+            echo "  fresh:     $fresh" >&2
+            echo "  Run 'just build-kernel $a' to rebuild." >&2
+            rc=1
+        fi
+    done
+    exit $rc
 
 [windows]
-build-kernel:
-    @Write-Error "build-kernel needs Docker on Linux. Build there (just build-kernel) and commit kernel/elfloader_hyperlight-x86_64."; exit 1
+verify-kernel arch="all":
+    @Write-Error "verify-kernel needs Docker on Linux; run it there."; exit 1
 
 # Build the workerd-specific elfloader. Its initrd is the static executor ELF
 # itself, so boot does not duplicate it through CPIO extraction into RAMFS.
@@ -186,27 +200,37 @@ build-workerd-kernel:
 build-workerd-kernel:
     @Write-Error "build-workerd-kernel needs Docker on Linux; run it inside WSL."; exit 1
 
-# Verify the committed kernel binary matches a fresh build.
-# Returns exit 0 if they match, exit 1 if they differ.
+# Build each architecture in the upstream deterministic builder.
+[private]
 [unix]
-verify-kernel:
+_kernel-docker arch:
     #!/usr/bin/env bash
     set -euo pipefail
-    committed="$(sha256sum "{{kernel_bin}}" | cut -d' ' -f1)"
 
     if [ ! -f "{{kernel_dir}}/unikraft/Makefile" ]; then
         echo "error: kernel submodules not initialised" >&2
         echo "run: git submodule update --init --recursive" >&2
         exit 1
     fi
+    # The builder is amd64 everywhere: the committed binaries are built
+    # there, and verify-kernel must reproduce them on an arm64 host too.
+    case "{{arch}}" in
+        x86_64) cross=""; overlay=() ;;
+        arm64)  cross="CROSS_COMPILE=aarch64-linux-gnu-"
+                overlay=(-v "{{root_dir}}/defconfig-elfloader.arm64:/defconfig-overlay:ro") ;;
+        *) echo "error: unknown kernel architecture '{{arch}}' (want: {{kernel_arches}})" >&2
+           exit 1 ;;
+    esac
 
-    docker build -q -t hluk-kernel-builder \
-        -f "{{kernel_dir}}/Dockerfile.build" "{{kernel_dir}}/"
+    docker build -q --platform linux/amd64 -t hluk-kernel-builder \
+        -f "{{kernel_dir}}/Dockerfile.build" "{{kernel_dir}}/" > /dev/null
 
-    docker run --rm \
+    docker run --rm --platform linux/amd64 \
         -v "{{kernel_dir}}:/kernel" \
         -v "{{root_dir}}/defconfig-elfloader:/defconfig-elfloader:ro" \
+        ${overlay[@]+"${overlay[@]}"} \
         -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+        -e CROSS="$cross" \
         hluk-kernel-builder bash -c '
             set -euo pipefail
             rm -rf .build
@@ -214,31 +238,16 @@ verify-kernel:
             ln -sfn /kernel/unikraft app-elfloader/workdir/unikraft
             ln -sfn /kernel/libs/libelf app-elfloader/workdir/libs/libelf
             ln -sfn /kernel/.build app-elfloader/workdir/build
-            cp /defconfig-elfloader app-elfloader/.config
+            { cat /defconfig-elfloader; [ ! -f /defconfig-overlay ] || cat /defconfig-overlay; } > app-elfloader/.config
             cd app-elfloader
-            yes "" 2>/dev/null | make WITH_LWIP=n olddefconfig > /dev/null 2>&1 || true
-            make WITH_LWIP=n -j$(nproc) > /dev/null 2>&1
+            yes "" 2>/dev/null | make $CROSS WITH_LWIP=n olddefconfig || true
+            make $CROSS WITH_LWIP=n -j$(nproc)
             cd ..
             chown -R "$HOST_UID:$HOST_GID" .build
             rm -f app-elfloader/.config app-elfloader/.config.old
             rm -f app-elfloader/workdir/unikraft app-elfloader/workdir/libs/libelf app-elfloader/workdir/build
             rmdir app-elfloader/workdir/libs app-elfloader/workdir 2>/dev/null || true
         '
-
-    fresh="$(sha256sum "{{kernel_build}}/elfloader_hyperlight-x86_64" | cut -d' ' -f1)"
-    if [ "$committed" = "$fresh" ]; then
-        echo "✓ Kernel binary matches source (sha256: $committed)"
-    else
-        echo "✗ Kernel binary does NOT match source" >&2
-        echo "  committed: $committed" >&2
-        echo "  fresh:     $fresh" >&2
-        echo "  Run 'just build-kernel' to rebuild." >&2
-        exit 1
-    fi
-
-[windows]
-verify-kernel:
-    @Write-Error "verify-kernel needs Docker on Linux; run it there."; exit 1
 
 [unix]
 verify-workerd-kernel:
@@ -298,11 +307,11 @@ build-native-kernel:
     fi
 
     echo "==> Building kernel builder image..."
-    docker build -q -t hluk-kernel-builder \
+    docker build -q --platform linux/amd64 -t hluk-kernel-builder \
         -f "{{kernel_dir}}/Dockerfile.build" "{{kernel_dir}}/"
 
     echo "==> Building native kernel inside Docker (reproducible toolchain)..."
-    docker run --rm \
+    docker run --rm --platform linux/amd64 \
         -v "{{kernel_dir}}:/kernel" \
         -v "{{native_kernel_dir}}:/napp" \
         -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
@@ -338,10 +347,10 @@ verify-native-kernel:
         exit 1
     fi
 
-    docker build -q -t hluk-kernel-builder \
+    docker build -q --platform linux/amd64 -t hluk-kernel-builder \
         -f "{{kernel_dir}}/Dockerfile.build" "{{kernel_dir}}/"
 
-    docker run --rm \
+    docker run --rm --platform linux/amd64 \
         -v "{{kernel_dir}}:/kernel" \
         -v "{{native_kernel_dir}}:/napp" \
         -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
@@ -389,11 +398,21 @@ clean-kernel:
 # build-rootfs for those runtimes; run directly to refresh it.
 [unix]
 build-busybox:
-    docker build -t hluk-busybox -f "{{drivers_dir}}/busybox.Dockerfile" "{{root_dir}}/"
+    docker build {{ if rootfs_platform == "" { "" } else { "--platform " + rootfs_platform } }} \
+        -t hluk-busybox{{rootfs_suffix}} -f "{{drivers_dir}}/busybox.Dockerfile" "{{root_dir}}/"
 
 [windows]
 build-busybox:
     @Write-Error "build-busybox needs Docker on Linux."; exit 1
+
+# The platform rootfs images are built for: Docker's default (the host's)
+# unless set, e.g. HLUK_ROOTFS_PLATFORM=linux/arm64 to build arm64 images on
+# an x86_64 host (needs QEMU binfmt handlers).  Such a build is kept apart from the
+# host's: image hluk-<runtime>-rootfs-arm64, build-elfloader/<runtime>-rootfs-arm64.cpio.
+# Images built FROM a driver's (examples/, demos/) take the same suffix through
+# ARG ROOTFS_SUFFIX; rebuild-rootfs builds for the host.
+rootfs_platform := env("HLUK_ROOTFS_PLATFORM", "")
+rootfs_suffix   := if rootfs_platform == "" { "" } else { "-" + file_name(rootfs_platform) }
 
 # Build a rootfs CPIO from a driver Dockerfile.
 #
@@ -428,21 +447,46 @@ build-rootfs runtime dockerfile="":
         just build-rootfs python-shell
         docker image inspect hluk-python-shell-rootfs:latest >/dev/null
     fi
-    image="hluk-{{runtime}}-rootfs"
-    output="{{build_dir}}/{{runtime}}-rootfs.cpio"
+    image="hluk-{{runtime}}-rootfs{{rootfs_suffix}}"
+    output="{{build_dir}}/{{runtime}}-rootfs{{rootfs_suffix}}.cpio"
     mkdir -p "{{build_dir}}"
     # Dependency: build the shared BusyBox base image first if this
-    # Dockerfile pulls from it (COPY --from=hluk-busybox).
-    if grep -q 'from=hluk-busybox' "$df"; then
+    # Dockerfile pulls from it (ARG BUSYBOX=hluk-busybox), for the same
+    # platform: the build names it through that argument.
+    if grep -q 'ARG BUSYBOX=hluk-busybox' "$df"; then
         just build-busybox
     fi
     echo "==> Building image $image from $df"
-    docker build -t "$image" -f "$df" "{{root_dir}}/"
+    platform="{{rootfs_platform}}"
+    # The Rust a Dockerfile builds with (drivers/wasmtime), for one that asks.
+    rust=
+    if grep -q '^ARG RUST_VERSION' "$df"; then
+        rust=$(just _rust-version)
+    fi
+    docker build ${platform:+--platform "$platform"} \
+        --build-arg BUSYBOX=hluk-busybox{{rootfs_suffix}} \
+        --build-arg ROOTFS_SUFFIX={{rootfs_suffix}} \
+        ${rust:+--build-arg RUST_VERSION="$rust"} \
+        -t "$image" -f "$df" "{{root_dir}}/"
     just _export-cpio "{{runtime}}" "$image"
 
 [windows]
 build-rootfs runtime dockerfile="":
     @Write-Error "build-rootfs needs Docker + cpio on Linux. Build there (just build-rootfs {{runtime}}) and copy build-elfloader/{{runtime}}-rootfs.cpio here."; exit 1
+
+# The Rust release rust-toolchain.toml pins, read as arm64.yml reads it.  A
+# release, as the rust:<release> images Docker builds from are named.
+[private]
+[unix]
+_rust-version:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    rust=$(sed -n 's/^channel = "\(.*\)"/\1/p' "{{root_dir}}/rust-toolchain.toml")
+    [[ "$rust" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || {
+        echo "error: rust-toolchain.toml pins no release (channel = \"1.99.0\"): '$rust'" >&2
+        exit 1
+    }
+    echo "$rust"
 
 # Export a rootfs docker image to build-elfloader/<runtime>-rootfs.cpio.
 # Used by build-rootfs after the docker build.
@@ -451,12 +495,14 @@ build-rootfs runtime dockerfile="":
 _export-cpio runtime image:
     #!/usr/bin/env bash
     set -euo pipefail
-    output="{{build_dir}}/{{runtime}}-rootfs.cpio"
+    output="{{build_dir}}/{{runtime}}-rootfs{{rootfs_suffix}}.cpio"
     mkdir -p "{{build_dir}}"
     echo "==> Exporting {{image}} to $output (newc CPIO)"
     tmpdir=$(mktemp -d)
     trap 'rm -rf "$tmpdir"' EXIT
-    cid=$(docker create --entrypoint=/ "{{image}}" 2>/dev/null || docker create "{{image}}")
+    platform="{{rootfs_platform}}"
+    cid=$(docker create ${platform:+--platform "$platform"} --entrypoint=/ "{{image}}" 2>/dev/null \
+        || docker create ${platform:+--platform "$platform"} "{{image}}")
     docker export "$cid" | tar -C "$tmpdir" -xf -
     docker rm "$cid" > /dev/null
     # docker export replaces /etc/hosts, /etc/resolv.conf with empty
@@ -511,10 +557,14 @@ changelog-notes version:
         grab && /^## \[/ { exit }
         grab { print }
     ' "{{root_dir}}/CHANGELOG.md" | sed -e '/./,$!d' | sed -e :strip -e '/^\n*$/{$d;N;bstrip}'
-    # Plus GitHub's auto-generated PR list, stripped of its own heading.
+    # Plus GitHub's auto-generated PR list, stripped of its own heading.  From
+    # the last release's tag, named outright: left to choose, GitHub could
+    # take the `dev` pre-release's, which points at main too.
     if [ "{{version}}" != "Prerelease" ] && command -v gh >/dev/null 2>&1; then
+        prev="$(git -C "{{root_dir}}" tag -l 'v*' --sort=-v:refname | grep -vx "{{version}}" | head -1)" || true
         prs="$(gh api "repos/{owner}/{repo}/releases/generate-notes" \
-            -f tag_name="{{version}}" --jq '.body' 2>/dev/null | sed '1,/^## /d')" || true
+            -f tag_name="{{version}}" ${prev:+-f previous_tag_name="$prev"} \
+            --jq '.body' 2>/dev/null | sed '1{/^## /d;}')" || true
         if [ -n "${prs:-}" ]; then
             printf '\n## Pull requests\n\n%s\n' "$prs"
         fi
@@ -536,42 +586,91 @@ changelog-notes version:
 # Same scheme for busybox (:latest is its base; no initrd — it's build-only),
 # and the kernel / urunc "hello" images.  publish-images.yml logs in and passes
 # the version; run locally after `docker login`.  Linux-only (Docker builds).
+#
+# Runtimes and busybox are multi-platform: each architecture is built
+# natively and pushed under arch-suffixed tags (`publish ... arm64` pushes
+# :latest-arm64, :initrd-arm64, …), then `publish-index` joins them into one
+# image index per tag, from which hluk and Docker pick the host's.
+#
+# `stable` says whether :latest and :initrd move: a release's publish
+# (true) moves them, the dev channel's (false, version `dev-<sha7>`) pushes
+# only :dev-<sha7> and :initrd-dev-<sha7>, which that commit's dev build of
+# hluk pulls.
 
-# Tag a local image into <target>:latest (+ :<version> when given) and push.
+# Tag a local image into <target>:latest (when stable) and :<version> (when
+# given) and push, each tag suffixed with -<arch> when given.
 [private]
 [unix]
-_push local target version="":
+_push local target version="" arch="" stable="true":
     #!/usr/bin/env bash
     set -euo pipefail
-    docker tag "{{local}}:latest" "{{target}}:latest"
-    docker push "{{target}}:latest"
-    if [ -n "{{version}}" ]; then
-        docker tag "{{local}}:latest" "{{target}}:{{version}}"
-        docker push "{{target}}:{{version}}"
+    sfx="{{ if arch == "" { "" } else { "-" + arch } }}"
+    if [ "{{stable}}" = true ]; then
+        docker tag "{{local}}:latest" "{{target}}:latest$sfx"
+        docker push "{{target}}:latest$sfx"
     fi
+    if [ -n "{{version}}" ]; then
+        docker tag "{{local}}:latest" "{{target}}:{{version}}$sfx"
+        docker push "{{target}}:{{version}}$sfx"
+    fi
+
+# Join the per-architecture tags `publish <runtime> ... <arch>` pushed into one
+# multi-platform index per tag: <registry>/<runtime>:latest, :initrd (when
+# stable) and the versioned ones.  Every architecture must have been
+# published: a missing -<arch> tag is an error, not a platform left out.
+[unix]
+publish-index runtime registry version="" arches="amd64 arm64" stable="true":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    repo="{{registry}}/{{runtime}}"
+    tags=()
+    if [ "{{stable}}" = true ]; then
+        tags+=(latest)
+        [ "{{runtime}}" = busybox ] || tags+=(initrd)
+    fi
+    if [ -n "{{version}}" ]; then
+        tags+=("{{version}}")
+        [ "{{runtime}}" = busybox ] || tags+=("initrd-{{version}}")
+    fi
+    for tag in "${tags[@]}"; do
+        sources=()
+        for a in {{arches}}; do
+            docker buildx imagetools inspect "$repo:$tag-$a" > /dev/null 2>&1 \
+                || { echo "error: $repo:$tag-$a is not published" >&2; exit 1; }
+            sources+=("$repo:$tag-$a")
+        done
+        docker buildx imagetools create -t "$repo:$tag" "${sources[@]}"
+    done
 
 # Build a runtime's rootfs and publish it as one package, two tags:
 # <registry>/<runtime>:latest (filesystem base, to build FROM) and
-# <registry>/<runtime>:initrd (the runnable CPIO, for pull-rootfs).
+# <registry>/<runtime>:initrd (the runnable CPIO, for pull-rootfs), each
+# also under the version when given; with stable=false only the versioned
+# ones.  With an arch (amd64, arm64), for the host's architecture under
+# -<arch> tags, which publish-index joins.
 [unix]
-publish runtime registry version="":
+publish runtime registry version="" arch="" stable="true":
     #!/usr/bin/env bash
     set -euo pipefail
     just build-rootfs "{{runtime}}"
     repo="{{registry}}/{{runtime}}"
+    sfx="{{ if arch == "" { "" } else { "-" + arch } }}"
     # :latest (+ :<version>) — the rootfs filesystem image, to build FROM.
-    just _push "hluk-{{runtime}}-rootfs" "$repo" "{{version}}"
+    just _push "hluk-{{runtime}}-rootfs{{rootfs_suffix}}" "$repo" "{{version}}" "{{arch}}" "{{stable}}"
     # :initrd (+ :initrd-<version>) — the runnable CPIO wrapped in a scratch
     # image.  build-elfloader is in .dockerignore, so wrap from a temp context.
     tmpctx=$(mktemp -d); trap 'rm -rf "$tmpctx"' EXIT
-    cp "{{build_dir}}/{{runtime}}-rootfs.cpio" "$tmpctx/initrd.cpio"
+    cp "{{build_dir}}/{{runtime}}-rootfs{{rootfs_suffix}}.cpio" "$tmpctx/initrd.cpio"
+    platform="{{rootfs_platform}}"
     printf 'FROM scratch\nCOPY initrd.cpio /initrd.cpio\n' \
-        | docker build -q -f - -t "hluk-{{runtime}}-initrd" "$tmpctx"
-    docker tag "hluk-{{runtime}}-initrd:latest" "$repo:initrd"
-    docker push "$repo:initrd"
+        | docker build -q ${platform:+--platform "$platform"} -f - -t "hluk-{{runtime}}-initrd" "$tmpctx"
+    if [ "{{stable}}" = true ]; then
+        docker tag "hluk-{{runtime}}-initrd:latest" "$repo:initrd$sfx"
+        docker push "$repo:initrd$sfx"
+    fi
     if [ -n "{{version}}" ]; then
-        docker tag "hluk-{{runtime}}-initrd:latest" "$repo:initrd-{{version}}"
-        docker push "$repo:initrd-{{version}}"
+        docker tag "hluk-{{runtime}}-initrd:latest" "$repo:initrd-{{version}}$sfx"
+        docker push "$repo:initrd-{{version}}$sfx"
     fi
 
 # Publish the shared BusyBox base as <registry>/busybox:latest.  busybox has no
@@ -579,28 +678,38 @@ publish runtime registry version="":
 # userland bash/agent/python-shell build on.  Kept separate from `publish` (which
 # is for runtimes), alongside publish-kernel / publish-urunc.
 [unix]
-publish-busybox registry version="":
+publish-busybox registry version="" arch="" stable="true":
     just build-busybox
-    just _push hluk-busybox "{{registry}}/busybox" "{{version}}"
+    just _push hluk-busybox{{rootfs_suffix}} "{{registry}}/busybox" "{{version}}" "{{arch}}" "{{stable}}"
 
-# Publish the committed kernel as <registry>/kernel (scratch image at /kernel).
+# Publish the committed kernels as <registry>/kernel (scratch image at
+# /kernel), one image index for linux/amd64 and linux/arm64.  Nothing runs in
+# the build, so buildx builds both platforms on any host.
 [unix]
-publish-kernel registry version="":
+publish-kernel registry version="" stable="true":
     #!/usr/bin/env bash
     set -euo pipefail
-    printf 'FROM scratch\nCOPY kernel/elfloader_hyperlight-x86_64 /kernel\n' \
-        | docker build -f - -t hluk-kernel "{{root_dir}}/"
-    just _push hluk-kernel "{{registry}}/kernel" "{{version}}"
+    tags=()
+    [ "{{stable}}" != true ] || tags+=(-t "{{registry}}/kernel:latest")
+    [ -z "{{version}}" ] || tags+=(-t "{{registry}}/kernel:{{version}}")
+    [ ${#tags[@]} -gt 0 ] || { echo "error: no tag to publish the kernel under" >&2; exit 1; }
+    # The context names each kernel as buildx names its platform.
+    tmpctx=$(mktemp -d); trap 'rm -rf "$tmpctx"' EXIT
+    cp "{{kernel_dir}}/elfloader_hyperlight-x86_64" "$tmpctx/kernel-amd64"
+    cp "{{kernel_dir}}/elfloader_hyperlight-arm64" "$tmpctx/kernel-arm64"
+    printf '%s\n' 'FROM scratch' 'ARG TARGETARCH' 'COPY kernel-${TARGETARCH} /kernel' \
+        | docker buildx build --platform linux/amd64,linux/arm64 \
+            -f - "${tags[@]}" --push "$tmpctx"
 
 # Publish the urunc "hello" OCI image (see demos/urunc).
 [unix]
-publish-urunc registry version="":
+publish-urunc registry version="" stable="true":
     #!/usr/bin/env bash
     set -euo pipefail
     ( cd "{{root_dir}}/demos/urunc" && just stage && docker build -f Containerfile -t hluk-hello-urunc . )
-    just _push hluk-hello-urunc "{{registry}}/hello-urunc" "{{version}}"
+    just _push hluk-hello-urunc "{{registry}}/hello-urunc" "{{version}}" "" "{{stable}}"
 
-# Clean rebuild of a rootfs — pulls fresh base images, no Docker cache.
+# Clean rebuild of a rootfs — pulls its pinned base images, no Docker cache.
 # Also nukes stale snapshots. Use when base images or drivers change.
 [unix]
 rebuild-rootfs runtime:
@@ -611,15 +720,19 @@ rebuild-rootfs runtime:
         echo "error: $dockerfile not found" >&2
         exit 1
     fi
-    # Pull fresh base images (skip local build stages like "hluk-python-rootfs")
-    for img in $(grep '^FROM ' "$dockerfile" | awk '{print $2}' | sort -u); do
+    rust=
+    if grep -q '^ARG RUST_VERSION' "$dockerfile"; then
+        rust=$(just _rust-version)
+    fi
+    # Pull the base images (skip local build stages like "hluk-python-rootfs")
+    for img in $(grep '^FROM ' "$dockerfile" | awk '{print $2}' | sed "s/\${RUST_VERSION[^}]*}/$rust/" | sort -u); do
         if docker pull "$img" 2>/dev/null; then
             echo "==> Pulled $img"
         fi
     done
     image="hluk-{{runtime}}-rootfs"
     echo "==> Rebuilding $image (--no-cache)"
-    docker build --no-cache -t "$image" -f "$dockerfile" "{{root_dir}}/"
+    docker build --no-cache ${rust:+--build-arg RUST_VERSION="$rust"} -t "$image" -f "$dockerfile" "{{root_dir}}/"
     just build-rootfs "{{runtime}}"
     # Rebuild the conformance rootfs too (it inherits the base image)
     conformance_dockerfile="{{conformance_dir}}/{{runtime}}/Dockerfile"
@@ -744,6 +857,12 @@ example-dotnet-jit: (run "dotnet-jit" (examples_dir / "dotnet-jit" / "Hello.cs")
 # Run the PowerShell hello world example
 example-powershell: (run "powershell" (examples_dir / "powershell" / "hello.ps1"))
 
+# Run the QuickJS hello world example
+example-quickjs: (run "quickjs" (examples_dir / "quickjs" / "hello.js"))
+
+# Run the Java hello world example
+example-java: (run "java" (examples_dir / "java" / "Hello.java"))
+
 # Compiled runtime examples (C, Rust, Go, dotnet-aot) require compiling
 # on the host first.  See examples/<runtime>/README.md for instructions,
 # then: just run <runtime> ./hello
@@ -753,36 +872,83 @@ example-powershell: (run "powershell" (examples_dir / "powershell" / "hello.ps1"
 # Build the compiled-language example binaries that tests/compiled.rs
 # mounts into the guest, into build-elfloader/bins/<runtime>/.  Linux
 # ELF output, so like build-rootfs this runs on Linux; copy
-# build-elfloader/bins/ to other hosts.  Needs gcc/g++, rustc, go and
-# the .NET SDK.
+# build-elfloader/bins/ to other hosts.  Needs gcc/g++, rustup, go and
+# Docker: the musl C programs and .NET AOT are built in Alpine images.
 [unix]
 build-test-bins:
     #!/usr/bin/env bash
     set -euo pipefail
     bins="{{build_dir}}/bins"
     rm -rf "$bins"
-    mkdir -p "$bins/c" "$bins/rust" "$bins/go" "$bins/dotnet-aot"
+    mkdir -p "$bins/c" "$bins/rust" "$bins/go" "$bins/dotnet-aot" "$bins/wasmtime"
     echo "==> C / C++"
     for src in hello goodbye env_vars status; do
         gcc -O2 -Wall -static-pie -fPIE -o "$bins/c/$src" "{{examples_dir}}/c/$src.c"
     done
     g++ -O2 -Wall -static-pie -fPIE -o "$bins/c/hello_cpp" "{{examples_dir}}/c/hello_cpp.cpp"
+    # The images run below are the ones the drivers build FROM, read from
+    # their Dockerfiles so both stay on the same digest.
+    base_image() { sed -n "s|^FROM \(--platform=[^ ]* \)\{0,1\}\($2[^ ]*\).*|\2|p" "$1" | head -n 1; }
+    alpine=$(base_image "{{drivers_dir}}/c/Dockerfile" alpine:)
+    dotnet_sdk=$(base_image "{{drivers_dir}}/dotnet-jit/Dockerfile" mcr.microsoft.com/dotnet/sdk:)
+    : "${alpine:?no alpine FROM in drivers/c/Dockerfile}" "${dotnet_sdk:?no SDK FROM in drivers/dotnet-jit/Dockerfile}"
+    # With musl, in Alpine: its condition variables hand waiters over with
+    # FUTEX_REQUEUE, which glibc's do not use.
+    docker run --rm -v "{{examples_dir}}/c:/c:ro" -v "$bins/c:/out" \
+        -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" "$alpine" sh -c '
+            set -eu
+            apk add --no-cache gcc musl-dev linux-headers >/dev/null
+            for src in condvar futex_requeue sigsuspend vfork_wake; do
+                gcc -O2 -Wall -static-pie -fPIE -pthread -o /out/$src /c/$src.c
+                chown "$HOST_UID:$HOST_GID" /out/$src
+            done'
     echo "==> Rust"
+    # The pinned toolchain first: `target add` installing it by itself is
+    # deprecated in rustup.
+    rustup toolchain install
     for src in hello env_vars; do
         rustc -C opt-level=2 -C target-feature=+crt-static -C relocation-model=pie \
             -o "$bins/rust/$src" "{{examples_dir}}/rust/$src.rs"
     done
     echo "==> Go"
     for src in hello env_vars counter; do
-        CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -buildmode=pie -ldflags='-s -w' \
+        CGO_ENABLED=0 GOOS=linux go build -buildmode=pie -ldflags='-s -w' \
             -o "$bins/go/$src" "{{examples_dir}}/go/$src.go"
     done
-    echo "==> .NET AOT"
-    for proj in hello env_vars caps; do
-        dotnet publish "{{examples_dir}}/dotnet-aot/$proj" -c Release -r linux-musl-x64 -v q --nologo \
-            -o "$bins/dotnet-aot"
+    echo "==> WebAssembly"
+    rustup target add wasm32-wasip1 wasm32-wasip2 >/dev/null
+    for target in wasm32-wasip1 wasm32-wasip2; do
+        cargo build -q --release --target "$target" \
+            --manifest-path "{{examples_dir}}/wasmtime/hello/Cargo.toml"
+        cp "{{examples_dir}}/wasmtime/hello/target/$target/release/hello.wasm" \
+            "$bins/wasmtime/hello-${target#wasm32-wasi}.wasm"
     done
-    rm -f "$bins/dotnet-aot"/*.dbg
+    # WASI 0.3: a command, and a library with an async export.
+    for crate in hello-p3 calculator; do
+        cargo build -q --release --target wasm32-wasip2 \
+            --manifest-path "{{examples_dir}}/wasmtime/$crate/Cargo.toml"
+    done
+    cp "{{examples_dir}}/wasmtime/hello-p3/target/wasm32-wasip2/release/hello_p3.wasm" \
+        "$bins/wasmtime/hello-p3.wasm"
+    cp "{{examples_dir}}/wasmtime/calculator/target/wasm32-wasip2/release/calculator.wasm" \
+        "$bins/wasmtime/calculator.wasm"
+    echo "==> .NET AOT"
+    # In Alpine's SDK image, for a musl toolchain: linked on a glibc host,
+    # an arm64 binary takes gcc's atomics helpers from glibc's libgcc, which
+    # call __getauxval, a symbol musl lacks, and fails to load in the guest.
+    docker run --rm -v "{{root_dir}}:/src" -w /src -e HOME=/tmp \
+        -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+        "$dotnet_sdk" sh -c '
+            set -eu
+            apk add --no-cache clang lld build-base zlib-dev >/dev/null
+            for proj in hello env_vars caps; do
+                dotnet publish examples/dotnet-aot/$proj -c Release -v q --nologo \
+                    -o build-elfloader/bins/dotnet-aot
+            done
+            rm -f build-elfloader/bins/dotnet-aot/*.dbg
+            chown -R "$HOST_UID:$HOST_GID" build-elfloader/bins/dotnet-aot \
+                examples/dotnet-aot/*/bin examples/dotnet-aot/*/obj'
+
     echo "==> Done:"
     find "$bins" -type f | sort
 
@@ -901,6 +1067,29 @@ ci:
 check-license-headers:
     ./dev/check-license-headers.sh
 
+# Build the GitHub Pages site (site/) into target/site, with the benchmark
+# history from the gh-pages branch beside it so the startup numbers load.
+[unix]
+site-build:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    git fetch -q origin gh-pages
+    rm -rf target/site-bench
+    mkdir -p target/site-bench
+    git archive FETCH_HEAD dev/bench | tar -x -C target/site-bench
+    python3 site/tools/build.py target/site --bench-from target/site-bench/dev/bench
+
+# Preview the site at http://localhost:8000.
+[unix]
+site-serve: site-build
+    python3 -m http.server -d target/site 8000
+
+# Re-record the site's terminal demos into site/casts/: all, or the scenes
+# named (hero, languages, dockerfile, calls). Uses the hluk on PATH.
+[unix]
+site-record *scenes:
+    site/record/record.sh {{scenes}}
+
 # Run benchmarks for a runtime across all workloads and modes.
 #
 # Usage:
@@ -928,9 +1117,12 @@ bench runtime *mode:
 
     just build
 
-    # Ensure snapshot exists
-    if [ ! -d "$snap_dir" ]; then
-        echo "==> Snapshot not found, saving first..."
+    # A snapshot loads only under a build with its key (the manifest tag
+    # ends in it); save one when it is missing or made with another.
+    key=$("$hluk" snapshot key)
+    if ! grep -qE "\"org.opencontainers.image.ref.name\":[[:space:]]*\"[^\"]*-$key\"" "$snap_dir/index.json" 2>/dev/null; then
+        echo "==> Snapshot missing or made with another kernel or host contract, saving first..."
+        rm -rf "$snap_dir"
         mkdir -p "$(dirname "$snap_dir")"
         "$hluk" snapshot save \
             --initrd "$rootfs" \
@@ -956,12 +1148,37 @@ bench runtime *mode:
         exit 1
     fi
 
+    # The host directory behind the mount workload's --mount.
+    mount_dir=$(mktemp -d)
+
     # Capture full output for summary extraction
     outfile=$(mktemp)
-    trap 'rm -f "$outfile"' EXIT
+    trap 'rm -rf "$outfile" "$mount_dir"' EXIT
+
+    # Keep the BENCH lines, tagged with their workload: printed as they
+    # arrive (grep and sed sit on them when writing to a pipe, so a run
+    # that hangs would show nothing) and kept in $outfile for the summary.
+    # Fails, as the grep did, when hluk said nothing.
+    tag_bench() {
+        local hit=0 line
+        while IFS= read -r line; do
+            case "$line" in
+                "BENCH "*)
+                    hit=1
+                    line="BENCH [$1] ${line#BENCH }"
+                    echo "$line"
+                    echo "$line" >>"$outfile"
+                    ;;
+            esac
+        done
+        [ "$hit" -eq 1 ]
+    }
 
     for script in "${workloads[@]}"; do
         wname=$(basename "$script" | sed 's/\.\(py\|js\)$//')
+        # The mount workload runs with a mount; the others as before.
+        mount_args=()
+        [ "$wname" = "mount" ] && mount_args=(--mount "$mount_dir:/mnt/bench")
         for m in $modes; do
             echo ""
             echo "════════════════════════════════════════════"
@@ -971,34 +1188,34 @@ bench runtime *mode:
                 cold)
                     "$hluk" bench cold \
                         --initrd "$rootfs" --scratch-mb "$scratch" \
+                        ${mount_args[@]+"${mount_args[@]}"} \
                         --samples "$samples" "$script" \
-                        2>&1 | grep '^BENCH' \
-                        | sed "s/^BENCH /BENCH [${wname}] /" | tee -a "$outfile"
+                        2>&1 | tag_bench "$wname"
                     ;;
                 cold-snap)
                     "$hluk" bench cold-snap \
+                        ${mount_args[@]+"${mount_args[@]}"} \
                         --samples "$samples" "$snap_dir" "$script" \
-                        2>&1 | grep '^BENCH' \
-                        | sed "s/^BENCH /BENCH [${wname}] /" | tee -a "$outfile"
+                        2>&1 | tag_bench "$wname"
                     ;;
                 warm-restore)
                     "$hluk" bench warm-restore \
+                        ${mount_args[@]+"${mount_args[@]}"} \
                         --samples "$samples" "$snap_dir" "$script" \
-                        2>&1 | grep '^BENCH' \
-                        | sed "s/^BENCH /BENCH [${wname}] /" | tee -a "$outfile"
+                        2>&1 | tag_bench "$wname"
                     ;;
                 warm-stateful)
                     "$hluk" bench warm-stateful \
+                        ${mount_args[@]+"${mount_args[@]}"} \
                         --samples "$samples" "$snap_dir" "$script" \
-                        2>&1 | grep '^BENCH' \
-                        | sed "s/^BENCH /BENCH [${wname}] /" | tee -a "$outfile"
+                        2>&1 | tag_bench "$wname"
                     ;;
                 parallel)
                     "$hluk" bench parallel \
                         --vms "$parallel_vms" --iterations "$parallel_iters" \
+                        ${mount_args[@]+"${mount_args[@]}"} \
                         "$snap_dir" "$script" \
-                        2>&1 | grep '^BENCH' \
-                        | sed "s/^BENCH /BENCH [${wname}] /" | tee -a "$outfile"
+                        2>&1 | tag_bench "$wname"
                     ;;
                 *)
                     echo "error: unknown mode '$m'" >&2
@@ -1110,8 +1327,14 @@ bench runtime *mode:
     just build
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-    if (-not (Test-Path $snapDir)) {
-        Write-Output "==> Snapshot not found, saving first..."
+    # A snapshot loads only under a build with its key (the manifest tag
+    # ends in it); save one when it is missing or made with another.
+    $key = (& $hluk snapshot key).Trim()
+    $index = Join-Path $snapDir 'index.json'
+    $current = (Test-Path $index) -and ((Get-Content -Raw $index) -match ('"org.opencontainers.image.ref.name":\s*"[^"]*-' + [regex]::Escape($key) + '"'))
+    if (-not $current) {
+        Write-Output "==> Snapshot missing or made with another kernel or host contract, saving first..."
+        Remove-Item -Recurse -Force $snapDir -ErrorAction SilentlyContinue
         New-Item -ItemType Directory -Force (Split-Path $snapDir) | Out-Null
         & $hluk snapshot save --initrd $rootfs --scratch-mb $scratch --output $snapDir
         if ($LASTEXITCODE -ne 0) { Write-Error "snapshot save failed" }
@@ -1126,29 +1349,38 @@ bench runtime *mode:
     $workloads = @(Get-ChildItem $benchDir -File | Where-Object { $_.Extension -in '.py', '.js' } | Sort-Object Name)
     if ($workloads.Count -eq 0) { Write-Error "no benchmark scripts in $benchDir" }
 
+    # The host directory behind the mount workload's --mount.
+    $mountDir = Join-Path ([IO.Path]::GetTempPath()) ("hluk-bench-" + [IO.Path]::GetRandomFileName())
+    New-Item -ItemType Directory -Force $mountDir | Out-Null
+
     # Every BENCH line, tagged with its workload, for the summary below.
+    # Each is also printed as it arrives (Write-Host: the pipeline's own
+    # output is what $out collects, so nothing of it shows until hluk
+    # exits), so a run that hangs shows how far it got.
     $lines = @()
     foreach ($script in $workloads) {
         $w = $script.BaseName
+        # The mount workload runs with a mount; the others as before.
+        $mountArgs = if ($w -eq 'mount') { @('--mount', "${mountDir}:/mnt/bench") } else { @() }
         foreach ($m in ($modes -split '\s+')) {
             Write-Output ""
             Write-Output "════════════════════════════════════════════"
             Write-Output "  {{runtime}} / $m / $w"
             Write-Output "════════════════════════════════════════════"
             $benchArgs = switch ($m) {
-                'cold'          { @('cold', '--initrd', $rootfs, '--scratch-mb', $scratch, '--samples', $samples, $script.FullName) }
-                'cold-snap'     { @('cold-snap', '--samples', $samples, $snapDir, $script.FullName) }
-                'warm-restore'  { @('warm-restore', '--samples', $samples, $snapDir, $script.FullName) }
-                'warm-stateful' { @('warm-stateful', '--samples', $samples, $snapDir, $script.FullName) }
-                'parallel'      { @('parallel', '--vms', $parallelVms, '--iterations', $parallelIters, $snapDir, $script.FullName) }
+                'cold'          { @('cold', '--initrd', $rootfs, '--scratch-mb', $scratch) + $mountArgs + @('--samples', $samples, $script.FullName) }
+                'cold-snap'     { @('cold-snap') + $mountArgs + @('--samples', $samples, $snapDir, $script.FullName) }
+                'warm-restore'  { @('warm-restore') + $mountArgs + @('--samples', $samples, $snapDir, $script.FullName) }
+                'warm-stateful' { @('warm-stateful') + $mountArgs + @('--samples', $samples, $snapDir, $script.FullName) }
+                'parallel'      { @('parallel', '--vms', $parallelVms, '--iterations', $parallelIters) + $mountArgs + @($snapDir, $script.FullName) }
                 default         { Write-Error "unknown mode '$m'" }
             }
-            $out = @(& $hluk bench @benchArgs 2>&1 | ForEach-Object { "$_" } | Where-Object { $_ -match '^BENCH ' } | ForEach-Object { $_ -replace '^BENCH ', "BENCH [$w] " })
+            $out = @(& $hluk bench @benchArgs 2>&1 | ForEach-Object { "$_" } | Where-Object { $_ -match '^BENCH ' } | ForEach-Object { $l = $_ -replace '^BENCH ', "BENCH [$w] "; Write-Host $l; $l })
             if ($LASTEXITCODE -ne 0) { Write-Error "hluk bench $m failed (exit $LASTEXITCODE)" }
-            $out | Write-Output
             $lines += $out
         }
     }
+    Remove-Item -Recurse -Force $mountDir -ErrorAction SilentlyContinue
 
     # ── Compact summary table ──────────────────────────────────
     # Same rows, layout and JSON as the bash recipe above.
@@ -1322,7 +1554,7 @@ conformance runtime *modules:
         # One module per line to avoid output truncation
         mapfile -t test_modules < <("$hluk" snapshot run "$snap_dir" --net --exec \
             "import os; d='/usr/local/lib/python3.12/test'; [print(f[:-3]) for f in sorted(os.listdir(d)) if f.startswith('test_') and f.endswith('.py')]" \
-            2>/dev/null | tr -d '\r' | grep "^test_" || true)
+            2>/dev/null | grep "^test_" || true)
     fi
 
     if [ "${#test_modules[@]}" -eq 0 ]; then
@@ -1360,7 +1592,7 @@ conformance runtime *modules:
             --net --exec "$inline" 2>/dev/null || echo "RESULT $mod status=CRASH tests=0 fail=0 error=0 skip=0 time=0")
 
         # Extract the RESULT line
-        result_line=$(echo "$output" | tr -d '\r' | grep "^RESULT " | tail -1)
+        result_line=$(echo "$output" | grep "^RESULT " | tail -1)
 
         if [ -z "$result_line" ]; then
             result_line="RESULT $mod status=CRASH tests=0 fail=0 error=0 skip=0 time=0"
@@ -1540,7 +1772,7 @@ build-all-rootfs:
 build-all-rootfs:
     @Write-Error "build-all-rootfs needs Docker + cpio on Linux. Build there (just build-all-rootfs) and copy build-elfloader/ here."; exit 1
 
-# Rebuild all rootfs images from scratch (--no-cache, pulls fresh
+# Rebuild all rootfs images from scratch (--no-cache, pulls the pinned
 # base images, invalidates snapshots).
 [unix]
 rebuild-all-rootfs:

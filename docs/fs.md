@@ -67,7 +67,9 @@ open("/mnt/host/foo.txt")
 
 Each mount corresponds to a `cap_std::fs::Dir` on the host side.  The guest kernel injects a mount index into every host call so the host routes operations to the correct directory.
 
-Reads and writes are transferred in chunks: the host's preferred size (`GetHostFsChunkSize`, 32 KiB), or less if one host call cannot carry that much — the guest reads the limit out of the PEB I/O stack sizes the host chose.
+Reads and writes are transferred in chunks: the host's preferred size (`GetHostFsChunkSize`, 64 KiB), or less if one host call cannot carry that much — the guest reads the limit out of the virtqueue pool sizes the host chose.
+
+Paths travel to the host as UTF-8 strings: a name that is not UTF-8 fails with `EILSEQ`, and a host file whose name is not UTF-8 lists with U+FFFD in its place (and cannot be opened by that name). The path below the mount's root is at most 1,023 bytes; a longer one fails with `ENAMETOOLONG`.
 
 Two limits of the protocol as it stands.  A directory listing is one host call, so a directory whose names do not fit in it (about 3,000 entries) does not list: `readdir` fails with `EOVERFLOW` and the guest goes on (TODO: page `fs_list`).  `stat` carries the size and whether the entry is a file or a directory, nothing more: mode reads as `755` (`555` on a read-only file), timestamps as the epoch, and a symlink as the file it points at (TODO: carry the real mode, the times and an `lstat`).
 
@@ -94,13 +96,22 @@ Passing `:ro` sets `MNT_RDONLY` on the VFS mount.  The kernel rejects writes at 
 
 ### Snapshots
 
-When restoring from a snapshot, pass the same `--mount` flags (or `Mount` values) that were used when the snapshot was created.  The guest kernel's mount table is captured in the snapshot; the mounts re-register the host-side functions that serve those mount points.
+Mounts belong to the run: give them to `hluk run` or `hluk snapshot run` (or to the `SandboxBuilder` that boots or restores), and save a snapshot without any.  On its `resume` entry the kernel fetches the host's mount list (with `GetResumeState`, which also brings the clock and resolver; `GetMounts` answers the same on its own), the same `vfs.fstab` entries a boot carries, and makes its mount table match: it mounts what the list adds, unmounts what the list lacks, and remounts an entry whose index or read-only flag changed.  Every hostfs node names its mount by index, so the host directory behind a guest path can differ between save and restore.
+
+```sh
+hluk snapshot save --initrd rootfs.cpio --output .snapshots/python
+hluk snapshot run .snapshots/python --mount /tmp/share:/mnt/host script.py
+```
+
+A mount kept busy across the snapshot, by a file left open on it, stays mounted until a restore finds it free; meanwhile its operations fail with `ESTALE`, since the host serves other mounts under its index now.
+
+A mount table holds at most 32 mounts and 3.5 KiB of entries, the kernel's bounds; a boot or restore with more is refused with `Error::MountTable`.
 
 ### Security
 
 All host filesystem access is sandboxed by [`cap-std`](https://docs.rs/cap-std) (capability-based filesystem access):
 
-- **Path traversal (`../`)**: blocked.  On Linux 5.6+, `openat2` with `RESOLVE_BENEATH` is kernel-enforced.  On Windows, cap-std uses component-by-component resolution that rejects escapes.
+- **Path traversal (`../`)**: blocked.  On Linux 5.6+, `openat2` with `RESOLVE_BENEATH` is kernel-enforced.  On Windows and macOS, cap-std uses component-by-component resolution that rejects escapes.
 - **Symlink escapes**: blocked.  `RESOLVE_NO_MAGICLINKS` prevents `/proc/self/fd/N`-style escapes on Linux.  Absolute symlink targets are rejected on all platforms.
 - **No ambient filesystem access**: the guest can only reach files inside the mounted host directory.
 - **chmod**: the guest can change permissions on files in the host mount (same as virtio-fs / 9pfs).  Use `:ro` mounts to prevent this.

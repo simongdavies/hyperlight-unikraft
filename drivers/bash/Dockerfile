@@ -1,19 +1,19 @@
 # BusyBox hush runtime for Hyperlight/Unikraft.
 #
 # The userland is the shared NOMMU/PIE BusyBox base image (see
-# drivers/busybox.Dockerfile — built as hluk-busybox, and pulled in below with
-# COPY --from=hluk-busybox).  BusyBox runs in NOMMU mode so the shell uses
+# drivers/busybox.Dockerfile — built as hluk-busybox, and pulled in below
+# through the busybox stage).  BusyBox runs in NOMMU mode so the shell uses
 # vfork()+execve() instead of fork() (the Unikraft kernel has no fork); all
 # applets (cat, grep, sed, awk, sort, ls, find, …) run as separate processes.
 # (NOMMU disables ash; hush is the active shell.)
-#
-# Limitation: pipes (|) and output redirects from external commands
-# (cmd > file) crash because Unikraft's vfork shares the parent's stack with
-# the child — a kernel fix (separate child stack) is needed.  Use awk
-# single-pass or shell builtins to work around.
+
+# The BusyBox base, per platform (hluk-busybox-arm64 for arm64); a stage
+# because COPY --from cannot expand a build arg.
+ARG BUSYBOX=hluk-busybox
+FROM ${BUSYBOX} AS busybox
 
 # ── Compile the C driver ─────────────────────────────────────────
-FROM alpine:3.20 AS build
+FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc AS build
 
 RUN apk add --no-cache gcc musl-dev
 
@@ -32,10 +32,9 @@ RUN gcc -O2 -Wall -Wextra -Wno-unused-parameter \
 # ── Minimal rootfs ───────────────────────────────────────────────
 FROM scratch
 
-# BusyBox userland (dynamically linked → needs the musl loader) from the
-# shared base image.
-COPY --from=hluk-busybox /lib/ld-musl-x86_64.so.1 /lib/ld-musl-x86_64.so.1
-COPY --from=hluk-busybox /busybox-root/ /
+# BusyBox userland + the musl loader it links against, from the shared base
+# image.
+COPY --from=busybox /busybox-root/ /
 
 # Hyperlight driver
 COPY --from=build /hl_bashdriver /usr/local/bin/hl_bashdriver

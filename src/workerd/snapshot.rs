@@ -11,7 +11,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 
-const SCHEMA_VERSION: u16 = 9;
+const SCHEMA_VERSION: u16 = 10;
 pub(super) const METADATA_FILE: &str = "worker.json";
 pub(super) const MAX_METADATA_BYTES: usize = 16 * 1024;
 const CAPABILITIES: &[u8] = b"stdout:ndjson-response:v1;console:bounded;stdin:denied;\
@@ -27,6 +27,7 @@ pub struct SnapshotBinding {
     target_compatibility_sha256: String,
     bundle_sha256: String,
     kernel_sha256: String,
+    host_snapshot_contract_sha256: String,
     rootfs_sha256: String,
     executor_sha256: String,
     dependency_closure_sha256: String,
@@ -69,6 +70,7 @@ impl SnapshotBinding {
             target_compatibility_sha256: target_compatibility_sha256()?,
             bundle_sha256: bundle.sha256()?,
             kernel_sha256: sha256(kernel),
+            host_snapshot_contract_sha256: sha256(crate::SNAPSHOT_KEY.as_bytes()),
             rootfs_sha256: sha256_file(rootfs.as_ref())?,
             executor_sha256: sha256_file(executor.as_ref())?,
             dependency_closure_sha256: dependency_closure_sha256(executor.as_ref())?,
@@ -108,6 +110,7 @@ impl SnapshotBinding {
         }
         for digest in [
             &self.kernel_sha256,
+            &self.host_snapshot_contract_sha256,
             &self.bundle_sha256,
             &self.rootfs_sha256,
             &self.executor_sha256,
@@ -122,6 +125,11 @@ impl SnapshotBinding {
                     .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
             {
                 return Err(Error::Snapshot("invalid SHA-256 digest".into()));
+            }
+            if self.host_snapshot_contract_sha256 != sha256(crate::SNAPSHOT_KEY.as_bytes()) {
+                return Err(Error::Snapshot(
+                    "host snapshot transport contract mismatch".into(),
+                ));
             }
         }
         if self.kernel_sha256 != sha256(crate::KERNEL)
@@ -478,6 +486,7 @@ mod tests {
             "worker_version",
             "bundle_sha256",
             "kernel_sha256",
+            "host_snapshot_contract_sha256",
             "rootfs_sha256",
             "executor_sha256",
             "dependency_closure_sha256",
@@ -492,6 +501,18 @@ mod tests {
             let other = serde_json::from_value(value).unwrap();
             assert!(metadata.validate(&other).is_err(), "{field}");
         }
+        let mut previous_binding = serde_json::to_value(&binding).unwrap();
+        previous_binding
+            .as_object_mut()
+            .unwrap()
+            .remove("host_snapshot_contract_sha256");
+        assert!(serde_json::from_value::<SnapshotBinding>(previous_binding).is_err());
+        let mut mismatched = binding.clone();
+        mismatched.host_snapshot_contract_sha256 = "0".repeat(64);
+        assert!(mismatched.validate().is_err());
+        metadata.schema_version = 9;
+        assert!(metadata.validate(&binding).is_err());
+        metadata.schema_version = SCHEMA_VERSION;
         metadata.schema_version += 1;
         assert!(metadata.validate(&binding).is_err());
         metadata.schema_version = SCHEMA_VERSION;

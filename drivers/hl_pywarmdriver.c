@@ -32,8 +32,8 @@
 
 #include "hl_fc.h"
 #include "hl_env.h"
-#include "hl_py.h"
 #include "hl_driver.h"
+#include "hl_py.h"
 
 /* ── Entry point ───────────────────────────────────────────────── */
 
@@ -50,11 +50,12 @@ int main(int argc, char **argv)
 	 * subprocess.run(["python3", ...]) fails.  Replace it before
 	 * Py_Initialize copies environ into os.environ; a host --env PATH is
 	 * applied per call after this and still wins. */
-	setenv("PATH", "/usr/local/bin:/usr/bin:/bin", 1);
+	hl_py_set_path();
 
 	/* Initialize Python while VFS is fully alive — open(),
 	 * read(), etc. all work for loading /usr/lib/python3.12/ */
 	Py_UTF8Mode = 1;
+	hl_py_preinit();
 	Py_Initialize();
 
 	PyRun_SimpleString(
@@ -74,8 +75,8 @@ int main(int argc, char **argv)
 	 * MPL_IGNORE_SYSTEM_FONTS: the unikernel has no system fonts
 	 * (no /usr/share/fonts, no fc-list).  Without this flag,
 	 * matplotlib.font_manager runs subprocess fc-list during
-	 * import, which crashes the unikernel.  Matplotlib's bundled
-	 * fonts (DejaVu, etc.) still work.
+	 * import, a failed exec that only costs time.  Matplotlib's
+	 * bundled fonts (DejaVu, etc.) still work.
 	 */
 	PyRun_SimpleString(
 		"import warnings\n"

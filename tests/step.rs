@@ -130,8 +130,8 @@ fn python_call_yields_on_timers() {
     assert!(sandbox.drain_output().contains("again"));
 }
 
-/// A call is only limited by the host's I/O buffer, which the kernel reads
-/// from the PEB and the driver learns through the device: a script far
+/// A call is only limited by the host's H2G pool, whose geometry the
+/// kernel reads from scratch and the driver learns through the device: a script far
 /// larger than any guest-side constant still runs.  (The previous kernel
 /// rejected anything over 16 KiB.)
 #[test]
@@ -419,11 +419,11 @@ fn python_threads_do_not_extend_the_call() {
         t.elapsed() < Duration::from_millis(400),
         "call waited for the thread"
     );
-    assert_eq!(sandbox.drain_output(), "main done\r\n");
+    assert_eq!(sandbox.drain_output(), "main done\n");
     while t.elapsed() < Duration::from_millis(1200) {
         sandbox.step(Duration::from_millis(500)).expect("step");
     }
-    assert_eq!(sandbox.drain_output(), "thread done\r\n");
+    assert_eq!(sandbox.drain_output(), "thread done\n");
 }
 
 /// A module-level thread pool keeps idle non-daemon workers alive.  The
@@ -439,11 +439,11 @@ fn python_thread_pool_does_not_hold_the_call() {
             "print('result', ex.submit(lambda: 21 * 2).result(), flush=True)\n",
         ))
         .expect("run");
-    assert_eq!(sandbox.drain_output(), "result 42\r\n");
+    assert_eq!(sandbox.drain_output(), "result 42\n");
     sandbox
         .run("print('again', ex.submit(lambda: 1).result(), flush=True)")
         .expect("run");
-    assert_eq!(sandbox.drain_output(), "again 1\r\n");
+    assert_eq!(sandbox.drain_output(), "again 1\n");
 }
 
 /// A Python thread a call leaves behind keeps running between calls: the
@@ -581,7 +581,9 @@ fn python_restored_clones_draw_different_random_bytes() {
 #[test]
 fn python_checkpoint_resumes_mid_call() {
     let mut sandbox = boot_python();
-    sandbox.submit(tick_script(3, 30)).expect("submit");
+    // Five ticks: however long the restore takes, its resume entry runs at
+    // most one overdue tick, which leaves the restored guest waits to park on.
+    sandbox.submit(tick_script(5, 30)).expect("submit");
     sandbox.drain_output();
 
     // Run until the first tick has printed, then stop at that boundary.
@@ -594,7 +596,7 @@ fn python_checkpoint_resumes_mid_call() {
     let (tail, _, done) = drive(&mut sandbox, |_| false);
     assert!(done);
     assert!(
-        tail.contains("tick 1") && tail.contains("tick 2") && tail.contains("done"),
+        tail.contains("tick 1") && tail.contains("tick 4") && tail.contains("done"),
         "{tail:?}"
     );
 
@@ -615,7 +617,7 @@ fn python_checkpoint_resumes_mid_call() {
         "restored guest restarted: {rest:?}"
     );
     assert!(
-        rest.contains("tick 1") && rest.contains("tick 2") && rest.contains("done"),
+        rest.contains("tick 1") && rest.contains("tick 4") && rest.contains("done"),
         "{rest:?}"
     );
     restored.run("print('again')").expect("run after restore");

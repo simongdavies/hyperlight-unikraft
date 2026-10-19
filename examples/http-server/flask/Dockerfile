@@ -2,11 +2,14 @@
 #
 # Build:  just build-rootfs http-flask examples/http-server/flask/Dockerfile
 # Run:    hluk run --initrd build-elfloader/http-flask-rootfs.cpio \
-#             --scratch-mb 256 --net --port 8080 examples/http-server/flask/server.py
-FROM hluk-python-shell-rootfs:latest AS base
+#             --scratch-mb 256 --port 8080 examples/http-server/flask/server.py
+# -arm64 when `just build-rootfs` builds for another platform
+# (HLUK_ROOTFS_PLATFORM), so the base is that platform's image too.
+ARG ROOTFS_SUFFIX=
+FROM hluk-python-shell-rootfs${ROOTFS_SUFFIX}:latest AS base
 
 # pip runs in a real Linux stage, then the packages are copied into the rootfs.
-FROM python:3.12-slim-bookworm AS installer
+FROM python:3.12-slim-bookworm@sha256:34386ef0cb081344d7ec1c103ba398e6e9f64e9ab3a1509accc92a4e24a07258 AS installer
 COPY --from=base / /rootfs/
 RUN pip install --no-cache-dir --target /rootfs/usr/local/lib/python3.12/site-packages \
         flask

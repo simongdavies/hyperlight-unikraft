@@ -179,7 +179,7 @@ impl TimerAdmission {
     fn acquire(broker: Arc<TimerBrokerInner>) -> std::result::Result<Self, TimerFailure> {
         broker
             .active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < broker.limits.max_active_timers).then_some(active + 1)
             })
             .map_err(|_| TimerFailure::overloaded("active timer limit reached"))?;

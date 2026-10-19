@@ -56,6 +56,32 @@ The rootfs and executor must be the matching packaged guest build, with its
 dependency-closure digest alongside the executor. The compatible Unikraft
 kernel is embedded in `hluk`; do not replace it independently.
 
+## Migrating to upstream v0.18.0
+
+The migration base is upstream release commit
+`a2ad7ab464bbd46b49798452281b848e47f3cea5`, using Rust 1.99 and
+Hyperlight 0.18's virtqueue transport. Rebuild the direct-ELF Workerd kernel
+with `just build-workerd-kernel` and native test kernels with
+`just build-native-kernel`. An older embedded kernel is not a compatible
+substitute. Keep the previous release, packages, and persisted state intact
+until the new revision has been qualified.
+
+The generic upstream host-call ioctl remains distinct from the additive
+typed-v1 bridge: on x86-64 their encoded requests are respectively
+`0xc0384803` (56-byte structure) and `0xc0c84803` (200-byte structure).
+The typed bridge retains existing executor wire values and validates its
+version, reserved fields, argument lengths, UTF-8, and active invocation.
+The host collector accepts byte-oriented `HostWrite`, bounds `HostWriteErr`
+separately from protocol responses, and denies byte-oriented `ReadStdin`.
+`python3 tools/test-workerd-hostcall-abi.py` tests native layout and helper
+failure paths; it does not replace real KVM qualification.
+
+Pre-v0.18 templates and changed-instance checkpoints are incompatible.
+Use a new revision home and newly initialized templates; never restore an
+old heap into the new kernel, relabel its metadata, or silently substitute
+fresh state for a failed resume. See [checkpoint migration](checkpoints.md).
+Published old artifact hashes remain evidence for the old release only.
+
 ```bash
 hluk workerd-identity --config host-config.json
 hluk workerd-host --config host-config.json \

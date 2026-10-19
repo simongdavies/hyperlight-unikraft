@@ -95,7 +95,7 @@ struct LivePermit(Arc<AtomicUsize>);
 impl LivePermit {
     fn acquire(counter: &Arc<AtomicUsize>, capacity: usize) -> Result<Self> {
         counter
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |live| {
                 (live < capacity).then_some(live + 1)
             })
             .map_err(|_| Error::State("instance live VM capacity exhausted".into()))?;

@@ -436,5 +436,6 @@ int main(void)
 {
 	if (hl_driver_init("workerd-executor"))
 		return 1;
+	hl_driver_serve_named_calls();
 	hl_driver_run(dispatch);
 }

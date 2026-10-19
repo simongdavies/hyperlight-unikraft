@@ -1003,6 +1003,18 @@ mod tests {
         function_types::{ParameterValue, ReturnType},
     };
 
+    struct StringOnlyFraming;
+
+    impl<'a> hyperlight_common::flatbuffer_wrappers::ExternalValueSink<'a> for StringOnlyFraming {
+        fn push_bytes(&mut self, _: &'a [u8]) -> anyhow::Result<()> {
+            anyhow::bail!("string-only framing unexpectedly emitted external bytes")
+        }
+
+        fn push_chunks(&mut self, _: &'a [bytes::Bytes]) -> anyhow::Result<()> {
+            anyhow::bail!("string-only framing unexpectedly emitted external chunks")
+        }
+    }
+
     fn request() -> RequestEnvelope {
         RequestEnvelope {
             protocol_version: PROTOCOL_VERSION,
@@ -1135,7 +1147,7 @@ mod tests {
                 ret,
             );
             let mut builder = flatbuffers::FlatBufferBuilder::new();
-            let bytes = call.encode(&mut builder);
+            let bytes = call.encode(&mut builder, &mut StringOnlyFraming).unwrap();
             assert!(bytes.len() <= crate::HOST_CALL_MAX, "{}", bytes.len());
         }
     }
@@ -1271,7 +1283,7 @@ mod tests {
             ReturnType::Void,
         );
         let mut builder = flatbuffers::FlatBufferBuilder::new();
-        let encoded = call.encode(&mut builder);
+        let encoded = call.encode(&mut builder, &mut StringOnlyFraming).unwrap();
         assert!(encoded.len() <= crate::HOST_CALL_MAX, "{}", encoded.len());
 
         maximum.modules[0].source = "\\".repeat(MAX_MODULE_SOURCE_BYTES);

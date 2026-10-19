@@ -13,24 +13,24 @@ sequenceDiagram
     H->>K: enter (a guest function: step, resume, Exec, …)
     K->>T: run the scheduler
     T-->>K: every thread blocked (sleeping, or waiting on a socket)
-    K->>H: Yield(ns until the next timer) — VM halts
+    K->>H: Yield(ns until the next timer, the call's news) — VM halts
     Note over H: parks in poll(2) on the guest's<br/>host sockets, at most ns — no CPU
     H->>K: enter again (step)
 ```
 
 Guest memory persists across the halt: parked threads, scheduler queues, the application heap.  A snapshot taken at any boundary resumes exactly there.  The guest never spins waiting for the host; an idle guest costs nothing.
 
-The guest reports to the host through named host functions, one fact each:
+The guest reports to the host through named host functions. Each is a VM exit, so an entry makes as few as it can: a call's start and return ride on the entry's final `Yield`, and a guest function call that returns in one entry costs that one exit.
 
 | Host function | Meaning |
 |---|---|
-| `Yield(ns)` | Every thread is blocked; the next timer fires in `ns` (0: none). |
+| `Yield(ns, flags, status, result)` | Every thread is blocked; the next timer fires in `ns` (0: none). `flags` says what the entry saw of the call in flight: taken and still running, or returned, with its `status` (0: success) and `result` (empty: none). |
 | `DriverReady()` | A runtime driver opened `/dev/hlcall`: named calls are served. |
-| `CallStarted()` / `CallDone(status)` | A named call was taken / returned (0: success). |
+| `CallStarted()` / `CallDone(status, result)` | The same news on its own, for an entry that ends without a `Yield` (the process exiting). |
 | `CallRejected()` | A named call had no reader: it never ran. |
 | `Exited(status)` | The guest process ended; the kernel is shutting down. |
 
-The host folds them into one [`Yield`](../src/lib.rs) per entry: `Blocked { until }`, `CallDone`, `CallFailed { status }`, or `Exited { status }`.  A `Blocked` with no timer and no host socket that could wake the guest, while a call's return or a program's exit is still owed, is a deadlock: `step`, `run` and `join` return `Error::Deadlocked` rather than wait forever.
+One more host function, `HostCall(name, args)`, runs the embedder's function of that name for a driver and returns its reply ([calls.md](calls.md)).  The host folds the reports into one [`Yield`](../src/lib.rs) per entry: `Blocked { until }`, `CallDone`, `CallFailed { status }`, or `Exited { status }`.  A `Blocked` with no timer and no host socket that could wake the guest, while a call's return or a program's exit is still owed, is a deadlock: `step`, `run` and `join` return `Error::Deadlocked` rather than wait forever.
 
 ## The verbs
 
@@ -42,6 +42,7 @@ Everything a caller does with an [`AppSandbox`](../src/lib.rs) is one of these. 
 | `submit(exec)` | Hands the driver a call and returns at the first boundary, without waiting for the call to finish. Example: `submit("import http.server … serve_forever()")` returns as soon as the server is parked in `accept()`; the embedder drives it with `step` from there, and `step` reports `CallDone` if the call ever returns. |
 | `step(timeout)` | Advances the guest by one boundary and returns control to the embedder. The host thread waits, with the VM halted, until the guest has something to do (a timer due, a socket ready) or `timeout` runs out. If the guest is due, the host enters the VM and the guest runs until every thread blocks again; `step` then returns why the guest stopped. If the timeout ran out first, nothing was entered and the last `Blocked` comes back.|
 | `run(exec)` | `submit`, then `step` until the call returns. |
+| `call(function, input)` | `run(Exec::Call { function, input })`, returning the result of a function the guest defined ([calls.md](calls.md)). |
 | `join()` | `step` until the process exits, and hand back its status. |
 | `snapshot()` / `snapshot_to(dir)` | Captures the guest at the current boundary, a call in flight included; `snapshot_to` also writes it to a directory. |
 | `restore(snapshot)` / `restore_from(dir)` | Replaces the guest with the snapshot in place and runs its `resume` entry. |
@@ -110,10 +111,10 @@ sequenceDiagram
 
     A->>S: run(code that sleeps 2 s, then prints)
     S->>G: enter Exec(code) — the kernel hands it to the driver through /dev/hlcall
-    G-->>S: CallStarted, Yield(2 s) — the driver thread is asleep
+    G-->>S: Yield(2 s, started) — the driver thread is asleep
     Note over S: parks 2 s, VM halted
     S->>G: enter step
-    G-->>S: CallDone(0), Yield(0) — driver back in read()
+    G-->>S: Yield(0, returned 0) — driver back in read()
     S-->>A: Ok(())
 ```
 
@@ -129,7 +130,7 @@ sequenceDiagram
 
     A->>S: submit(server_script)
     S->>G: enter Exec(code)
-    G-->>S: CallStarted, Yield(0) — the server is parked in accept()
+    G-->>S: Yield(0, started) — the server is parked in accept()
     S-->>A: Ok(())
     A->>S: step(200 ms)
     Note over S: poll(2) on the listener
@@ -191,4 +192,6 @@ sequenceDiagram
 
 **In the middle of a call, with `submit` + `step`.**  A snapshot taken between two steps captures the call in flight; the restored guest finishes it and reports `CallDone` on a later step.
 
-On `resume` the guest puts itself right for the new host: sockets are opened and bound again, connections whose peers died with the old host read as closed, the CSPRNG is reseeded (see [random.md](random.md)) and the wall clock re-anchored (see [clock.md](clock.md)).  The embedder re-supplies what lives on its side: the same mounts (the kernel's mount table is in the image), the listen ports, and any environment.  `restore(snap)` does the same in place, on an existing `AppSandbox`.
+A snapshot loads under any build with the same *snapshot key*, `SNAPSHOT_KEY` (`hluk snapshot key`): the embedded kernel's hash and a host contract number, the two things a snapshot depends on.  A release that changes neither keeps every saved snapshot; one that does refuses them with `Error::SnapshotRelease`, which names the release that saved the snapshot and says to save it again.
+
+On `resume` the guest puts itself right for the new host: its hostfs mounts are made to match what the host serves (see [fs.md](fs.md)), sockets are opened and bound again, connections whose peers died with the old host read as closed, the CSPRNG is reseeded (see [random.md](random.md)) and the wall clock re-anchored (see [clock.md](clock.md)). It asks the host for the mounts, the wall clock and the resolver configuration in one host call, `GetResumeState`, which answers what `GetMounts`, `GetWallClockNs` and `GetResolvConf` answer on their own.  The embedder supplies what lives on its side: the mounts, the listen ports, and any environment.  `restore(snap)` does the same in place, on an existing `AppSandbox`.

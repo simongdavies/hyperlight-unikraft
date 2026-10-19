@@ -7,6 +7,9 @@ CONFIG_LIBUKVMEM=y
 CONFIG_LIBUKVMEM_DEFAULT_BASE=0x0000001000000000
 CONFIG_LIBUKVMEM_DEMAND_PAGE_IN_SIZE=12
 CONFIG_LIBUKVMEM_PAGEFAULT_HANDLER_PRIO=4
+# /dev/maps, for /proc/self/maps: glibc reads it to find the main thread's
+# stack (PowerShell's glibc build fails without it).
+CONFIG_LIBUKVMEM_DEVFS_MAPS=y
 CONFIG_LIBPOSIX_MMAP=y
 # elfloader basics
 CONFIG_APPELFLOADER_CUSTOMAPPNAME=y
@@ -61,6 +64,10 @@ CONFIG_LIBVFSCORE=y
 CONFIG_LIBVFSCORE_AUTOMOUNT=y
 CONFIG_LIBVFSCORE_AUTOMOUNT_CI=y
 CONFIG_LIBVFSCORE_AUTOMOUNT_CI_INITRD=y
+# Files extracted from the initrd reference it instead of being copied into
+# guest memory: the rootfs no longer takes scratch at boot, nor a second copy
+# in every snapshot.
+CONFIG_LIBVFSCORE_AUTOMOUNT_EXTRACT_BORROW=y
 CONFIG_LIBVFSCORE_AUTOMOUNT_UP=y
 CONFIG_LIBVFSCORE_NONLARGEFILE=y
 # Command-line parameter parsing — needed for vfs.fstab= cmdline arg
@@ -79,6 +86,12 @@ CONFIG_LIBHOSTSOCK=y
 # Route stdin through the console driver (not /dev/null) so the guest
 # can read host-provided input via sys.stdin, process.stdin, etc.
 CONFIG_LIBPOSIX_TTY_STDIN_SERIAL=y
+CONFIG_LIBPOSIX_TTY_SERIAL_EOF_FINAL=y
+# stderr is a stream of its own (HostWriteErr), and newlines reach the
+# host as the program wrote them, not as CR-LF.  Pinned here on purpose,
+# though the kernel defaults them so for Hyperlight.
+CONFIG_LIBPOSIX_TTY_SERIAL_STDERR=y
+# CONFIG_LIBUKCONSOLE_ONLCR is not set
 # Disable compile-date embedding for reproducible builds — same source
 # always produces the same binary.
 CONFIG_LIBUKLIBID_INFO_COMPILEDATE=n

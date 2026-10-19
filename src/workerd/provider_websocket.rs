@@ -780,7 +780,7 @@ fn valid_close(code: u16) -> bool {
 
 fn reserve_bytes(budget: &AtomicU64, bytes: u64, maximum: u64) -> bool {
     budget
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
             used.checked_add(bytes).filter(|total| *total <= maximum)
         })
         .is_ok()

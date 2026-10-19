@@ -14,13 +14,21 @@ use hyperlight_unikraft::{
     NetworkPolicy, SandboxBuilder, load_snapshot,
 };
 
+mod cli;
+
 /// The CLI's own errors are messages for the terminal; the library's
 /// come through as they are.
 type CliResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-/// Minimal Hyperlight host for Unikraft unikernels.
+/// Milliseconds since `t`, to a tenth: what a timing log needs, without
+/// the six decimals an f64 would print.
+fn elapsed_ms(t: Instant) -> f64 {
+    (t.elapsed().as_secs_f64() * 10_000.0).round() / 10.0
+}
+
+/// Run Linux programs in Hyperlight micro-VMs, with Unikraft as the guest kernel.
 #[derive(Parser)]
-#[command(name = "hluk")]
+#[command(name = "hluk", version = cli::registry::BUILD_VERSION)]
 struct Cli {
     /// Log level for hluk diagnostics: error, warn, info, debug, trace.
     /// Off by default; pass --log-level info to see timing.
@@ -33,9 +41,27 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Boot a guest and run a script, inline code, a guest command, or
-    /// its entry point.
-    Run(RunArgs),
+    /// Start a project from a template: write its hluk.toml and starter
+    /// files, and pull the rootfs it runs on.
+    Init(cli::InitArgs),
+
+    /// Boot a guest and run a script, inline code, a guest command, or its
+    /// entry point: a rootfs named with --initrd or --runtime, or the
+    /// project described by the hluk.toml in this directory.
+    Run(cli::RunArgs),
+
+    /// Build the project: run its build command, and build its Dockerfile
+    /// into a rootfs.
+    Build(cli::ProjectArgs),
+
+    /// Fetch, or refresh, the rootfs image the project's hluk.toml names.
+    Pull(cli::ProjectArgs),
+
+    /// List the templates `init` can start from.
+    Templates,
+
+    /// The pulled rootfs images and warm snapshots: list or remove them.
+    Cache(cli::CacheArgs),
 
     /// Snapshot operations: save a post-evolve snapshot to disk,
     /// or restore from a saved snapshot and dispatch.
@@ -127,6 +153,8 @@ enum SnapshotCommand {
 
     /// Restore a guest from a saved snapshot and dispatch commands.
     Run(SnapshotRunArgs),
+    /// Print the current snapshot compatibility key.
+    Key,
 }
 
 #[derive(clap::Args)]
@@ -326,34 +354,24 @@ struct RunArgs {
     /// Enable host networking with no policy (all destinations allowed).
     #[arg(long, conflicts_with_all = ["net_allow", "net_block"])]
     net: bool,
-
-    /// Allow-list: only permit connections to these hosts/IPs.
-    /// Implies --net. Mutually exclusive with --net-block.
-    #[arg(long = "net-allow", value_name = "HOST", conflicts_with = "net_block")]
-    net_allow: Vec<String>,
-
-    /// Block-list: deny connections to these hosts/IPs, allow everything else.
-    /// Implies --net. Mutually exclusive with --net-allow.
-    #[arg(long = "net-block", value_name = "HOST", conflicts_with = "net_allow")]
-    net_block: Vec<String>,
-
-    /// Ports the guest may bind to for inbound connections.
-    /// Without this flag, bind() is rejected (outbound-only).
-    #[arg(long = "port", value_name = "PORT")]
-    ports: Vec<u16>,
-
-    /// Set an environment variable in the guest (repeatable).
-    /// Format: KEY=VALUE (e.g. --env MY_VAR=hello --env DEBUG=1).
-    #[arg(long = "env", value_name = "KEY=VALUE")]
-    envs: Vec<String>,
 }
 
 /// Arguments for `snapshot save`.
 #[derive(clap::Args)]
 struct SaveArgs {
     /// Path to a CPIO initrd to map into the guest.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "runtime")]
     initrd: Option<PathBuf>,
+
+    /// A published runtime image by name (python, node, agent, …) or a
+    /// full image reference, pulled into the cache when missing.
+    #[arg(long, value_name = "NAME|IMAGE", conflicts_with = "kernel")]
+    runtime: Option<String>,
+
+    /// Code the runtime runs once before the snapshot is taken, so what it
+    /// loads is in it (e.g. "import flask, pandas").
+    #[arg(long = "warm-exec", value_name = "CODE")]
+    warm_exec: Option<String>,
 
     /// Entry point binary path inside the initrd VFS.
     /// Auto-detected from the initrd if not specified.
@@ -366,9 +384,10 @@ struct SaveArgs {
     #[arg(long, value_name = "PATH")]
     kernel: Option<PathBuf>,
 
-    /// Scratch memory in MiB (default 256; increase for large rootfs).
-    #[arg(long, default_value_t = DEFAULT_SCRATCH_MB)]
-    scratch_mb: usize,
+    /// Guest memory in MiB. Default: the size the rootfs's runtime image is
+    /// tested with.
+    #[arg(long, value_name = "MIB")]
+    scratch_mb: Option<usize>,
 
     /// Directory to save the snapshot (OCI Image Layout).
     #[arg(short, long)]
@@ -392,8 +411,13 @@ struct SaveArgs {
     net_block: Vec<String>,
 
     /// Ports the guest may bind to for inbound connections.
-    #[arg(long = "port", value_name = "PORT")]
-    ports: Vec<u16>,
+    #[arg(long = "port", value_name = "PORT|LOW-HIGH|all")]
+    ports: Vec<PortSpec>,
+
+    /// A resolver configuration file to install as the guest's
+    /// /etc/resolv.conf before the snapshot is taken.
+    #[arg(long = "resolv-conf", value_name = "FILE")]
+    resolv_conf: Option<PathBuf>,
 }
 
 /// Arguments for `snapshot run`.
@@ -416,6 +440,20 @@ struct SnapshotRunArgs {
     #[arg(long = "guest-exec", value_name = "COMMAND", conflicts_with_all = ["script", "exec"])]
     guest_exec: Option<String>,
 
+    /// Call a function the guest has defined once the workload has run,
+    /// and print its result. See `hluk run --help`.
+    #[arg(long, value_name = "FUNCTION")]
+    call: Option<String>,
+
+    /// The call's input, JSON. See `hluk run --help`.
+    #[arg(long, value_name = "JSON", requires = "call")]
+    input: Option<String>,
+
+    /// Print where the time went, host side, when the run ends (also
+    /// HLUK_PROFILE=1).
+    #[arg(long)]
+    profile: bool,
+
     /// Mount a host directory into the guest filesystem.
     /// Format: HOST:GUEST[:ro] (e.g. /tmp/share:/mnt or /data:/mnt/data:ro).
     #[arg(long = "mount", value_name = "HOST:GUEST[:ro]")]
@@ -434,13 +472,19 @@ struct SnapshotRunArgs {
     net_block: Vec<String>,
 
     /// Ports the guest may bind to for inbound connections.
-    #[arg(long = "port", value_name = "PORT")]
-    ports: Vec<u16>,
+    #[arg(long = "port", value_name = "PORT|LOW-HIGH|all")]
+    ports: Vec<PortSpec>,
 
     /// Set an environment variable in the guest (repeatable).
     /// Format: KEY=VALUE (e.g. --env MY_VAR=hello --env DEBUG=1).
     #[arg(long = "env", value_name = "KEY=VALUE")]
     envs: Vec<String>,
+
+    /// A resolver configuration file to install as the guest's
+    /// /etc/resolv.conf, at boot and on a restore (nameservers, search
+    /// domains, options). Without it the rootfs's own file stands.
+    #[arg(long = "resolv-conf", value_name = "FILE")]
+    resolv_conf: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -471,13 +515,19 @@ struct BenchColdArgs {
     /// Script file to execute.
     script: PathBuf,
 
-    /// Scratch memory in MiB.
-    #[arg(long, default_value_t = DEFAULT_SCRATCH_MB)]
-    scratch_mb: usize,
+    /// Guest memory in MiB. Default: the size the rootfs's runtime image is
+    /// tested with.
+    #[arg(long, value_name = "MIB")]
+    scratch_mb: Option<usize>,
 
     /// Number of samples to run.
     #[arg(long, default_value_t = 20)]
     samples: usize,
+
+    /// Mount a host directory into the guest filesystem.
+    /// Format: HOST:GUEST[:ro] (e.g. /tmp/share:/mnt or /data:/mnt/data:ro).
+    #[arg(long = "mount", value_name = "HOST:GUEST[:ro]")]
+    mounts: Vec<String>,
 }
 
 /// Arguments for snapshot-based bench modes (cold-snap, warm-restore, warm-stateful).
@@ -492,6 +542,11 @@ struct BenchSnapArgs {
     /// Number of iterations / samples.
     #[arg(long, default_value_t = 20)]
     samples: usize,
+
+    /// Mount a host directory into the guest filesystem.
+    /// Format: HOST:GUEST[:ro] (e.g. /tmp/share:/mnt or /data:/mnt/data:ro).
+    #[arg(long = "mount", value_name = "HOST:GUEST[:ro]")]
+    mounts: Vec<String>,
 }
 
 /// Arguments for `bench parallel`.
@@ -510,6 +565,11 @@ struct BenchParallelArgs {
     /// Iterations per VM.
     #[arg(long, default_value_t = 10)]
     iterations: usize,
+
+    /// Mount a host directory into the guest filesystem.
+    /// Format: HOST:GUEST[:ro] (e.g. /tmp/share:/mnt or /data:/mnt/data:ro).
+    #[arg(long = "mount", value_name = "HOST:GUEST[:ro]")]
+    mounts: Vec<String>,
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
@@ -564,12 +624,57 @@ fn parse_mount(m: &str) -> Option<Mount> {
     })
 }
 
+/// A `--port` value: one port, an inclusive range `LOW-HIGH`, or `all`,
+/// which lets the guest bind any port -- what a container runtime asks for,
+/// since the container's network namespace already scopes what the guest
+/// exposes, the way `docker run -P` publishes every port.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PortSpec {
+    All,
+    One(u16),
+    Range(u16, u16),
+}
+
+impl std::str::FromStr for PortSpec {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        let s = s.trim();
+        if s.eq_ignore_ascii_case("all") {
+            return Ok(PortSpec::All);
+        }
+        let port = |p: &str| {
+            p.trim()
+                .parse::<u16>()
+                .map_err(|_| format!("invalid port {p:?}: expected a port, LOW-HIGH or all"))
+        };
+        if let Some((lo, hi)) = s.split_once('-') {
+            let (lo, hi) = (port(lo)?, port(hi)?);
+            if lo > hi {
+                return Err(format!("empty port range {s:?}"));
+            }
+            return Ok(PortSpec::Range(lo, hi));
+        }
+        port(s).map(PortSpec::One)
+    }
+}
+
+/// Read the `--resolv-conf` file, if given.
+fn read_resolv_conf(path: Option<&PathBuf>) -> CliResult<Option<String>> {
+    match path {
+        Some(p) => std::fs::read_to_string(p)
+            .map(Some)
+            .map_err(|e| format!("cannot read resolv.conf {}: {e}", p.display()).into()),
+        None => Ok(None),
+    }
+}
+
 /// Convert CLI net flags into `(Option<NetworkPolicy>, Option<ListenPorts>)`.
 fn parse_net_policy(
     net: bool,
     net_allow: &[String],
     net_block: &[String],
-    ports: &[u16],
+    ports: &[PortSpec],
 ) -> Result<(Option<NetworkPolicy>, Option<ListenPorts>), String> {
     let policy = if !net_allow.is_empty() {
         Some(NetworkPolicy::AllowList(
@@ -584,20 +689,23 @@ fn parse_net_policy(
     } else {
         None
     };
-    // Listen ports are meaningless without networking: `hostnet` is only
-    // registered when a policy is present, so `--port` on its own would be a
-    // silent no-op (the guest gets no networking at all).  Reject it up front
-    // rather than let the user believe the guest can bind.
-    if !ports.is_empty() && policy.is_none() {
-        return Err(
-            "--port requires networking to be enabled; pass --net (or --net-allow/--net-block) too"
-                .to_string(),
-        );
-    }
-    let listen = if !ports.is_empty() {
-        Some(ListenPorts::from_ports(ports.iter().copied()))
-    } else {
+    // `--port` on its own serves without reaching out: the library gives
+    // listen ports with no policy an allow list that lists nothing.
+    let listen = if ports.is_empty() {
         None
+    } else if ports.contains(&PortSpec::All) {
+        Some(ListenPorts::all())
+    } else {
+        let mut listen = ListenPorts::from_ports(ports.iter().filter_map(|p| match p {
+            PortSpec::One(port) => Some(*port),
+            _ => None,
+        }));
+        for spec in ports {
+            if let PortSpec::Range(lo, hi) = spec {
+                listen = listen.with_range(*lo..=*hi);
+            }
+        }
+        Some(listen)
     };
     Ok((policy, listen))
 }
@@ -648,40 +756,91 @@ fn base_builder(kernel: Option<PathBuf>, initrd: Option<PathBuf>) -> CliResult<S
     }
 }
 
-fn cmd_run(args: RunArgs) -> CliResult<()> {
-    let mounts = parse_mounts(&args.mounts)?;
-    let (policy, listen) =
-        parse_net_policy(args.net, &args.net_allow, &args.net_block, &args.ports)?;
+/// Boot `builder` for the CLI, which echoes the guest's output as it is
+/// written and never drains it, so keeps none: a long-running guest would
+/// grow the capture without end.
+fn boot(builder: SandboxBuilder) -> hyperlight_unikraft::Result<AppSandbox> {
+    builder.output_limit(0).boot()
+}
 
-    // Precedence: a host script or --exec code; else a guest command
-    // (--guest-exec); else, with no workload at all, the rootfs's conventional
-    // entrypoint. The last two are the model a container runtime (urunc) uses.
-    let no_workload = args.script.is_none() && args.exec.is_none() && args.guest_exec.is_none();
-    let exec = resolve_exec(args.script, args.exec)?
-        .unwrap_or_else(|| Exec::Guest(args.guest_exec.unwrap_or_default()));
-    let envs = parse_envs(&args.envs)?;
+/// A function to call once the workload has run (`--call`, `--input`).
+struct Call {
+    function: String,
+    input: String,
+}
 
-    let mut builder = base_builder(args.kernel, args.initrd)?
-        .scratch_mb(args.scratch_mb)
-        .mounts(mounts);
-    if let Some(entry) = args.entry {
-        builder = builder.entry(entry);
+impl Call {
+    fn new(function: Option<String>, input: Option<String>) -> Option<Self> {
+        function.map(|function| Call {
+            function,
+            input: input.unwrap_or_default(),
+        })
     }
+}
 
-    if let Some(policy) = policy {
-        builder = builder.network(policy);
-    }
-    if let Some(listen) = listen {
-        builder = builder.listen_ports(listen);
-    }
-    for (key, value) in envs {
-        builder = builder.env(key, value);
-    }
+/// Run the workload in a booted guest, then the call, printing its
+/// result; with a call and nothing else to run, only the call.  With
+/// nothing to run and no driver to run it, the entry point is a plain
+/// program (`--entry /bin/server`): drive it to its exit the way a
+/// container runtime would, and exit with its status, as running it
+/// directly would.
+fn drive(
+    sandbox: &mut AppSandbox,
+    no_workload: bool,
+    exec: Exec,
+    call: Option<Call>,
+) -> CliResult<()> {
     let t = Instant::now();
-    let mut sandbox = builder.boot()?;
-    info!(elapsed_ms = t.elapsed().as_secs_f64() * 1000.0, "boot");
+    if (!no_workload || call.is_some()) && !sandbox.has_driver() {
+        return Err(
+            "the guest has no runtime driver to run the workload: a script, \
+                    --exec, --guest-exec and --call need one in the rootfs (usr/local/bin/hl_*); \
+                    a plain program runs as the entry point with --entry"
+                .into(),
+        );
+    }
+    let result = drive_inner(sandbox, no_workload, exec, call, t);
+    if sandbox.profile().enabled() {
+        eprint!("{}", sandbox.profile().report());
+    }
+    // The entry program's status, after the report: exiting in
+    // `drive_inner` would lose it.
+    match result? {
+        0 => Ok(()),
+        status => std::process::exit(status),
+    }
+}
 
-    drive(&mut sandbox, no_workload, exec)
+/// The entry program's exit status when it is driven to its exit, else 0.
+fn drive_inner(
+    sandbox: &mut AppSandbox,
+    no_workload: bool,
+    exec: Exec,
+    call: Option<Call>,
+    t: Instant,
+) -> CliResult<i32> {
+    if let Some(call) = call {
+        if !no_workload {
+            sandbox.run(exec)?;
+            info!(elapsed_ms = elapsed_ms(t), "exec");
+        }
+        let t = Instant::now();
+        let result = sandbox.call(&call.function, &call.input)?;
+        info!(elapsed_ms = elapsed_ms(t), "call");
+        if !result.is_empty() {
+            println!("{result}");
+        }
+        return Ok(0);
+    }
+    if no_workload && !sandbox.has_driver() {
+        info!("no driver in the guest; driving its entry point to exit");
+        let status = sandbox.join()?;
+        info!(elapsed_ms = elapsed_ms(t), status, "exec");
+        return Ok(status);
+    }
+    sandbox.run(exec)?;
+    info!(elapsed_ms = elapsed_ms(t), "exec");
+    Ok(0)
 }
 
 fn cmd_workerd(args: WorkerdArgs) -> CliResult<()> {
@@ -2155,36 +2314,29 @@ fn cmd_workerd_host(args: WorkerdHostArgs) -> CliResult<()> {
     Ok(())
 }
 
-/// Run the workload in a booted guest.  With nothing to run and no driver
-/// to run it, the entry point is a plain program (`--entry /bin/server`):
-/// drive it to its exit the way a container runtime would, and exit with
-/// its status, as running it directly would.
-fn drive(sandbox: &mut AppSandbox, no_workload: bool, exec: Exec) -> CliResult<()> {
-    let t = Instant::now();
-    if no_workload && !sandbox.has_driver() {
-        info!("no driver in the guest; driving its entry point to exit");
-        let status = sandbox.join()?;
-        info!(
-            elapsed_ms = t.elapsed().as_secs_f64() * 1000.0,
-            status, "exec"
-        );
-        if status != 0 {
-            std::process::exit(status);
-        }
-        return Ok(());
-    }
-    sandbox.run(exec)?;
-    info!(elapsed_ms = t.elapsed().as_secs_f64() * 1000.0, "exec");
-    Ok(())
-}
-
 fn cmd_snapshot_save(args: SaveArgs) -> CliResult<()> {
     let mounts = parse_mounts(&args.mounts)?;
     let (policy, listen) =
         parse_net_policy(args.net, &args.net_allow, &args.net_block, &args.ports)?;
-    let mut builder = base_builder(args.kernel, args.initrd)?
-        .scratch_mb(args.scratch_mb)
-        .mounts(mounts);
+    let mut builder = match &args.runtime {
+        Some(runtime) => {
+            cli::check_runtime_name(runtime)?;
+            let (path, _) =
+                cli::rootfs::ensure_initrd(&cli::registry::runtime_image(runtime), false)?;
+            let mut b = SandboxBuilder::from_initrd(path);
+            if let Some(mb) = cli::registry::runtime_name(runtime)
+                .and_then(hyperlight_unikraft::runtime_scratch_mb)
+            {
+                b = b.scratch_mb(mb);
+            }
+            b
+        }
+        None => base_builder(args.kernel, args.initrd)?,
+    }
+    .mounts(mounts);
+    if let Some(mb) = args.scratch_mb {
+        builder = builder.scratch_mb(mb);
+    }
     if let Some(entry) = args.entry {
         builder = builder.entry(entry);
     }
@@ -2194,11 +2346,21 @@ fn cmd_snapshot_save(args: SaveArgs) -> CliResult<()> {
     if let Some(listen) = listen {
         builder = builder.listen_ports(listen);
     }
-    let mut sandbox = builder.boot()?;
+    if let Some(rc) = read_resolv_conf(args.resolv_conf.as_ref())? {
+        builder = builder.resolv_conf(rc);
+    }
+    let mut sandbox = boot(builder)?;
+    // What the snapshot should have loaded, run before it is taken.
+    if let Some(code) = &args.warm_exec {
+        if !sandbox.has_driver() {
+            return Err("--warm-exec needs a runtime driver in the rootfs".into());
+        }
+        sandbox.run(code.as_str())?;
+    }
 
     let t = Instant::now();
     sandbox.snapshot_to(&args.output)?;
-    let save_ms = t.elapsed().as_secs_f64() * 1000.0;
+    let save_ms = elapsed_ms(t);
     info!(
         path = %args.output.display(),
         elapsed_ms = save_ms,
@@ -2223,13 +2385,16 @@ fn cmd_snapshot_run(args: SnapshotRunArgs) -> CliResult<()> {
     let builder = SandboxBuilder::from_snapshot_dir(&args.snapshot)?;
     info!(
         path = %args.snapshot.display(),
-        elapsed_ms = t.elapsed().as_secs_f64() * 1000.0,
+        elapsed_ms = elapsed_ms(t),
         "snapshot loaded",
     );
 
     let envs = parse_envs(&args.envs)?;
 
     let mut builder = builder.mounts(mounts);
+    if args.profile {
+        builder = builder.profile(true);
+    }
     if let Some(policy) = policy {
         builder = builder.network(policy);
     }
@@ -2239,20 +2404,25 @@ fn cmd_snapshot_run(args: SnapshotRunArgs) -> CliResult<()> {
     for (key, value) in envs {
         builder = builder.env(key, value);
     }
+    if let Some(rc) = read_resolv_conf(args.resolv_conf.as_ref())? {
+        builder = builder.resolv_conf(rc);
+    }
 
     let t = Instant::now();
-    let mut sandbox = builder.boot()?;
-    info!(
-        elapsed_ms = t.elapsed().as_secs_f64() * 1000.0,
-        "restored from snapshot",
-    );
+    let mut sandbox = boot(builder)?;
+    info!(elapsed_ms = elapsed_ms(t), "restored from snapshot");
 
     // Precedence: host script / --exec code; else --guest-exec; else the
     // rootfs's conventional entrypoint.
     let no_workload = args.script.is_none() && args.exec.is_none() && args.guest_exec.is_none();
     let exec = resolve_exec(args.script, args.exec)?
         .unwrap_or_else(|| Exec::Guest(args.guest_exec.unwrap_or_default()));
-    drive(&mut sandbox, no_workload, exec)
+    drive(
+        &mut sandbox,
+        no_workload,
+        exec,
+        Call::new(args.call, args.input),
+    )
 }
 
 // ── Bench helpers ────────────────────────────────────────────────
@@ -2358,15 +2528,19 @@ fn print_rss(label: &str) {
 /// Cold start: fresh boot + dispatch, N independent samples.
 fn bench_cold(args: BenchColdArgs) -> CliResult<()> {
     let source = read_script(&args.script)?;
+    let mounts = parse_mounts(&args.mounts)?;
     let mut boots = Vec::with_capacity(args.samples);
     let mut execs = Vec::with_capacity(args.samples);
     let mut totals = Vec::with_capacity(args.samples);
 
     for i in 0..args.samples {
         let t0 = Instant::now();
-        let mut sandbox = SandboxBuilder::from_initrd(args.initrd.clone())
-            .scratch_mb(args.scratch_mb)
-            .boot()?;
+        let mut builder =
+            SandboxBuilder::from_initrd(args.initrd.clone()).mounts(mounts.iter().cloned());
+        if let Some(mb) = args.scratch_mb {
+            builder = builder.scratch_mb(mb);
+        }
+        let mut sandbox = boot(builder)?;
         let boot_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         let t1 = Instant::now();
@@ -2392,6 +2566,7 @@ fn bench_cold(args: BenchColdArgs) -> CliResult<()> {
 /// Cold snapshot: load from disk + restore + dispatch, N independent samples.
 fn bench_cold_snap(args: BenchSnapArgs) -> CliResult<()> {
     let source = read_script(&args.script)?;
+    let mounts = parse_mounts(&args.mounts)?;
     let mut loads = Vec::with_capacity(args.samples);
     let mut restores = Vec::with_capacity(args.samples);
     let mut execs = Vec::with_capacity(args.samples);
@@ -2403,7 +2578,7 @@ fn bench_cold_snap(args: BenchSnapArgs) -> CliResult<()> {
         let load_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         let t1 = Instant::now();
-        let mut sandbox = builder.boot()?;
+        let mut sandbox = boot(builder.mounts(mounts.iter().cloned()))?;
         let restore_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
         let t2 = Instant::now();
@@ -2433,10 +2608,11 @@ fn bench_cold_snap(args: BenchSnapArgs) -> CliResult<()> {
 /// Warm with restore: load snapshot once, then loop dispatch + restore.
 fn bench_warm_restore(args: BenchSnapArgs) -> CliResult<()> {
     let source = read_script(&args.script)?;
+    let mounts = parse_mounts(&args.mounts)?;
 
     let t0 = Instant::now();
     let snap = load_snapshot(&args.snapshot)?;
-    let mut sandbox = SandboxBuilder::from_snapshot(snap.clone()).boot()?;
+    let mut sandbox = boot(SandboxBuilder::from_snapshot(snap.clone()).mounts(mounts))?;
     let setup_ms = t0.elapsed().as_secs_f64() * 1000.0;
     println!("BENCH warm-restore setup_ms={setup_ms:.3}");
 
@@ -2467,10 +2643,11 @@ fn bench_warm_restore(args: BenchSnapArgs) -> CliResult<()> {
 /// Warm stateful: load snapshot once, then loop dispatch without restore.
 fn bench_warm_stateful(args: BenchSnapArgs) -> CliResult<()> {
     let source = read_script(&args.script)?;
+    let mounts = parse_mounts(&args.mounts)?;
 
     let t0 = Instant::now();
     let snap = load_snapshot(&args.snapshot)?;
-    let mut sandbox = SandboxBuilder::from_snapshot(snap).boot()?;
+    let mut sandbox = boot(SandboxBuilder::from_snapshot(snap).mounts(mounts))?;
     let setup_ms = t0.elapsed().as_secs_f64() * 1000.0;
     println!("BENCH warm-stateful setup_ms={setup_ms:.3}");
 
@@ -2494,6 +2671,7 @@ fn bench_warm_stateful(args: BenchSnapArgs) -> CliResult<()> {
 /// Parallel VMs: spawn N threads, each restoring from the same snapshot.
 fn bench_parallel(args: BenchParallelArgs) -> CliResult<()> {
     let source = Arc::new(read_script(&args.script)?);
+    let mounts = parse_mounts(&args.mounts)?;
     let snap = load_snapshot(&args.snapshot)?;
 
     // Barrier so all VMs start at the same time.
@@ -2506,13 +2684,13 @@ fn bench_parallel(args: BenchParallelArgs) -> CliResult<()> {
             let source = source.clone();
             let barrier = barrier.clone();
             let iterations = args.iterations;
+            let mounts = mounts.clone();
 
             std::thread::spawn(move || -> Result<Vec<f64>, String> {
                 barrier.wait();
                 let vm_start = Instant::now();
 
-                let mut sandbox = SandboxBuilder::from_snapshot(snap.clone())
-                    .boot()
+                let mut sandbox = boot(SandboxBuilder::from_snapshot(snap.clone()).mounts(mounts))
                     .map_err(|e| e.to_string())?;
                 let mut execs = Vec::with_capacity(iterations);
 
@@ -2587,6 +2765,21 @@ fn main() {
         }
         _ => {
             eprintln!("error: {e}");
+            #[cfg(target_os = "macos")]
+            if e.to_string().contains("HVF error: 0xfae94007") {
+                // HV_DENIED: the binary lacks the hypervisor entitlement.
+                // The command signs this binary, wherever it came from, via a
+                // private temporary file.
+                let exe = std::env::current_exe()
+                    .map(|p| p.display().to_string().replace('\'', "'\\''"))
+                    .unwrap_or_else(|_| "hluk".into());
+                eprintln!(
+                    "hint: sign hluk with the hypervisor entitlement:\n  \
+                     p=$(mktemp) && printf '<?xml version=\"1.0\"?><plist version=\"1.0\"><dict>\
+                     <key>com.apple.security.hypervisor</key><true/></dict></plist>' > \"$p\" \
+                     && codesign -f -s - --entitlements \"$p\" '{exe}'"
+                );
+            }
             std::process::exit(1);
         }
     }
@@ -2596,10 +2789,11 @@ fn cli_main() -> CliResult<()> {
     let cli = Cli::parse();
 
     if let Some(level) = cli.log_level {
-        // RUST_LOG overrides --log-level when set; otherwise scope to
-        // our crate only so library noise doesn't leak through.
-        let filter = EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new(format!("hyperlight_unikraft={level}")));
+        // RUST_LOG overrides --log-level when set; otherwise scope to the
+        // library and this binary, so dependency noise doesn't leak through.
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            EnvFilter::new(format!("hyperlight_unikraft={level},hluk={level}"))
+        });
         tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_target(false)
@@ -2621,7 +2815,12 @@ fn cli_main() -> CliResult<()> {
     });
 
     match cli.command {
-        Command::Run(args) => cmd_run(args),
+        Command::Init(args) => cli::init(args),
+        Command::Run(args) => cli::run(args),
+        Command::Build(args) => cli::build(args),
+        Command::Pull(args) => cli::pull(args),
+        Command::Templates => cli::templates(),
+        Command::Cache(args) => cli::cache(args),
         Command::Workerd(args) => cmd_workerd(args),
         Command::WorkerdHost(args) => cmd_workerd_host(args),
         Command::WorkerdPrewarmSnapshot(args) => cmd_workerd_prewarm_snapshot(args),
@@ -2629,6 +2828,10 @@ fn cli_main() -> CliResult<()> {
         Command::Snapshot(cmd) => match cmd {
             SnapshotCommand::Save(args) => cmd_snapshot_save(args),
             SnapshotCommand::Run(args) => cmd_snapshot_run(args),
+            SnapshotCommand::Key => {
+                println!("{}", hyperlight_unikraft::SNAPSHOT_KEY);
+                Ok(())
+            }
         },
         Command::Bench(cmd) => match cmd {
             BenchCommand::Cold(args) => bench_cold(args),
@@ -2769,7 +2972,7 @@ mod tests {
 
     #[test]
     fn net_policy_port_with_net_sets_listen() {
-        let (policy, listen) = parse_net_policy(true, &[], &[], &[8080]).unwrap();
+        let (policy, listen) = parse_net_policy(true, &[], &[], &[PortSpec::One(8080)]).unwrap();
         assert!(matches!(policy, Some(NetworkPolicy::AllowAll)));
         assert!(listen.is_some());
     }
@@ -2777,16 +2980,48 @@ mod tests {
     #[test]
     fn net_policy_port_with_allow_list_sets_listen() {
         let (policy, listen) =
-            parse_net_policy(false, &["example.com".into()], &[], &[8080]).unwrap();
+            parse_net_policy(false, &["example.com".into()], &[], &[PortSpec::One(8080)]).unwrap();
         assert!(matches!(policy, Some(NetworkPolicy::AllowList(_))));
         assert!(listen.is_some());
     }
 
     #[test]
-    fn net_policy_port_without_net_is_rejected() {
-        // --port alone would be a silent no-op (hostnet is only registered
-        // when a policy is present), so it must be an error, not accepted.
-        let err = parse_net_policy(false, &[], &[], &[8080]).unwrap_err();
-        assert!(err.contains("--port requires networking"), "got: {err}");
+    fn port_spec_parses_port_range_and_all() {
+        assert_eq!("8080".parse::<PortSpec>().unwrap(), PortSpec::One(8080));
+        assert_eq!(
+            "8000-8010".parse::<PortSpec>().unwrap(),
+            PortSpec::Range(8000, 8010)
+        );
+        assert_eq!("all".parse::<PortSpec>().unwrap(), PortSpec::All);
+        assert_eq!("ALL".parse::<PortSpec>().unwrap(), PortSpec::All);
+        assert!("8010-8000".parse::<PortSpec>().is_err());
+        assert!("http".parse::<PortSpec>().is_err());
+        assert!("70000".parse::<PortSpec>().is_err());
+    }
+
+    #[test]
+    fn net_policy_port_all_and_ranges() {
+        let (_, listen) = parse_net_policy(true, &[], &[], &[PortSpec::All]).unwrap();
+        assert!(listen.unwrap().allows(12345));
+        let (_, listen) = parse_net_policy(
+            true,
+            &[],
+            &[],
+            &[PortSpec::One(22), PortSpec::Range(8000, 8010)],
+        )
+        .unwrap();
+        let listen = listen.unwrap();
+        assert!(listen.allows(22));
+        assert!(listen.allows(8005));
+        assert!(!listen.allows(9000));
+    }
+
+    #[test]
+    fn net_policy_port_without_net_grants_no_outbound() {
+        // --port alone names no policy: the library then lets the guest
+        // serve on the port and reach nothing (see GuestConfig::new).
+        let (policy, listen) = parse_net_policy(false, &[], &[], &[PortSpec::One(8080)]).unwrap();
+        assert!(policy.is_none());
+        assert!(listen.unwrap().allows(8080));
     }
 }

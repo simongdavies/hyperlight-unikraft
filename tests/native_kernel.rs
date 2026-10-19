@@ -7,10 +7,11 @@
 //! kernel other than the embedded elfloader.
 //!
 //! The fixture kernel is built reproducibly with `just build-native-kernel`
-//! (and checked by `just verify-native-kernel` in CI) against mini's cleanup
-//! Unikraft, which needs the platform fix `select LIBPOSIX_ENVIRON` in
-//! `plat/hyperlight/Config.uk` (dispatch.c calls putenv/setenv, which a
-//! non-elfloader build wouldn't otherwise pull in).  See the fixture README.
+//! (and checked by `just verify-native-kernel` in CI) against the pinned
+//! `kernel/unikraft` (`plat-hyperlight-v2`), which carries the platform fix
+//! `select LIBPOSIX_ENVIRON` in `plat/hyperlight/Config.uk` (dispatch.c calls
+//! putenv/setenv, which a non-elfloader build wouldn't otherwise pull in).
+//! See the fixture README.
 //!
 //! Native apps use a different execution model from the elfloader runtimes:
 //! the workload runs at *boot* (during `init()`/evolve), not on a later
@@ -24,6 +25,9 @@
 //! bogus term-function pointer (`0x1`), which the shutdown term loop called —
 //! the elfloader never hit it because it never returns from `main`.  See the
 //! fixture README.
+
+// The fixture is an x86_64 kernel; an arm64 host cannot run it.
+#![cfg(target_arch = "x86_64")]
 
 use std::path::PathBuf;
 
@@ -50,6 +54,9 @@ fn native_kernel_boots_and_prints() {
         .scratch_mb(64)
         .boot()
         .unwrap();
+    // nolibc keeps the program's standard error apart, newlines as written.
+    let stderr = sandbox.drain_stderr();
+    assert_eq!(stderr, "native-kernel-stderr\n");
     let output = sandbox.drain_output();
 
     assert!(

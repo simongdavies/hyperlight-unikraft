@@ -25,6 +25,7 @@ cp "$root/defconfig-workerd" "$build/defconfig-workerd"
 docker build --progress=plain -t hluk-kernel-builder \
     -f "$build/kernel/Dockerfile.build" "$build/kernel"
 docker run --rm \
+    --user "$(id -u):$(id -g)" \
     -v "$build/kernel:/kernel" \
     -v "$build/defconfig-workerd:/defconfig-workerd:ro" \
     -e HOST_UID="$(id -u)" \

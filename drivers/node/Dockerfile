@@ -1,4 +1,4 @@
-FROM node:22-alpine AS build
+FROM node:22-alpine@sha256:0a7108bf6c7bf5de370ffb1a3ed6be93d405b43ff159f681a8d18c0e2bc2e402 AS build
 
 RUN apk add --no-cache gcc musl-dev
 
@@ -6,17 +6,21 @@ RUN apk add --no-cache gcc musl-dev
 COPY drivers/hl_fc.h /src/drivers/hl_fc.h
 COPY drivers/hl_env.h /src/drivers/hl_env.h
 COPY drivers/hl_driver.h /src/drivers/hl_driver.h
+COPY drivers/hl_child.h /src/drivers/hl_child.h
 COPY drivers/node/hl_nodedriver.c /src/drivers/node/hl_nodedriver.c
 
 RUN gcc -O2 -Wall -Wextra -Wno-unused-parameter \
         -static-pie -fPIE \
         -o /hl_nodedriver /src/drivers/node/hl_nodedriver.c
 
+# musl's dynamic linker is named for the architecture (x86_64, aarch64)
+RUN mkdir -p /musl && cp /lib/ld-musl-$(uname -m).so.1 /musl/
+
 # Minimal rootfs: Node binary + musl + driver
 FROM scratch
 
 # musl dynamic linker + libs
-COPY --from=build /lib/ld-musl-x86_64.so.1 /lib/ld-musl-x86_64.so.1
+COPY --from=build /musl/ /lib/
 COPY --from=build /usr/lib/libgcc_s.so.1 /usr/lib/libgcc_s.so.1
 COPY --from=build /usr/lib/libstdc++.so.6 /usr/lib/libstdc++.so.6
 

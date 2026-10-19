@@ -222,6 +222,10 @@ impl Responses {
     }
 
     fn output(&self, chunk: &str) -> Result<()> {
+        self.output_bytes(chunk.as_bytes())
+    }
+
+    fn output_bytes(&self, chunk: &[u8]) -> Result<()> {
         let mut state = self
             .0
             .lock()
@@ -243,15 +247,16 @@ impl Responses {
             state.violation = Some(error.into());
             return Err(Error::State(error.into()));
         }
-        state.bytes.extend_from_slice(chunk.as_bytes());
+        state.bytes.extend_from_slice(chunk);
         if let Some(end) = state.bytes.iter().position(|&b| b == b'\n') {
-            // v0.14's console turns a guest LF into CRLF, including across
-            // HostPrint chunks. Strip exactly that terminator, never trim().
-            let json_end = end.saturating_sub(1);
+            // New kernels preserve LF; the legacy HostPrint bridge may send CRLF.
+            let json_end = if end > 0 && state.bytes[end - 1] == b'\r' {
+                end - 1
+            } else {
+                end
+            };
             let error = if end != state.bytes.len() - 1 {
                 Some("response has a suffix or additional line")
-            } else if state.bytes.get(json_end) != Some(&b'\r') {
-                Some("response terminator is not CRLF")
             } else if state.bytes.first() != Some(&b'{') {
                 Some("response has a non-JSON prefix")
             } else if state.bytes.get(json_end.wrapping_sub(1)) != Some(&b'}') {
@@ -339,11 +344,58 @@ impl Responses {
 
     fn register(&self, target: &mut impl Registerable) -> Result<()> {
         self.1.register(target)?;
-        target.register_host_function("ReadStdin", || -> hyperlight_host::Result<String> {
+        target.register_host_function("ReadStdin", || -> hyperlight_host::Result<Vec<u8>> {
             Err(hyperlight_host::new_error!(
                 "workerd has no stdin capability"
             ))
         })?;
+        let collector = self.clone();
+        let console_bytes = Arc::new(Mutex::new(0usize));
+        let stderr_bytes = console_bytes.clone();
+        target.register_host_function(
+            "HostWrite",
+            move |message: Vec<u8>| -> hyperlight_host::Result<i32> {
+                let active = collector
+                    .0
+                    .lock()
+                    .map_err(|_| hyperlight_host::new_error!("response state poisoned"))?
+                    .id
+                    .is_some();
+                if active {
+                    collector.output_bytes(&message).map_err(|error| {
+                        hyperlight_host::new_error!("workerd response rejected: {error}")
+                    })?;
+                } else {
+                    let mut used = console_bytes
+                        .lock()
+                        .map_err(|_| hyperlight_host::new_error!("console state poisoned"))?;
+                    *used = used.saturating_add(message.len());
+                    if *used > 64 * 1024 {
+                        return Err(hyperlight_host::new_error!(
+                            "workerd console limit exceeded"
+                        ));
+                    }
+                    tracing::debug!(bytes = message.len(), "workerd console output");
+                }
+                Ok(message.len() as i32)
+            },
+        )?;
+        target.register_host_function(
+            "HostWriteErr",
+            move |message: Vec<u8>| -> hyperlight_host::Result<i32> {
+                let mut used = stderr_bytes
+                    .lock()
+                    .map_err(|_| hyperlight_host::new_error!("console state poisoned"))?;
+                *used = used.saturating_add(message.len());
+                if *used > 64 * 1024 {
+                    return Err(hyperlight_host::new_error!(
+                        "workerd console limit exceeded"
+                    ));
+                }
+                tracing::debug!(bytes = message.len(), "workerd stderr");
+                Ok(message.len() as i32)
+            },
+        )?;
         let bytes = Arc::new(Mutex::new(0usize));
         let collector = self.clone();
         target.register_host_function(
@@ -2425,7 +2477,6 @@ mod tests {
             format!("{} \r\n", response("r")),
             format!("{}\r\nextra", response("r")),
             format!("{}\r\n{}\r\n", response("r"), response("r")),
-            format!("{}\n", response("r")),
             format!("{}\r\r\n", response("r")),
             "a".repeat(super::super::MAX_ENVELOPE_BYTES + 3),
         ] {
@@ -2448,6 +2499,25 @@ mod tests {
         c.output(&format!("{}\r", response("next"))).unwrap();
         c.output("\n").unwrap();
         assert_eq!(c.finish().unwrap().request_id, "next");
+    }
+
+    #[test]
+    fn byte_output_preserves_split_utf8_and_lf_without_accepting_invalid_bytes() {
+        let c = Responses::default();
+        c.begin("utf8").unwrap();
+        let json = serde_json::json!({
+            "protocol_version":1, "request_id":"utf8", "status":200,
+            "headers":[{"name":"x-test","value":"\u{00e9}"}], "body_base64":""
+        })
+        .to_string();
+        let bytes = format!("{json}\n").into_bytes();
+        let split = bytes.iter().position(|byte| *byte == 0xc3).unwrap() + 1;
+        c.output_bytes(&bytes[..split]).unwrap();
+        c.output_bytes(&bytes[split..]).unwrap();
+        assert_eq!(c.finish().unwrap().headers[0].value, "\u{00e9}");
+        c.begin("bad-utf8").unwrap();
+        assert!(c.output_bytes(b"{\"x\":\"\xff\"}\n").is_err());
+        assert!(c.finish().is_err());
     }
 
     #[test]

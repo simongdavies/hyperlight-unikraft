@@ -2,6 +2,23 @@
 
 [Canonical demo runbook](../azure-workerd-hyperlight-runbook.md)
 
+## Release compatibility
+
+The v0.18 migration uses metadata schema 10. Each binding additionally
+requires the host's snapshot transport-contract hash derived from
+`SNAPSHOT_KEY`, alongside its kernel, executor, rootfs, policy, and target
+hashes. Missing or mismatched transport metadata and schema-9 snapshots
+are refused. The upstream snapshot key also changes with its embedded
+kernel and host transport contract.
+
+This is a deliberate incompatible heap boundary, not an in-place durable
+state migration. Preserve existing encrypted checkpoints and their keys.
+Drain and retire the old revision through its original runtime, retain any
+required external SQL/KV data, and explicitly create a new revision/home
+with the new runtime. Do not delete old state, rewrite its binding, or
+fall back to a pristine VM after incompatible resume. Rollback uses the old
+runtime and its matching old artifacts/state, not the new runtime reading
+an old heap.
 
 For per-instance lifecycle control, add `instance_home` to a resident app.
 This **replaces** the conventional resident pool; one logical instance is one

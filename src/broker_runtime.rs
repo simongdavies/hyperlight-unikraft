@@ -19,7 +19,7 @@ static NEXT_OPAQUE_AUTHORITY: AtomicU64 = AtomicU64::new(1);
 
 fn opaque_authority() -> u64 {
     NEXT_OPAQUE_AUTHORITY
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |next| {
             next.checked_add(1)
         })
         .expect("process cannot construct u64::MAX broker authorities")

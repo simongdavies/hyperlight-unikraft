@@ -336,7 +336,7 @@ impl ResidentWorkerPool {
         let request_id = request.request_id().to_string();
         if self
             .admitted
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
                 (admitted < self.admission_capacity).then_some(admitted + 1)
             })
             .is_err()
@@ -386,7 +386,7 @@ impl ResidentWorkerPool {
     pub fn reserve(&self) -> Option<ResidentHandle> {
         if self
             .admitted
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
                 (admitted < self.admission_capacity).then_some(admitted + 1)
             })
             .is_err()

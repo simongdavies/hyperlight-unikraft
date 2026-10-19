@@ -4,17 +4,18 @@ A driver is the program the kernel starts in a runtime image.  It brings its run
 
 ## The device
 
-The whole contract is one character device, `/dev/hlcall`, and five operations on it, listed in the order a driver uses them:
+The whole contract is one character device, `/dev/hlcall`, and six operations on it, listed in the order a driver uses them:
 
 | Operation | Meaning |
 |---|---|
 | `open()` | The driver is here.  The kernel tells the host `DriverReady`; a call that arrives before any open is refused with `CallRejected`, which is what an image without a driver produces. |
-| `ioctl(HLCALL_IOC_MAXLEN)` | How large a call can be, a `uint64_t` the kernel knows from the host's PEB.  The driver allocates its read buffer from it, once. |
+| `ioctl(HLCALL_IOC_MAXLEN)` | How large a call can be, a `uint64_t` the kernel knows from the transport geometry the host published.  The driver allocates its read buffer from it, once. |
 | `read()` | Blocks until the host issues a call, then returns it whole: the FunctionCall FlatBuffer as the host encoded it.  Reading again completes the previous call. |
-| `ioctl(HLCALL_IOC_GETENV)` | The variables the embedder set (`--env`, `set_env_vars`) as they are now, `KEY=VALUE` entries separated by NUL, into a buffer the driver provides.  Asked at the top of every call. |
-| `write()` | An `int32_t` status for the call being served, written only when it failed.  Refused when no call is in flight. |
+| `ioctl(HLCALL_IOC_GETENV)` | The variables the embedder set (`--env`, `set_env_vars`) as they are now, `KEY=VALUE` entries separated by NUL, into a buffer the driver provides.  Asked at the top of every call; the kernel answers from its own copy unless the embedder changed the variables since (each call carries the host's version of them), so an unchanged environment costs no host call. |
+| `ioctl(HLCALL_IOC_HOSTCALL)` | Call one of the embedder's functions (`SandboxBuilder::host_function`) by name and get its reply. The kernel forwards it as the host function `HostCall(name, args)`. Only while a call is in flight. |
+| `write()` | An `int32_t` status for the call being served, optionally followed by its result, which the kernel reports with the entry's `Yield`. Written when the call failed or has a result. Refused when no call is in flight. |
 
-The ioctl numbers, `_IOR('H', 1, uint64_t)` and `_IOWR('H', 2, struct hlcall_env)`, are built with the standard macros, so the argument's size is part of the number and a layout mismatch between the two sides reads as `ENOTTY`.  The kernel's `plat/hyperlight/include/hyperlight-x86/step.h` is the source of truth; `hl_driver.h` mirrors it.
+The ioctl numbers, `_IOR('H', 1, uint64_t)`, `_IOWR('H', 2, struct hlcall_env)` and `_IOWR('H', 3, struct hlcall_hostcall)`, are built with the standard macros, so the argument's size is part of the number and a layout mismatch between the two sides reads as `ENOTTY`.  The kernel's `plat/hyperlight/include/hyperlight/step.h` is the source of truth; `hl_driver.h` mirrors it.
 
 ## From boot to a call
 
@@ -29,38 +30,45 @@ sequenceDiagram
     D->>K: open(/dev/hlcall)
     K-->>H: DriverReady
     D->>K: ioctl(MAXLEN)
-    K-->>D: 64 KiB
+    K-->>D: 73,716 bytes
     Note over D: Py_Initialize()
     D->>K: read()
     Note over D: parked, nothing left to run
     K-->>H: Yield, boot() returns
 
     H->>K: run("print(6*7)"): Exec
-    K-->>H: CallStarted
     K-->>D: the read returns the call
     D->>K: ioctl(GETENV)
     Note over D: PyRun_SimpleString prints 42
     D->>K: read()
-    K-->>H: CallDone(0), Yield: run() returns
+    K-->>H: Yield(returned 0): run() returns
 ```
 
-`boot()` returns when the driver is parked in its first `read()`, so every call the host ever makes finds a reader waiting.  Two things complete a call: the callback returning, and the driver reading again.  The kernel reports `CallDone` at that second read, which is why the driver never says "done" explicitly.  When the callback returns is each runtime's own rule: Node when its event loop drains, so a live timer or server keeps the call open until it is cleared or `unref()`ed; an exec'd program when it exits, taking its threads with it as any process does; Python and .NET when the main code returns, so a thread it started, daemon or not, foreground or background, is left behind and makes progress on the steps that follow like any blocked guest thread.  Python and .NET differ from their standalone programs here, which wait for non-daemon and foreground threads before exiting; a long-lived interpreter cannot run the exit-time machinery that makes that safe (a module-level thread pool would hold the call forever), so the call is the main code.  What the runtime prints to stdout and stderr is the guest's output on the host.
+`boot()` returns when the driver is parked in its first `read()`, so every call the host ever makes finds a reader waiting.  Two things complete a call: the callback returning, and the driver reading again.  The kernel notes the return at that second read and reports it with the entry's `Yield`, which is why the driver never says "done" explicitly.  When the callback returns is each runtime's own rule: Node when its event loop drains, so a live timer or server keeps the call open until it is cleared or `unref()`ed; an exec'd program when it exits, taking its threads with it as any process does; Python, .NET and Java when the main code returns, so a thread it started, daemon or not, foreground or background, is left behind and makes progress on the steps that follow like any blocked guest thread.  Python, .NET and Java differ from their standalone programs here, which wait for non-daemon and foreground threads before exiting; a long-lived interpreter cannot run the exit-time machinery that makes that safe (a module-level thread pool would hold the call forever), so the call is the main code.  What the runtime prints to stdout and stderr is the guest's output on the host, kept apart: `hluk run` writes each to its own stream, and `drain_stderr()` returns standard error alone.
 
-An exit inside a call (`sys.exit()`, `process.exit()`, `Environment.Exit()`, a shell's `exit`, a program's exit code) ends the call with that status, as it would end a script.  The runtime is there for the next call: Python and Node catch the exit and keep their state; .NET and bash cannot, so the next call starts a fresh one.
+An exit inside a call (`sys.exit()`, `process.exit()`, `Environment.Exit()`, `System.exit()`, a shell's `exit`, a program's exit code) ends the call with that status, as it would end a script.  The runtime is there for the next call: Python and Node catch the exit and keep their state; .NET, Java and bash cannot, so the next call starts a fresh one.  The kernel keeps an exited process's memory, so each fresh .NET or Java runtime needs the room for another; `hl_javadriver` measures what its first JVM took and fails a call that would start one without twice that free, and sizes the new one's heap from what is left after it (two restarts at java's 512 MiB), which a restore from a snapshot undoes.
 
 A call can block.  `run("time.sleep(2)")` puts the driver thread to sleep, and to the kernel that is an ordinary blocked thread: with nothing else to run it yields, the host waits the two seconds without using CPU, re-enters, and the call goes on.  A `recv()` on a socket does the same, with the host waiting for the socket instead.  That is the step model of [execution.md](execution.md) seen from inside the driver.
 
 ## A call that fails
 
-`run("1/0")` makes Python raise.  The callback returns 1, `hl_driver_run` writes that status to the device, and the next `read()` reports `CallDone(1)`: the host's `run()` fails with status 1 and the traceback in the output, and `step()` reports `Yield::CallFailed { status: 1 }`.  The status is the driver's to choose: a program's or an `exit()`'s own code, 1 for an uncaught exception (what the runtime's script would exit with), -1 when the driver could not run the call at all.  A call the driver reads past without a status is a success.  The kernel never waits for a write, so nothing can hang on one.
+`run("1/0")` makes Python raise.  The callback returns 1, `hl_driver_run` writes that status to the device, and the next `read()` marks the call returned with status 1: the host's `run()` fails with status 1 and the traceback in the output, and `step()` reports `Yield::CallFailed { status: 1 }`.  The status is the driver's to choose: a program's or an `exit()`'s own code, 1 for an uncaught exception (what the runtime's script would exit with), -1 when the driver could not run the call at all.  A call the driver reads past without a status is a success.  The kernel never waits for a write, so nothing can hang on one.
 
 ## What a call carries
 
-`Exec` carries source: `run("print(6*7)")` arrives as `Exec` with that string as its one parameter, and the callback runs it in the runtime (an `Exec::File` is read on the host and sent the same way).  `GuestExec` carries a command line for a program already in the image: `run(Exec::Guest("/app/server --port 8080"))` arrives as `GuestExec` with that line, the callback runs the file with that argv, and an empty line runs the image's conventional entrypoint, `/entrypoint.py` in the python image.  [`hl_fc.h`](../drivers/hl_fc.h) reads the name and the parameter out of the FlatBuffer.  One call at a time: the host finishes one before it issues the next.
+`Exec` carries source: `run("print(6*7)")` arrives as `Exec` with that string as its one parameter, and the callback runs it in the runtime (an `Exec::File` is read on the host and sent the same way).  `GuestExec` carries a command line for a program already in the image: `run(Exec::Guest("/app/server --port 8080"))` arrives as `GuestExec` with that line, the callback runs the file with that argv, and an empty line runs the image's conventional entrypoint, `/entrypoint.py` in the python image.  [`hl_fc.h`](../drivers/hl_fc.h) reads the name and the parameters out of the FlatBuffer.  One call at a time: the host finishes one before it issues the next.
+
+`Call` carries a function name and an input. `call("greet", r#"{"name":"World"}"#)` asks the driver to run the guest's `greet` and send back its result with `hl_set_result()`. A driver opts in with `hl_driver_serve_calls()`. Without it, `hl_driver_run` fails a `Call` itself, so a callback written for `Exec` never runs a function name as code. A result is at most 69,620 bytes, what one host call carries; the kernel refuses a larger one and the call fails. [calls.md](calls.md) covers what each image does with a call.
+
+## Host functions
+
+`hl_host_call("math.add", "[2,3]", ...)` runs the embedder's `math.add` and returns 0 with its result, 1 with its error message, or -1 if the call couldn't be made (no call in flight, or a host without `HostCall`). Every embedder function travels as one host function, `HostCall(name, args)`, which the library dispatches by name, so a new function needs no kernel change. The bytes pass through untouched; the drivers use JSON. The empty name lists the registered functions, one per line.
+
+Call it from the thread serving the call. The node, dotnet-jit and java runtimes are child processes, so the child sends each host function call up its pipe and the driver makes it.
 
 ## The environment
 
-`hluk run --env GREETING="it's me"` reaches the guest as the entry `GREETING=it's me` from `HLCALL_IOC_GETENV`.  Only the embedder's variables travel this way; what the image's runtime sets for itself stays, unless the embedder sets the same key, which then wins.  Together they must fit one host call, 64 KiB by default, since the kernel fetches them with one.  [`hl_env.h`](../drivers/hl_env.h) does `setenv()` for the C side and hands each variable to the runtime: Python sets `os.environ["GREETING"]` through the C API, and bash, whose shell is a separate process fed with source, gets `export GREETING='it'\''s me'` in front of the call, quoted so the shell takes the value as it is.  A variable the embedder removed stays set in the guest.
+`hluk run --env GREETING="it's me"` reaches the guest as the entry `GREETING=it's me` from `HLCALL_IOC_GETENV`.  Only the embedder's variables travel this way; what the image's runtime sets for itself stays, unless the embedder sets the same key, which then wins.  Together, with a separator after each, they must fit one host call: under 69,620 bytes, since the kernel fetches them with one.  [`hl_env.h`](../drivers/hl_env.h) does `setenv()` for the C side and hands each variable to the runtime: Python sets `os.environ["GREETING"]` through the C API, and bash, whose shell is a separate process fed with source, gets `export GREETING='it'\''s me'` in front of the call, quoted so the shell takes the value as it is.  A variable the embedder removed stays set in the guest, except under the `python`, `python-shell` and `agent` drivers, which unset it, or put back the image's own value if it had one, before the next call.
 
 ## Snapshots
 
@@ -70,9 +78,9 @@ A snapshot taken while the driver is parked in `read()` is a warm image: restore
 
 The loop is the same in every driver; what differs is where the runtime lives, and that decides how a call and the environment reach it.
 
-Python is embedded: `hl_pydriver` and `hl_pywarmdriver` link `libpython` and run the code with `PyRun_SimpleString` in their own process, which is why those images can set `os.environ` through the C API.
+Python is embedded: `hl_pydriver` and `hl_pywarmdriver` link `libpython` and run the code with `PyRun_SimpleString` in their own process, which is why those images can set `os.environ` through the C API.  `hl_quickjsdriver` embeds quickjs-ng the same way. `hl_wasmtimedriver` embeds Wasmtime and is written in Rust, with its own port of these headers in `drivers/wasmtime/driver/src/hlcall.rs`.
 
-Node and .NET (the dotnet-jit image) ship as programs, so `hl_nodedriver` and `hl_dotnetdriver` spawn one child at boot and keep it: the child sits in a read on a pipe from the driver, gets each call as length-prefixed code, runs it and writes back an ack byte.  Kept across calls it stays warm, and a snapshot keeps it warm.  `hl_bashdriver` does the same with a BusyBox `hush`, except that the call goes into a file and the byte on the pipe says "source it".  Such a child can only be reached through the source it is fed, hence the quoted assignments in front of each call.
+Node, .NET (the dotnet-jit image) and Java ship as programs, so `hl_nodedriver`, `hl_dotnetdriver` and `hl_javadriver` spawn one child at boot and keep it: the child sits in a read on a pipe from the driver, gets each call as length-prefixed code, runs it and writes back its status.  The children also take a `Call` (a function name and input) and write back its result, and send each host function call up the same pipe for the driver to make; [`hl_child.h`](../drivers/hl_child.h) has the protocol.  Kept across calls it stays warm, and a snapshot keeps it warm.  The Java child runs each call through JShell in its JVM, and since `System.getenv()` is a copy Java has no way to change, writes the host's variables into that copy.  JShell keeps a record of every snippet: a declaration (a field, method or class) about 50 KiB of heap, which stays for the calls that use it, and each call about 15 KiB more once the statements it ran are dropped, which also slows the next calls a little.  An expression's value is freed once the call ends; a variable declared again keeps its old value, which code still running may read, so set a large one to `null` first.  A guest that serves thousands of `run` calls should be restored from its snapshot now and then; guest function calls add nothing.  `hl_bashdriver` does the same with a BusyBox `hush`, except that the call goes into a file and the byte on the pipe says "source it".  Such a child can only be reached through the source it is fed, hence the quoted assignments in front of each call.
 
 `hl_pwshdriver` starts a fresh `pwsh` per call, and `hl_execdriver`, behind the c, go, rust and dotnet-aot images, simply runs the program the call names, seeing its exit as EOF on a pipe.  A process spawned per call inherits `environ`, so `setenv()` alone reaches it.
 

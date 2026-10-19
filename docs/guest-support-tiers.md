@@ -39,7 +39,7 @@ A tier 2 runtime boots, runs guest code, and has integration tests covering the 
 - **Integration tests** covering inline and/or file execution, a snapshot round-trip, and the applicable capability surface — filesystem, networking, concurrency, stdin, environment variables — for the capabilities that apply to the runtime. (A shell runtime has no networking or threads; the Python-based runtimes inherit the tier-1 Python suite.) Failures block release.
 - **Example script** in `examples/<runtime>/`.
 
-**Current tier 2 runtimes:** Node.js, .NET (JIT and AOT), Bash (BusyBox), Agent, Python-Shell
+**Current tier 2 runtimes:** Node.js, .NET (JIT and AOT), Java, Bash (BusyBox), Agent, Python-Shell
 
 ## Tier 3 — Builds and smoke-tested
 
@@ -51,7 +51,7 @@ A tier 3 runtime has a Dockerfile that produces a rootfs and a small **smoke tes
 - **Smoke test** covering boot + execution and a snapshot round-trip (e.g. `tests/compiled.rs`, `tests/powershell.rs`).
 - **Example script** in `examples/<runtime>/` (recommended but not required).
 
-**Current tier 3 runtimes:** C, Rust, Go, PowerShell
+**Current tier 3 runtimes:** C, Rust, Go, PowerShell, QuickJS, Wasmtime
 
 ## Promotion and Demotion
 

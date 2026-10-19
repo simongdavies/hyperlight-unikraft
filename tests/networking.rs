@@ -6,7 +6,7 @@ use common::{UNUSED_PORT, host_ip, net_probe, require_rootfs};
 use hyperlight_unikraft::{AllowList, BlockList, NetworkPolicy, SandboxBuilder};
 
 /// Networking disabled by default — guest socket calls fail because
-/// net_* host functions aren't registered at all.
+/// every socket() is refused with EACCES, as a policy refuses a destination.
 #[test]
 fn net_policy_disabled_by_default() {
     let rootfs = require_rootfs("python");
@@ -14,15 +14,76 @@ fn net_policy_disabled_by_default() {
         .scratch_mb(256)
         .boot()
         .unwrap();
-    // socket() calls the net_socket host function which isn't registered,
-    // causing the guest to abort — run() returns an error.
-    let result = sandbox.run(
-        "import socket; s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); print('SOCKET_OK')",
-    );
+    sandbox.run(SOCKET_PROBE).unwrap();
     let output = sandbox.drain_output();
     assert!(
-        result.is_err() || !output.contains("SOCKET_OK"),
-        "expected socket creation to fail when networking is disabled, got result={result:?}, output={output:?}",
+        output.contains("socket: errno 13"),
+        "expected socket creation to fail with EACCES when networking is disabled, got: {output:?}",
+    );
+}
+
+/// Prints whether a socket can be made, and its errno when it cannot.
+const SOCKET_PROBE: &str = r#"
+import socket
+try:
+    socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    print('socket: ok')
+except OSError as e:
+    print('socket: errno', e.errno)
+"#;
+
+/// The net_* host functions exist on every path, so a snapshot saved under
+/// a policy restores without one: the restore is accepted and the guest
+/// simply has no network.
+#[test]
+fn snapshot_under_a_policy_restores_without_one() {
+    let dir = common::temp_dir("net-then-none");
+    let snap = dir.path().join("snap");
+    let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("python"))
+        .scratch_mb(256)
+        .network(NetworkPolicy::AllowAll)
+        .boot()
+        .unwrap();
+    sandbox.run(SOCKET_PROBE).unwrap();
+    assert!(sandbox.drain_output().contains("socket: ok"));
+    sandbox.snapshot_to(&snap).unwrap();
+    drop(sandbox);
+
+    let mut sandbox = SandboxBuilder::from_snapshot_dir(&snap)
+        .unwrap()
+        .boot()
+        .unwrap();
+    sandbox.run(SOCKET_PROBE).unwrap();
+    let output = sandbox.drain_output();
+    assert!(
+        output.contains("socket: errno 13"),
+        "expected no network after a restore without a policy, got: {output:?}",
+    );
+}
+
+/// And the other way round: a warm snapshot saved without a policy gets
+/// the network the restore names.
+#[test]
+fn snapshot_without_a_policy_restores_under_one() {
+    let dir = common::temp_dir("none-then-net");
+    let snap = dir.path().join("snap");
+    let mut sandbox = SandboxBuilder::from_initrd(require_rootfs("python"))
+        .scratch_mb(256)
+        .boot()
+        .unwrap();
+    sandbox.snapshot_to(&snap).unwrap();
+    drop(sandbox);
+
+    let mut sandbox = SandboxBuilder::from_snapshot_dir(&snap)
+        .unwrap()
+        .network(NetworkPolicy::AllowAll)
+        .boot()
+        .unwrap();
+    sandbox.run(SOCKET_PROBE).unwrap();
+    let output = sandbox.drain_output();
+    assert!(
+        output.contains("socket: ok"),
+        "expected the network given at restore, got: {output:?}",
     );
 }
 
@@ -216,4 +277,75 @@ fn net_policy_blocklist_by_name_end_to_end() {
     assert!(out.contains("blocked name failed"), "{out:?}");
     assert!(out.contains("blocked address refused"), "{out:?}");
     assert!(out.contains("other address connected"), "{out:?}");
+}
+
+/// glibc's getaddrinfo() sorts a dual-stack answer by probing every
+/// candidate through one IPv6 UDP socket, disconnecting it with an
+/// AF_UNSPEC connect in between.  A passive lookup, what `http.server`
+/// does to bind, is the shortest path to that: it must not abort the guest.
+#[test]
+fn net_getaddrinfo_dual_stack_passive() {
+    let rootfs = require_rootfs("python");
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
+        .scratch_mb(256)
+        .network(NetworkPolicy::AllowAll)
+        .boot()
+        .unwrap();
+    let result = sandbox.run(
+        "import socket\n\
+         ai = socket.getaddrinfo(None, 8000, socket.AF_UNSPEC, socket.SOCK_STREAM, 0, socket.AI_PASSIVE)\n\
+         print('FAMILIES', sorted({a[0] for a in ai}))\n\
+         print('GAI_OK')",
+    );
+    let output = sandbox.drain_output();
+    assert!(
+        result.is_ok() && output.contains("GAI_OK"),
+        "expected the dual-stack passive lookup to succeed, got result={result:?}, output={output:?}",
+    );
+}
+
+/// A stream that arrives in two parts is read as fast as it arrives, with
+/// a socket timeout set (Python then polls before each read): the second
+/// part must wake the guest, not wait out the timeout.
+#[test]
+fn net_recv_wakes_for_data_after_a_short_read() {
+    use std::io::Write;
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    let rootfs = require_rootfs("python");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut conn, _) = listener.accept().unwrap();
+        conn.write_all(&[b'a'; 4096]).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        conn.write_all(&[b'b'; 4096]).unwrap();
+    });
+    let mut sandbox = SandboxBuilder::from_initrd(rootfs)
+        .scratch_mb(256)
+        .network(NetworkPolicy::AllowAll)
+        .boot()
+        .unwrap();
+    let code = format!(
+        "import socket, time\n\
+         s = socket.create_connection(('127.0.0.1', {port}), timeout=10)\n\
+         t, n = time.time(), 0\n\
+         while (b := s.recv(65536)):\n\
+         \x20   n += len(b)\n\
+         print('read', n, 'in', round(time.time() - t, 1))\n"
+    );
+    sandbox.run(code.as_str()).unwrap();
+    server.join().unwrap();
+    let output = sandbox.drain_output();
+    let secs: f64 = output
+        .trim()
+        .rsplit(' ')
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(f64::MAX);
+    assert!(
+        output.starts_with("read 8192 in") && secs < 5.0,
+        "expected both parts well before the 10 s timeout, got: {output:?}",
+    );
 }

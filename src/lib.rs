@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 pub use hyperlight_host;
 
 use hyperlight_host::{
-    GuestBinary, HyperlightError, MultiUseSandbox, UninitializedSandbox, func::Registerable,
+    GuestBinary, HyperlightError, Sandbox, UninitializedSandbox, func::Registerable,
     sandbox::SandboxConfiguration, sandbox::snapshot::OciTag,
 };
 
@@ -47,11 +47,13 @@ mod hostfs;
 mod hostnet;
 pub mod logical_broker;
 pub mod net_policy;
+mod profile;
 pub mod wasi_p3;
 pub mod wasi_preview2;
 pub mod workerd;
 
 pub use net_policy::{AllowList, BlockList, ListenPorts, NetworkPolicy, ResolveError};
+pub use profile::Profile;
 
 // ── Errors ──────────────────────────────────────────────────────────────
 
@@ -105,6 +107,25 @@ pub enum Error {
     /// kernel is not one of ours, or the entry failed.
     #[error("the guest halted without a word: its kernel reported neither a boundary nor an exit")]
     GuestSilent,
+    /// The snapshot in `dir` was saved by a build with another
+    /// [`SNAPSHOT_KEY`]: another kernel, or another host contract.
+    #[error(
+        "the snapshot in {} was saved by hyperlight-unikraft {saved_by}, whose kernel or host \
+         contract differs from this build's, {this}; save it again with this build (`hluk \
+         snapshot save`)",
+        dir.display()
+    )]
+    SnapshotRelease {
+        dir: PathBuf,
+        saved_by: String,
+        this: String,
+    },
+    /// More mounts, or longer entries, than the kernel takes.
+    #[error(
+        "a mount table of {mounts} mounts and {bytes} bytes of entries; the kernel takes at \
+         most {MOUNTS_MAX} mounts and {FSTAB_ENTRIES_MAX} bytes"
+    )]
+    MountTable { mounts: usize, bytes: usize },
     /// A guest mount path the kernel's fstab list would misparse: not
     /// absolute, or containing whitespace, `:` or brackets.
     #[error(
@@ -130,6 +151,15 @@ pub enum Error {
          kernel/initrd/entry/scratch_mb do not apply to from_snapshot"
     )]
     SnapshotSettings,
+    /// A name given to [`SandboxBuilder::host_function`] cannot be one:
+    /// empty (it asks for the list of functions) or with a line break
+    /// (the list has one name per line).
+    #[error("{name:?} cannot name a host function: it must be non-empty and on one line")]
+    HostFunctionName { name: String },
+    /// A call's result was not UTF-8 text; [`AppSandbox::take_result`]
+    /// hands it over as bytes.
+    #[error("the call's result is not UTF-8 text")]
+    ResultNotText,
     /// The script of an [`Exec::File`] could not be read.
     #[error("failed to read script {}: {source}", path.display())]
     Script {
@@ -154,10 +184,78 @@ pub enum Error {
 /// The result of a sandbox operation.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// A function the embedder offers the guest (see
+/// [`SandboxBuilder::host_function`]): its argument text in, its result
+/// text out, or an error message the guest raises as its own error.  The
+/// drivers speak JSON on both sides; the library passes the text through.
+pub type HostFunction =
+    Arc<dyn Fn(&str) -> std::result::Result<String, String> + Send + Sync + 'static>;
+
+/// The host functions a sandbox offers, by name.
+type HostFunctionTable = Arc<std::collections::BTreeMap<String, HostFunction>>;
+
+/// What `HostCall` answers: a tag byte, then the result or the error
+/// message.  The drivers read it back (`hl_driver.h`'s `hl_host_call`).
+const HOST_CALL_OK: u8 = 0;
+const HOST_CALL_ERR: u8 = 1;
+
+/// Run the host function `name` for the guest and encode its reply.  The
+/// empty name, which no function can have, lists the registered names one
+/// per line: how a driver learns what to offer before anything is called
+/// (the quickjs driver builds its `host:` modules from it).
+fn dispatch_host_call(table: &HostFunctionTable, name: &str, args: &[u8]) -> Vec<u8> {
+    // The name is the guest's: quoted in an error, it is cut short, so a
+    // long one cannot push the reply past what the guest can take.
+    let shown = || name.chars().take(128).collect::<String>();
+    let reply = if name.is_empty() {
+        Ok(table
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("\n"))
+    } else {
+        match (table.get(name), std::str::from_utf8(args)) {
+            (Some(f), Ok(args)) => f(args),
+            (Some(_), Err(_)) => Err(format!("{}: the arguments are not UTF-8 text", shown())),
+            (None, _) => Err(format!("no host function {:?}", shown())),
+        }
+    };
+    let (tag, text) = match reply {
+        Ok(text) => (HOST_CALL_OK, text),
+        Err(message) => (HOST_CALL_ERR, message),
+    };
+    // A reply the guest's buffer cannot take would be refused by the
+    // kernel, and the call fail with nothing to say why; it becomes an
+    // error the guest can report instead.
+    let (tag, text) = if text.len() + 1 > HOST_CALL_MAX {
+        (
+            HOST_CALL_ERR,
+            format!(
+                "{}: a {}-byte result exceeds the {HOST_CALL_MAX}-byte host call limit",
+                shown(),
+                text.len()
+            ),
+        )
+    } else {
+        (tag, text)
+    };
+    let mut out = Vec::with_capacity(text.len() + 1);
+    out.push(tag);
+    out.extend_from_slice(text.as_bytes());
+    out
+}
+
 // ── Constants ───────────────────────────────────────────────────────────
 
-/// Embedded Unikraft app-elfloader kernel binary.
+/// Embedded Unikraft app-elfloader kernel binary, built for the host's
+/// architecture: a guest runs on the host CPU.
+#[cfg(target_arch = "x86_64")]
 static KERNEL: &[u8] = include_bytes!("../kernel/elfloader_hyperlight-x86_64");
+#[cfg(target_arch = "aarch64")]
+static KERNEL: &[u8] = include_bytes!("../kernel/elfloader_hyperlight-arm64");
+
+/// Most bytes one GetRandomBytes answers: far more than a CSPRNG seed.
+const RANDOM_BYTES_MAX: u64 = 4096;
 
 /// Workerd kernel that loads a trusted static PIE directly from the mapped
 /// initrd, avoiding the CPIO-to-RAMFS executor copy.
@@ -166,36 +264,299 @@ static WORKERD_KERNEL: &[u8] = include_bytes!("../kernel/workerd_hyperlight-x86_
 /// GPA where the initrd is mapped via `map_file_cow`.
 ///
 /// Past the x86 LAPIC MMIO page (0xFEE0_0000) to avoid collisions
-/// with KVM's in-kernel IRQCHIP reservation.
+/// with KVM's in-kernel IRQCHIP reservation.  On arm64 nothing sits
+/// there; the address is aligned for HVF's 16 KiB pages and well inside
+/// its 36-bit guest physical space.
 const INITRD_MAP_BASE: u64 = 0xFEF0_0000;
 
-/// Default scratch memory budget in MiB.
+/// Scratch memory in MiB for a guest with no initrd to size from (a
+/// native kernel), and the fallback when the initrd cannot be read.  A
+/// guest booted from an initrd is sized by [`default_scratch_mb`].
 ///
-/// The frame allocator gets 75% of this; the rest covers CoW faults
-/// and boot overhead.  Override with `--scratch-mb` for large rootfs
-/// images (e.g. Node's 100 MiB binary needs ~512 MiB).
+/// The frame allocator gets 75% of the scratch; the rest covers CoW
+/// faults and boot overhead.
 pub const DEFAULT_SCRATCH_MB: usize = 256;
 
-/// Largest payload of one host call, in either direction.
-///
-/// The host decides this alone: it sizes the PEB I/O stacks
-/// ([`IO_STACK_SIZE`]) and the guest sizes every transfer buffer from
-/// the stack sizes it reads back out of the PEB
-/// (`hl_hcall_max_payload()` in `plat/hyperlight/hcall.c`: the smaller
-/// stack less a 4 KiB reserve for the FlatBuffer framing).  So a guest
-/// never asks for, or sends, more than this, and the host functions
-/// here only cap what they hand back (`net_recvfrom`) as a courtesy to
-/// a guest that asks for more.
-pub(crate) const HOST_CALL_MAX: usize = 64 * 1024;
+/// Guest memory per runtime image, in MiB: the sizes the repository's
+/// tests and benchmarks run each published image with (the justfile's
+/// `scratch_*`).  A rootfs is unpacked into this memory, so an image that
+/// has grown past what these leave free needs more, and `hluk` says so.
+pub const RUNTIME_SCRATCH_MB: &[(&str, usize)] = &[
+    ("c", 64),
+    ("rust", 64),
+    ("quickjs", 64),
+    ("go", 128),
+    ("bash", 256),
+    ("python", 256),
+    ("python-shell", 256),
+    ("wasmtime", 256),
+    ("dotnet-aot", 256),
+    ("node", 512),
+    ("java", 512),
+    ("dotnet-jit", 768),
+    ("powershell", 1024),
+    ("agent", 1536),
+];
 
-/// PEB I/O stack size for host-call data transfer.
-///
-/// Both the input stack (host→guest results) and output stack
-/// (guest→host calls) must hold a FlatBuffer-encoded message carrying
-/// a [`HOST_CALL_MAX`] payload plus its framing, the same 4 KiB reserve
-/// the guest subtracts.  Default Hyperlight stacks are only 16 KiB —
-/// too small for large file or network transfers.
-const IO_STACK_SIZE: usize = HOST_CALL_MAX + 4096;
+/// The runtime image a driver binary belongs to, for an initrd that is
+/// only a file.  The two Python variants share a driver and resolve to the
+/// smaller; the `agent` image is known by name (see
+/// [`runtime_scratch_mb`]).
+const DRIVER_RUNTIME: &[(&str, &str)] = &[
+    ("hl_pydriver", "python"),
+    ("hl_pywarmdriver", "python-shell"),
+    ("hl_nodedriver", "node"),
+    ("hl_dotnetdriver", "dotnet-jit"),
+    ("hl_javadriver", "java"),
+    ("hl_pwshdriver", "powershell"),
+    ("hl_quickjsdriver", "quickjs"),
+    ("hl_wasmtimedriver", "wasmtime"),
+    ("hl_bashdriver", "bash"),
+    ("hl_godriver", "go"),
+    ("hl_cdriver", "c"),
+    ("hl_rustdriver", "rust"),
+    ("hl_dotnetaotdriver", "dotnet-aot"),
+];
+
+/// The tested memory for a runtime image, by name (`python`, `node`,
+/// `agent`, …): [`RUNTIME_SCRATCH_MB`].
+pub fn runtime_scratch_mb(runtime: &str) -> Option<usize> {
+    RUNTIME_SCRATCH_MB
+        .iter()
+        .find(|(name, _)| *name == runtime)
+        .map(|(_, mb)| *mb)
+}
+
+/// The scratch memory a guest booted from `initrd` gets when none is asked
+/// for: the runtime named in `etc/hluk-runtime` if the image carries one,
+/// else the tested size of the runtime image its driver belongs to
+/// ([`RUNTIME_SCRATCH_MB`]), else [`DEFAULT_SCRATCH_MB`].
+/// [`SandboxBuilder::boot`] uses it when
+/// [`scratch_mb`](SandboxBuilder::scratch_mb) was not called.
+pub fn default_scratch_mb(initrd: &Path) -> usize {
+    let scan = scan_cpio(initrd);
+    // A runtime marker takes priority: images that share a driver binary
+    // (agent and python-shell both use hl_pywarmdriver) write it so the
+    // right scratch size is chosen without --scratch-mb.
+    if let Some(mb) = scan.runtime.as_deref().and_then(runtime_scratch_mb) {
+        return mb;
+    }
+    scan.entry
+        .as_deref()
+        .and_then(|p| p.rsplit('/').next())
+        .and_then(driver_scratch_mb)
+        .unwrap_or(DEFAULT_SCRATCH_MB)
+}
+
+/// Whether `name` is the file name of one of the runtime drivers
+/// (`hl_pydriver`, …), each of which takes the host's environment again
+/// before every call.
+pub fn is_runtime_driver(name: &str) -> bool {
+    DRIVER_RUNTIME.iter().any(|(d, _)| *d == name)
+}
+
+/// [`default_scratch_mb`] from the driver's file name.
+fn driver_scratch_mb(driver: &str) -> Option<usize> {
+    DRIVER_RUNTIME
+        .iter()
+        .find(|(d, _)| *d == driver)
+        .and_then(|(_, runtime)| runtime_scratch_mb(runtime))
+}
+
+#[cfg(test)]
+mod scratch_tests {
+    use super::*;
+
+    #[test]
+    fn every_driver_maps_to_a_tested_size() {
+        for (driver, runtime) in DRIVER_RUNTIME {
+            assert!(
+                runtime_scratch_mb(runtime).is_some(),
+                "{driver}: {runtime} is not in RUNTIME_SCRATCH_MB"
+            );
+        }
+        assert_eq!(runtime_scratch_mb("python"), Some(256));
+        assert_eq!(runtime_scratch_mb("agent"), Some(1536));
+        assert_eq!(runtime_scratch_mb("cobol"), None);
+        assert_eq!(driver_scratch_mb("hl_nodedriver"), Some(512));
+        assert_eq!(
+            driver_scratch_mb("hl_pywarmdriver"),
+            Some(256),
+            "the shared Python driver resolves to the smaller image"
+        );
+        assert_eq!(driver_scratch_mb("hl_execdriver"), None);
+        assert!(is_runtime_driver("hl_pywarmdriver"));
+        assert!(!is_runtime_driver("hl_server"));
+    }
+
+    #[test]
+    fn an_unreadable_initrd_gets_the_flat_default() {
+        assert_eq!(
+            default_scratch_mb(Path::new("/nonexistent/rootfs.cpio")),
+            DEFAULT_SCRATCH_MB
+        );
+    }
+}
+
+/// Guest page size, the unit the virtqueue pools are sized in.
+const PAGE_SIZE: usize = hyperlight_common::vmem::PAGE_SIZE;
+
+/// What the guest keeps back from each half of the G2H pool: the
+/// message header, and a 4 KiB reserve for the FlatBuffer framing
+/// (`HL_HCALL_FRAMING` in `plat/hyperlight/hcall.c`).
+const MSG_OVERHEAD: usize = hyperlight_common::transport::MsgHeader::SIZE + 4096;
+
+/// Pages in each half of the guest-to-host pool.  The guest splits the
+/// pool in two, a host call's request and its reply, and each half
+/// carries a 64 KiB payload (a file or socket transfer) plus
+/// [`MSG_OVERHEAD`].  Hyperlight's default pool (12 pages) is too small
+/// for that.
+const G2H_HALF_PAGES: usize = (64 * 1024 + MSG_OVERHEAD).div_ceil(PAGE_SIZE);
+const G2H_POOL_PAGES: usize = 2 * G2H_HALF_PAGES;
+
+/// Largest payload of one host call, in either direction: exactly what
+/// the guest computes from the pool geometry (`hl_hcall_max_payload()`
+/// in `plat/hyperlight/hcall.c`), 69,620 bytes.  The host decides it
+/// alone, through the pool sizes, and the guest sizes every transfer
+/// buffer from it.  So a guest never sends more than this, and the host
+/// functions that hand back data (`fs_*` reads and listings,
+/// `net_recvfrom`, `HostCall` results) keep their whole reply within it,
+/// data and what comes with it; the kernel refuses a larger result rather
+/// than cut it short.
+pub(crate) const HOST_CALL_MAX: usize = G2H_HALF_PAGES * PAGE_SIZE - MSG_OVERHEAD;
+
+/// Pages of the host-to-guest pool, cut into receive buffers of
+/// Hyperlight's default size.  A guest function call can be as large as
+/// a host call's whole message (the kernel sizes `/dev/hlcall` buffers,
+/// which also take host call replies, from it), so it gets as many pages
+/// as a G2H half.
+const H2G_POOL_PAGES: usize = G2H_HALF_PAGES;
+
+// Hyperlight keeps one H2G buffer spare for a call with byte parameters;
+// hluk's guest functions (`step`, `Exec`, `Call`, ...) take strings and
+// integers only, and the kernel serves no other, so every buffer is the
+// call's.
+const _: () = {
+    assert!(HOST_CALL_MAX >= 64 * 1024);
+    // The guest posts min(queue size, pool / buffer size) receive
+    // buffers: the default queue must post all of them, or a call the
+    // size of a G2H half would not fit.
+    let buffers = H2G_POOL_PAGES * PAGE_SIZE / SandboxConfiguration::DEFAULT_H2G_BUFFER_SIZE;
+    assert!(buffers <= SandboxConfiguration::DEFAULT_H2G_QUEUE_SIZE);
+    assert!(buffers * SandboxConfiguration::DEFAULT_H2G_BUFFER_SIZE >= G2H_HALF_PAGES * PAGE_SIZE);
+};
+
+/// Size the virtqueue pools for [`HOST_CALL_MAX`] transfers.  The other
+/// knobs keep Hyperlight's defaults: this guest copies every message out
+/// of the pools, so buffer sizes and queue depths change nothing it
+/// measures (see the transport notes in `docs/`).
+fn apply_transport(cfg: &mut SandboxConfiguration) {
+    cfg.set_g2h_pool_pages(G2H_POOL_PAGES);
+    cfg.set_h2g_pool_pages(H2G_POOL_PAGES);
+}
+
+/// A decoder for one stream of guest console output.  The guest sends
+/// bytes; a character split between two writes is held back until its end
+/// arrives, across drains (a program may print half of one in one step and
+/// the rest in the next), or the guest ends; bytes that are not UTF-8 read
+/// as U+FFFD.
+#[derive(Default)]
+struct GuestOutput {
+    /// The start of a character whose end is still to come.
+    partial: Vec<u8>,
+}
+
+impl GuestOutput {
+    /// Take `bytes` in; returns the text they completed.
+    fn push(&mut self, bytes: &[u8]) -> String {
+        let mut text = String::new();
+        self.join(bytes, &mut text);
+        text
+    }
+
+    /// [`push`](Self::push), for a write the caller owns: with nothing held
+    /// and bytes that are UTF-8, perhaps but for a character cut short at
+    /// the end (most writes), the text is the bytes themselves, not a copy.
+    fn push_owned(&mut self, bytes: Vec<u8>) -> String {
+        if !self.partial.is_empty() {
+            return self.push(&bytes);
+        }
+        match String::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(e) if e.utf8_error().error_len().is_none() => {
+                let valid = e.utf8_error().valid_up_to();
+                let mut bytes = e.into_bytes();
+                self.partial = bytes.split_off(valid);
+                // `valid_up_to` bytes are UTF-8: this never falls back.
+                String::from_utf8(bytes).unwrap_or_default()
+            }
+            Err(e) => self.push(e.as_bytes()),
+        }
+    }
+
+    /// End the output: a character still cut short reads as U+FFFD.
+    /// Returns the text that adds.
+    fn finish(&mut self) -> String {
+        if self.partial.is_empty() {
+            return String::new();
+        }
+        self.partial.clear();
+        char::REPLACEMENT_CHARACTER.to_string()
+    }
+
+    fn join(&mut self, mut bytes: &[u8], text: &mut String) {
+        // Finish a character cut short by the last write with the few
+        // bytes it lacks; the rest is decoded where it lies.  The joined
+        // bytes can leave a new character cut short (the held one was
+        // not continued, and what follows starts another), so this goes
+        // on until nothing is held or the write is used up.
+        while let Some(&lead) = self.partial.first() {
+            if bytes.is_empty() {
+                return;
+            }
+            let width: usize = match lead {
+                0xf0.. => 4,
+                0xe0.. => 3,
+                _ => 2,
+            };
+            let take = width
+                .saturating_sub(self.partial.len())
+                .clamp(1, bytes.len());
+            self.partial.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+            let joined = std::mem::take(&mut self.partial);
+            self.decode(&joined, text);
+        }
+        self.decode(bytes, text);
+    }
+
+    fn decode(&mut self, mut rest: &[u8], text: &mut String) {
+        loop {
+            match std::str::from_utf8(rest) {
+                Ok(s) => {
+                    text.push_str(s);
+                    return;
+                }
+                Err(e) => {
+                    let (valid, after) = rest.split_at(e.valid_up_to());
+                    // `valid_up_to` bytes are UTF-8: this never falls back.
+                    text.push_str(std::str::from_utf8(valid).unwrap_or_default());
+                    match e.error_len() {
+                        Some(bad) => {
+                            text.push(char::REPLACEMENT_CHARACTER);
+                            rest = &after[bad..];
+                        }
+                        // Cut short: keep it for the next write.
+                        None => {
+                            self.partial.extend_from_slice(after);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 
 /// PEB heap size.
 ///
@@ -204,25 +565,54 @@ const IO_STACK_SIZE: usize = HOST_CALL_MAX + 4096;
 /// scratch instead.
 const HEAP_SIZE: u64 = 0x10_0000; // 1 MiB
 
-/// The name a snapshot is saved under in its directory: this crate's
-/// version.  A snapshot is only good for the release that wrote it -- the
-/// host functions and their behaviour move with the release -- so a load
-/// by another version fails, and the error names the versions the
-/// directory holds.  (The version must stay a valid OCI tag: no `+build`
-/// metadata; the unit test below keeps that honest.)
+/// What a snapshot depends on, as a tag suffix `k<kernel>-c<contract>`:
+/// the embedded kernel's SHA-256 (its first 16 hex digits; the kernel's
+/// code and host-call protocol are in the snapshot's memory) and the host
+/// contract number kept in `build.rs` (the host functions and their
+/// meaning, the pool sizes, the layout, the MSRs, the hyperlight-host
+/// release).  A snapshot loads under any release with the same key, so a
+/// release that changes neither keeps every saved snapshot.  (Hyperlight
+/// versions its own snapshot format besides, and refuses one it cannot
+/// read.)
+pub const SNAPSHOT_KEY: &str = env!("HLUK_SNAPSHOT_KEY");
+
+/// The name a snapshot is saved under in its directory: this release and
+/// its [`SNAPSHOT_KEY`], `<release>-<key>`.  A load matches the key
+/// ([`load_snapshot`]); the release is for the message when none does.
+/// (Both must stay valid in an OCI tag: no `+build` metadata; the unit
+/// test below keeps that honest.)
 fn snapshot_tag() -> OciTag {
-    env!("CARGO_PKG_VERSION")
+    format!("{}-{SNAPSHOT_KEY}", env!("CARGO_PKG_VERSION"))
         .parse()
-        .expect("the crate version is a valid OCI tag")
+        .expect("the crate version and the snapshot key make a valid OCI tag")
+}
+
+/// The key of a snapshot tag, `<release>-<key>`, or `None` for a tag of
+/// another shape (a snapshot from before keys was tagged by release alone).
+fn snapshot_tag_key(tag: &str) -> Option<&str> {
+    let at = tag.rfind("-k")?;
+    let key = &tag[at + 1..];
+    let (kernel, contract) = key[1..].split_once("-c")?;
+    let hex = kernel.len() == 16 && kernel.bytes().all(|b| b.is_ascii_hexdigit());
+    (hex && !contract.is_empty() && contract.bytes().all(|b| b.is_ascii_digit())).then_some(key)
+}
+
+/// A snapshot tag as a message names it: `0.14.1 (k…-c1)`, or the tag
+/// itself when it carries no key.
+fn describe_snapshot_tag(tag: &str) -> String {
+    match snapshot_tag_key(tag) {
+        Some(key) => format!("{} ({key})", &tag[..tag.len() - key.len() - 1]),
+        None => tag.to_string(),
+    }
 }
 
 /// Write a snapshot from [`AppSandbox::snapshot`] to `dir` as an OCI image
-/// layout, named by this crate's version.  Another process, or a later run
-/// of this one, reads it back with [`load_snapshot`],
-/// [`SandboxBuilder::from_snapshot_dir`] or [`AppSandbox::restore_from`];
-/// only this version of the crate can, since the host side a snapshot
-/// depends on moves with the release.  [`AppSandbox::snapshot_to`] does
-/// both steps in one.
+/// layout, named by this release and its [`SNAPSHOT_KEY`].  Another
+/// process, or a later run of this one, reads it back with
+/// [`load_snapshot`], [`SandboxBuilder::from_snapshot_dir`] or
+/// [`AppSandbox::restore_from`]; any build with the same key can, since
+/// the key is the kernel and the host contract a snapshot depends on.
+/// [`AppSandbox::snapshot_to`] does both steps in one.
 pub fn save_snapshot(snapshot: &Snapshot, dir: impl AsRef<Path>) -> Result<()> {
     let digest = snapshot.save(dir.as_ref(), &snapshot_tag())?;
     debug!(dir = %dir.as_ref().display(), %digest, "snapshot saved");
@@ -231,14 +621,59 @@ pub fn save_snapshot(snapshot: &Snapshot, dir: impl AsRef<Path>) -> Result<()> {
 
 /// Read a snapshot written by [`save_snapshot`] back into memory, to boot
 /// ([`SandboxBuilder::from_snapshot`]) or restore ([`AppSandbox::restore`])
-/// any number of guests from one load.  The snapshot must come from this
-/// version of the crate; see [`save_snapshot`].
+/// any number of guests from one load.  The snapshot must have been saved
+/// with this build's [`SNAPSHOT_KEY`]; see [`save_snapshot`].
 pub fn load_snapshot(dir: impl AsRef<Path>) -> Result<Arc<Snapshot>> {
-    Ok(Arc::new(Snapshot::load(dir.as_ref(), snapshot_tag())?))
+    let dir = dir.as_ref();
+    // The index names every save by release and key.  Load the one with
+    // this build's key, whichever release saved it; otherwise say which
+    // releases did, and what to do.  With no index to read, the layout
+    // code reports that.
+    let tag = match snapshot_tags(dir) {
+        Some(tags) => match tags
+            .iter()
+            .find(|t| snapshot_tag_key(t) == Some(SNAPSHOT_KEY))
+        {
+            Some(tag) => tag.parse::<OciTag>().map_err(|e| {
+                Error::Hyperlight(hyperlight_host::new_error!("snapshot tag {:?}: {}", tag, e))
+            })?,
+            None => {
+                return Err(Error::SnapshotRelease {
+                    dir: dir.to_path_buf(),
+                    saved_by: if tags.is_empty() {
+                        "an unknown release".to_string()
+                    } else {
+                        tags.iter()
+                            .map(|t| describe_snapshot_tag(t))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    },
+                    this: format!("{} ({SNAPSHOT_KEY})", env!("CARGO_PKG_VERSION")),
+                });
+            }
+        },
+        None => snapshot_tag(),
+    };
+    Ok(Arc::new(Snapshot::load(dir, tag)?))
+}
+
+/// The tags of the OCI index in `dir`, one per save.  `None` when there
+/// is no index to read, which [`Snapshot::load`] reports.
+fn snapshot_tags(dir: &Path) -> Option<Vec<String>> {
+    let index: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("index.json")).ok()?).ok()?;
+    Some(
+        index["manifests"]
+            .as_array()?
+            .iter()
+            .filter_map(|m| m["annotations"]["org.opencontainers.image.ref.name"].as_str())
+            .map(str::to_string)
+            .collect(),
+    )
 }
 
 /// MSRs the Unikraft guest reads/writes, which hyperlight 0.17.0's
-/// default-deny KVM MSR filter must permit.
+/// default-deny KVM MSR filter must permit (x86 only).
 ///
 /// From 0.17.0 the vCPU runs behind a KVM MSR filter that faults (#GP)
 /// on any guest rdmsr/wrmsr of an MSR the host has not declared.  The
@@ -249,6 +684,7 @@ pub fn load_snapshot(dir: impl AsRef<Path>) -> Result<Arc<Snapshot>> {
 /// [`SandboxBuilder::boot`]) must declare the SAME set: a snapshot persists exactly
 /// the declared MSRs and restore rejects any it cannot map back onto the
 /// restoring VM's declared set.
+#[cfg(target_arch = "x86_64")]
 const GUEST_MSRS: &[u32] = &[
     0x277,       // IA32_PAT   — page-attribute table (paging init)
     0xC000_0081, // IA32_STAR  — syscall CS/SS selectors
@@ -272,6 +708,30 @@ const GUEST_MSRS: &[u32] = &[
 /// and sleeps run fast or slow by the ratio; the resume entry should ask
 /// again and re-base the clock (the wall clock is already re-anchored
 /// there).
+/// Yield flags (plat/hyperlight/step.c): the call in flight started and is
+/// still running; it returned, with a status and a result.
+const YIELD_CALL_STARTED: i32 = 1;
+const YIELD_CALL_DONE: i32 = 2;
+
+/// A fresh environment version: the kernel answers a driver's GETENV
+/// from its copy while calls carry the version it fetched under.  Unique
+/// across processes in practice (seeded from the clock), so a snapshot
+/// taken by one never matches a version another hands out.
+fn next_env_version() -> u64 {
+    static NEXT: std::sync::OnceLock<std::sync::atomic::AtomicU64> = std::sync::OnceLock::new();
+    NEXT.get_or_init(|| std::sync::atomic::AtomicU64::new(wall_clock_ns() | 1))
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The host's wall clock, in ns since the Unix epoch (0 if it is set
+/// before it): GetWallClockNs's answer, and GetResumeState's.
+fn wall_clock_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
 fn host_tsc_hz() -> u64 {
     static HZ: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *HZ.get_or_init(|| {
@@ -313,10 +773,17 @@ fn host_tsc_hz() -> u64 {
 }
 
 /// Declare [`GUEST_MSRS`] on a sandbox configuration.
+#[cfg(target_arch = "x86_64")]
 fn apply_guest_msrs(cfg: &mut SandboxConfiguration) -> Result<()> {
     cfg.guest_msrs(GUEST_MSRS).map_err(|e| {
         Error::Hyperlight(hyperlight_host::new_error!("declaring guest MSRs: {}", e))
     })?;
+    Ok(())
+}
+
+/// arm64 has no MSRs to declare.
+#[cfg(not(target_arch = "x86_64"))]
+fn apply_guest_msrs(_cfg: &mut SandboxConfiguration) -> Result<()> {
     Ok(())
 }
 
@@ -476,6 +943,173 @@ struct Guest {
 
 // ── GuestConfig ─────────────────────────────────────────────────────────
 
+/// A guest output stream, and the host function that carries it.
+#[derive(Clone, Copy)]
+enum Stream {
+    Out = 0,
+    Err = 1,
+}
+
+impl Stream {
+    fn host_function(self) -> &'static str {
+        match self {
+            Stream::Out => "HostWrite",
+            Stream::Err => "HostWriteErr",
+        }
+    }
+}
+
+/// Guest output taken from a sandbox ([`AppSandbox::take_output`],
+/// [`AppSandbox::take_stderr`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CapturedOutput {
+    /// What was kept: everything the guest wrote since the last drain, or
+    /// its first bytes, up to [`SandboxBuilder::output_limit`], cut between
+    /// characters.
+    pub text: String,
+    /// How many bytes of text were left out: `text.len() + omitted` is all
+    /// the guest wrote since the last drain, as text (UTF-8, with a byte
+    /// that is not read as U+FFFD, three bytes); a character the guest has
+    /// only begun to write is in neither until it ends.
+    pub omitted: u64,
+}
+
+impl CapturedOutput {
+    /// Whether the limit left anything out.
+    pub fn truncated(&self) -> bool {
+        self.omitted > 0
+    }
+}
+
+/// What the write host functions keep of one stream until it is drained.
+#[derive(Default)]
+struct Capture {
+    text: String,
+    omitted: u64,
+}
+
+impl Capture {
+    /// Keep `msg`, or as much of it as fits in `limit` bytes, cut between
+    /// characters, and count the rest.  Once anything is left out, so is
+    /// everything after it until the next drain: what is kept is always the
+    /// beginning of the stream, never a beginning with holes.
+    fn push(&mut self, msg: &str, limit: usize) {
+        let mut keep = if self.omitted > 0 {
+            0
+        } else {
+            msg.len().min(limit.saturating_sub(self.text.len()))
+        };
+        while !msg.is_char_boundary(keep) {
+            keep -= 1;
+        }
+        if keep > 0 {
+            // Grown up to the limit and no further: doubling the capacity
+            // would allocate up to twice the limit.
+            let need = self.text.len() + keep;
+            if need > self.text.capacity() {
+                let want = need.max(self.text.capacity() * 2).min(limit);
+                self.text.reserve_exact(want - self.text.len());
+            }
+            self.text.push_str(&msg[..keep]);
+        }
+        self.omitted += (msg.len() - keep) as u64;
+    }
+
+    fn take(&mut self) -> CapturedOutput {
+        let Capture { text, omitted } = std::mem::take(self);
+        CapturedOutput { text, omitted }
+    }
+}
+
+/// The guest's output on the host: where the write host functions send it,
+/// and what they keep of it for the embedder ([`SandboxBuilder::output_limit`],
+/// [`SandboxBuilder::echo_output`]).
+struct Console {
+    /// Bytes each capture keeps between drains.
+    limit: usize,
+    /// Whether the output also goes to this process's stdout and stderr.
+    echo: bool,
+    /// Standard output and standard error, in the order written.
+    output: Mutex<Capture>,
+    /// Standard error alone.
+    stderr: Mutex<Capture>,
+    /// Each stream's decoder (standard output, standard error), so a
+    /// character one leaves cut short is not joined to the other's next
+    /// write.
+    decoders: Mutex<[GuestOutput; 2]>,
+}
+
+impl Console {
+    fn new(limit: usize, echo: bool) -> Self {
+        Self {
+            limit,
+            echo,
+            output: Mutex::default(),
+            stderr: Mutex::default(),
+            decoders: Mutex::default(),
+        }
+    }
+
+    /// Take `bytes` written to `stream` in; returns the text they completed.
+    fn decode(&self, stream: Stream, bytes: Vec<u8>) -> String {
+        self.decoders.lock().unwrap()[stream as usize].push_owned(bytes)
+    }
+
+    /// Echo `text`, written to `stream`, to this process's stdout or stderr,
+    /// flushed, unless echo is off.  `print!`/`eprint!`, which a test
+    /// harness captures and which panic on a failed write, so
+    /// `hluk run | head -1` ends when its reader does.
+    fn emit(&self, stream: Stream, text: &str) {
+        if !self.echo || text.is_empty() {
+            return;
+        }
+        match stream {
+            Stream::Out => {
+                use std::io::Write;
+                print!("{text}");
+                let _ = std::io::stdout().flush();
+            }
+            // Unbuffered: nothing to flush.
+            Stream::Err => eprint!("{text}"),
+        }
+    }
+
+    /// Keep `text`, written to `stream`, up to the limit: with the rest, and
+    /// on its own for standard error.
+    fn capture(&self, stream: Stream, text: &str) {
+        if let Stream::Err = stream {
+            self.stderr.lock().unwrap().push(text, self.limit);
+        }
+        self.output.lock().unwrap().push(text, self.limit);
+    }
+
+    /// End the output: a character either stream left cut short reads as
+    /// U+FFFD, echoed and captured like the rest.
+    fn finish(&self) {
+        for stream in [Stream::Out, Stream::Err] {
+            let text = self.decoders.lock().unwrap()[stream as usize].finish();
+            self.emit(stream, &text);
+            self.capture(stream, &text);
+        }
+    }
+
+    /// Drop a character cut short, on a restore: the bytes held may be the
+    /// discarded timeline's, and which they are is not known here, so a
+    /// character the snapshot's own timeline left cut short is dropped too
+    /// (its end, should the restored guest write it, reads as U+FFFD).
+    fn forget(&self) {
+        for decoder in self.decoders.lock().unwrap().iter_mut() {
+            decoder.partial.clear();
+        }
+    }
+}
+
+impl Default for Console {
+    fn default() -> Self {
+        Self::new(usize::MAX, true)
+    }
+}
+
 /// Runtime parameters for the guest's host functions.
 ///
 /// Built once during sandbox setup, then used to register identical
@@ -483,7 +1117,8 @@ struct Guest {
 ///
 /// The fields are internal — a caller receives a `GuestConfig` from
 /// [`SandboxBuilder::boot`] and interacts with it through the
-/// methods ([`set_env_vars`](Self::set_env_vars), [`drain_output`](Self::drain_output)).
+/// methods ([`set_env_vars`](Self::set_env_vars), [`take_stderr`](Self::take_stderr),
+/// [`drain_output`](Self::drain_output)).
 pub(crate) struct GuestConfig {
     cmdline: String,
     scratch_size: usize,
@@ -491,10 +1126,14 @@ pub(crate) struct GuestConfig {
     initrd_size: u64,
     /// Host filesystem mounts.
     mounts: Vec<Mount>,
-    /// Captured guest stdout — accumulated by the HostPrint callback.
-    output: Arc<Mutex<String>>,
+    /// The guest's output, captured by the HostWrite and HostWriteErr
+    /// callbacks.
+    console: Arc<Console>,
     /// NUL-separated KEY=VALUE pairs for guest env vars.
     env_str: Arc<Mutex<String>>,
+    /// The guest's `/etc/resolv.conf`, written by the kernel at boot and on
+    /// every restore; empty leaves the rootfs's own file in place.
+    resolv_conf: Arc<Mutex<String>>,
     /// Host networking state (`None` = networking disabled).  Shared with
     /// the `net_*` host functions; kept here for the inter-step wait of
     /// the cooperative step model.
@@ -502,8 +1141,21 @@ pub(crate) struct GuestConfig {
     /// Events from the guest's last entry, in order; shared with the event
     /// host functions, which push, and drained by [`absorb`](Self::absorb).
     events: Arc<Mutex<Vec<Event>>>,
+    /// What the call in flight returned (with `CallDone`), taken by
+    /// [`AppSandbox::take_result`]; cleared when a call is submitted.
+    result: Arc<Mutex<Option<Vec<u8>>>>,
+    /// The embedder's functions, served through `HostCall`.
+    host_functions: HostFunctionTable,
+    /// Whether to register `HostWriteErr`; off only to test a host
+    /// without it ([`SandboxBuilder::without_host_write_err`]).
+    host_write_err: bool,
     /// What those events add up to.
     guest: Mutex<Guest>,
+    /// Where this sandbox's time goes (off unless asked for).
+    profile: Arc<profile::Profile>,
+    /// The environment's version, sent with every call (see
+    /// [`next_env_version`]): new when it changes, and on every restore.
+    env_version: std::sync::atomic::AtomicU64,
     /// Optional bounded broker state, absent unless explicitly registered.
     broker_runtime: Option<broker_runtime::BrokerRuntime>,
 }
@@ -520,8 +1172,16 @@ impl GuestConfig {
         network: Option<NetworkPolicy>,
         listen_ports: Option<ListenPorts>,
     ) -> Self {
-        // Networking is opt-in: no policy, no `net_*` host functions and
-        // nothing for the inter-step wait to watch.
+        // Networking is opt-in: no policy, no host sockets and nothing for
+        // the inter-step wait to watch (the `net_*` functions still exist,
+        // refusing; see `register`).  Ports to listen on are an opt-in of
+        // their own, for inbound only: the guest may serve on them but
+        // reach nothing, as under an allow list that lists nothing.
+        let network = network.or_else(|| {
+            listen_ports
+                .as_ref()
+                .map(|_| NetworkPolicy::AllowList(AllowList::empty()))
+        });
         let net = network.map(|policy| Arc::new(hostnet::Net::new(policy, listen_ports)));
         Self {
             cmdline,
@@ -529,13 +1189,36 @@ impl GuestConfig {
             initrd_base,
             initrd_size,
             mounts,
-            output: Arc::new(Mutex::new(String::new())),
+            console: Arc::default(),
             env_str: Arc::new(Mutex::new(String::new())),
+            resolv_conf: Arc::new(Mutex::new(String::new())),
             net,
             events: Arc::new(Mutex::new(Vec::new())),
+            result: Arc::new(Mutex::new(None)),
+            host_functions: HostFunctionTable::default(),
+            host_write_err: true,
             guest: Mutex::new(Guest::default()),
+            profile: profile::Profile::new(),
+            env_version: std::sync::atomic::AtomicU64::new(next_env_version()),
             broker_runtime: None,
         }
+    }
+
+    /// The embedder's host functions; set before [`register`](Self::register).
+    fn with_host_functions(mut self, table: HostFunctionTable) -> Self {
+        self.host_functions = table;
+        self
+    }
+
+    fn with_host_write_err(mut self, on: bool) -> Self {
+        self.host_write_err = on;
+        self
+    }
+
+    /// Where the guest's output goes; set before [`register`](Self::register).
+    fn with_console(mut self, console: Console) -> Self {
+        self.console = Arc::new(console);
+        self
     }
 
     /// How much scratch memory to give the paging frame allocator (75%).
@@ -559,11 +1242,11 @@ impl GuestConfig {
     /// the host and calls `setenv()` for every returned variable.
     ///
     /// **Caveat — full replace, not merge**: This replaces the entire
-    /// env var set, not merging with the previous one.  Variables
-    /// removed from the host side will **not** be unset in the guest's
-    /// glibc `environ` — `hl_env_refresh()` only calls `setenv()`,
-    /// never `unsetenv()`.  Stale variables from earlier dispatches
-    /// linger in the guest until it is restored from a snapshot.
+    /// env var set, not merging with the previous one.  The Python
+    /// drivers unset a variable removed from the host side; the others'
+    /// `hl_env_refresh()` only calls `setenv()`, never `unsetenv()`, so
+    /// there stale variables from earlier dispatches linger until the
+    /// guest is restored from a snapshot.
     ///
     /// ```no_run
     /// # use hyperlight_unikraft::SandboxBuilder;
@@ -573,18 +1256,88 @@ impl GuestConfig {
     /// ```
     pub fn set_env_vars(&self, vars: &[(&str, &str)]) {
         let mut s = String::new();
-        for (k, v) in vars {
+        // A name given twice (a project's and a run's): the last wins, and
+        // the guest is told it once.
+        let last = |i: usize, k: &str| !vars[i + 1..].iter().any(|(later, _)| *later == k);
+        for (_, (k, v)) in vars.iter().enumerate().filter(|(i, (k, _))| last(*i, k)) {
             s.push_str(k);
             s.push('=');
             s.push_str(v);
             s.push('\0');
         }
         *self.env_str.lock().unwrap() = s;
+        self.env_version
+            .store(next_env_version(), std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Drain captured guest output, clearing the buffer.
+    fn env_version(&self) -> u64 {
+        self.env_version.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The resolver configuration the kernel writes as the guest's
+    /// `/etc/resolv.conf`: at boot, and again on every restore, so a
+    /// snapshot taken elsewhere resolves names where it now runs.  Empty
+    /// leaves the rootfs's own file in place.
+    ///
+    /// glibc's parallel A and AAAA queries do not work through the socket
+    /// layer, so `options single-request` is added unless the caller set
+    /// an options line of their own that has it.
+    fn set_resolv_conf(&self, content: &str) {
+        *self.resolv_conf.lock().unwrap() = with_single_request(content);
+    }
+
+    /// Take the captured guest output, clearing it and the standard-error
+    /// capture, so a caller that never drains standard error does not
+    /// grow it.
+    pub fn take_output(&self) -> CapturedOutput {
+        self.console.stderr.lock().unwrap().take();
+        self.console.output.lock().unwrap().take()
+    }
+
+    /// Take the captured guest standard error, clearing it.
+    pub fn take_stderr(&self) -> CapturedOutput {
+        self.console.stderr.lock().unwrap().take()
+    }
+
+    /// Drain captured guest output: [`take_output`](Self::take_output)'s
+    /// text.
     pub fn drain_output(&self) -> String {
-        self.output.lock().unwrap().split_off(0)
+        self.take_output().text
+    }
+
+    /// The write host function for `stream`: the guest's bytes, decoded as
+    /// they come (see [`GuestOutput`]), to the host's stdout or stderr,
+    /// flushed, unless echo is off, and captured up to the limit — standard
+    /// error both with the rest and on its own.  Bytes, not a string: what a
+    /// program writes need not be UTF-8, and a write can end inside a
+    /// character.  It uses `print!`/`eprint!`, which a test harness captures
+    /// and which panic on a failed write, so `hluk run | head -1` ends when
+    /// its reader does.  The guest is told all of its bytes were written,
+    /// kept or not.
+    fn write_host_function(
+        &self,
+        stream: Stream,
+    ) -> impl Fn(Vec<u8>) -> hyperlight_host::Result<i32> + Send + Sync + 'static {
+        let prof = self.profile.clone();
+        let console = self.console.clone();
+        let name = stream.host_function();
+        move |bytes: Vec<u8>| {
+            let _profile = prof.host(name);
+            // Captured after the echo, so a failed one (a closed pipe)
+            // leaves both captures as they were; the decoder has moved on.
+            let written = bytes.len() as i32;
+            let text = console.decode(stream, bytes);
+            console.emit(stream, &text);
+            console.capture(stream, &text);
+            Ok(written)
+        }
+    }
+
+    /// Register `stream`'s write host function, name and closure from the
+    /// one value so they cannot disagree.
+    fn register_write(&self, target: &mut impl Registerable, stream: Stream) -> Result<()> {
+        target.register_host_function(stream.host_function(), self.write_host_function(stream))?;
+        Ok(())
     }
 
     /// Register host functions on any [`Registerable`] target.
@@ -592,87 +1345,194 @@ impl GuestConfig {
     /// Works for both the init path (`UninitializedSandbox`) and the
     /// snapshot-restore path (`HostFunctions`).
     pub fn register(&self, target: &mut impl Registerable) -> Result<()> {
-        // Override Hyperlight's default HostPrint (which wraps output in
-        // green ANSI on stdout) — send guest output to stdout uncolored,
-        // and capture it for programmatic access.
-        let output = self.output.clone();
+        // Guest console output, uncolored (Hyperlight's own HostPrint wraps
+        // it in green ANSI), and captured for programmatic access.
+        self.register_write(target, Stream::Out)?;
+
+        // Hyperlight registers a HostPrint of its own, which this kernel
+        // does not call; one that another guest or driver might is taken as
+        // standard output, so it is captured and echoed like the rest
+        // rather than printed in green past `echo_output(false)`.
+        // Through the same decoder, so it lands in order with HostWrite
+        // (and is timed as HostWrite by `--profile`).
+        let write = self.write_host_function(Stream::Out);
         target.register_host_function(
             "HostPrint",
-            move |msg: String| -> hyperlight_host::Result<i32> {
-                use std::io::Write;
-                let len = msg.len() as i32;
-                print!("{msg}");
-                let _ = std::io::stdout().flush();
-                output.lock().unwrap().push_str(&msg);
-                Ok(len)
+            move |msg: String| -> hyperlight_host::Result<i32> { write(msg.into_bytes()) },
+        )?;
+
+        // Optional only so a test can stand in for a host without it, whose
+        // guest then sends standard error through HostWrite.
+        if self.host_write_err {
+            self.register_write(target, Stream::Err)?;
+        }
+
+        let cmdline = self.cmdline.clone();
+        let prof = self.profile.clone();
+        target.register_host_function(
+            "GetCmdLine",
+            move || -> hyperlight_host::Result<String> {
+                let _profile = prof.host("GetCmdLine");
+                Ok(cmdline.clone())
             },
         )?;
 
-        let cmdline = self.cmdline.clone();
-        target
-            .register_host_function("GetCmdLine", move || -> hyperlight_host::Result<String> {
-                Ok(cmdline.clone())
-            })?;
+        // The mount table this host serves.  A restored guest makes its own
+        // match on `resume`; a fresh guest boots with the same list from its
+        // cmdline.
+        let fstab = fstab_entries(&self.mounts)?;
+        let mounts = fstab.clone();
+        let prof = self.profile.clone();
+        target.register_host_function(
+            "GetMounts",
+            move || -> hyperlight_host::Result<String> {
+                let _profile = prof.host("GetMounts");
+                Ok(mounts.clone())
+            },
+        )?;
 
         let budget = self.paging_budget();
+        let prof = self.profile.clone();
         target.register_host_function(
             "GetPagingBudget",
-            move || -> hyperlight_host::Result<u64> { Ok(budget) },
+            move || -> hyperlight_host::Result<u64> {
+                let _profile = prof.host("GetPagingBudget");
+                Ok(budget)
+            },
         )?;
 
         let base = self.initrd_base;
-        target
-            .register_host_function("GetInitrdBase", move || -> hyperlight_host::Result<u64> {
+        let prof = self.profile.clone();
+        target.register_host_function(
+            "GetInitrdBase",
+            move || -> hyperlight_host::Result<u64> {
+                let _profile = prof.host("GetInitrdBase");
                 Ok(base)
-            })?;
+            },
+        )?;
 
         let size = self.initrd_size;
-        target
-            .register_host_function("GetInitrdSize", move || -> hyperlight_host::Result<u64> {
+        let prof = self.profile.clone();
+        target.register_host_function(
+            "GetInitrdSize",
+            move || -> hyperlight_host::Result<u64> {
+                let _profile = prof.host("GetInitrdSize");
                 Ok(size)
-            })?;
+            },
+        )?;
 
         let est = self.exn_stack_top();
-        target
-            .register_host_function("GetExnStackTop", move || -> hyperlight_host::Result<u64> {
+        let prof = self.profile.clone();
+        target.register_host_function(
+            "GetExnStackTop",
+            move || -> hyperlight_host::Result<u64> {
+                let _profile = prof.host("GetExnStackTop");
                 Ok(est)
-            })?;
+            },
+        )?;
 
-        target.register_host_function("GetWallClockNs", || -> hyperlight_host::Result<u64> {
-            Ok(std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0))
-        })?;
+        let prof = self.profile.clone();
+        target.register_host_function(
+            "GetWallClockNs",
+            move || -> hyperlight_host::Result<u64> {
+                let _profile = prof.host("GetWallClockNs");
+                Ok(wall_clock_ns())
+            },
+        )?;
 
         // The guest's clock is the TSC, whose frequency KVM does not tell
         // it (no CPUID.15H, no hypervisor leaf); without this it assumes
         // 2.5 GHz and its clock runs fast or slow by the difference.
-        target.register_host_function("GetTscHz", || -> hyperlight_host::Result<u64> {
+        let prof = self.profile.clone();
+        target.register_host_function("GetTscHz", move || -> hyperlight_host::Result<u64> {
+            let _profile = prof.host("GetTscHz");
             Ok(host_tsc_hz())
         })?;
 
-        target
-            .register_host_function("GetHostFsChunkSize", || -> hyperlight_host::Result<u64> {
+        // Entropy for the guest's CSPRNG where the CPU has no generator the
+        // kernel can use (arm64 without FEAT_RNG).  The guest asks at boot
+        // and again when it reseeds after a restore, so clones diverge.
+        let prof = self.profile.clone();
+        target.register_host_function(
+            "GetRandomBytes",
+            move |len: u64| -> hyperlight_host::Result<Vec<u8>> {
+                let _profile = prof.host("GetRandomBytes");
+                let mut buf = vec![0u8; len.min(RANDOM_BYTES_MAX) as usize];
+                getrandom::fill(&mut buf)
+                    .map_err(|e| hyperlight_host::new_error!("host entropy unavailable: {}", e))?;
+                Ok(buf)
+            },
+        )?;
+
+        let prof = self.profile.clone();
+        target.register_host_function(
+            "GetHostFsChunkSize",
+            move || -> hyperlight_host::Result<u64> {
+                let _profile = prof.host("GetHostFsChunkSize");
                 Ok(hostfs::CHUNK as u64)
-            })?;
+            },
+        )?;
 
         // ── Environment variables ─────────────────────────────────
         let env_str = self.env_str.clone();
-        target
-            .register_host_function("GetEnvVars", move || -> hyperlight_host::Result<String> {
+        let prof = self.profile.clone();
+        target.register_host_function(
+            "GetEnvVars",
+            move || -> hyperlight_host::Result<String> {
+                let _profile = prof.host("GetEnvVars");
                 Ok(env_str.lock().unwrap().clone())
-            })?;
+            },
+        )?;
+
+        // ── Resume state ──────────────────────────────────────────
+        // What a restored guest asks its new host for on `resume`, in one
+        // exit rather than three: the wall clock (u64 ns), then the mount
+        // table and the resolver configuration, each a u32 length and its
+        // bytes, as GetMounts and GetResolvConf answer them.
+        let mounts = fstab;
+        let resolv_conf = self.resolv_conf.clone();
+        let prof = self.profile.clone();
+        target.register_host_function(
+            "GetResumeState",
+            move || -> hyperlight_host::Result<Vec<u8>> {
+                let _profile = prof.host("GetResumeState");
+                // The same answers GetWallClockNs, GetMounts and
+                // GetResolvConf give, one exit for all three.
+                let resolv = resolv_conf.lock().unwrap();
+                let mut state = Vec::with_capacity(16 + mounts.len() + resolv.len());
+                state.extend_from_slice(&wall_clock_ns().to_le_bytes());
+                for part in [mounts.as_bytes(), resolv.as_bytes()] {
+                    state.extend_from_slice(&(part.len() as u32).to_le_bytes());
+                    state.extend_from_slice(part);
+                }
+                Ok(state)
+            },
+        )?;
+
+        // ── Resolver configuration ────────────────────────────────
+        let resolv_conf = self.resolv_conf.clone();
+        let prof = self.profile.clone();
+        target.register_host_function(
+            "GetResolvConf",
+            move || -> hyperlight_host::Result<String> {
+                let _profile = prof.host("GetResolvConf");
+                Ok(resolv_conf.lock().unwrap().clone())
+            },
+        )?;
 
         // ── Stdin ─────────────────────────────────────────────────
+        // Bytes, as stdin has them: a read can end inside a character, and
+        // what is piped in need not be text.
+        let prof = self.profile.clone();
         target.register_host_function(
             "ReadStdin",
-            move || -> hyperlight_host::Result<String> {
+            move || -> hyperlight_host::Result<Vec<u8>> {
+                let _profile = prof.host("ReadStdin");
                 use std::io::Read;
                 let mut data = vec![0u8; 4096];
                 let n = std::io::stdin().read(&mut data).unwrap_or(0);
                 data.truncate(n);
-                Ok(String::from_utf8_lossy(&data).into_owned())
+                Ok(data)
             },
         )?;
 
@@ -681,30 +1541,66 @@ impl GuestConfig {
         // They are only recorded here, in order; `absorb` reads them once
         // the entry has halted.
         let events = self.events.clone();
-        target.register_host_function("Yield", move |ns: u64| -> hyperlight_host::Result<i32> {
-            // Keep the absolute deadline so time the host spends elsewhere
-            // counts against it and the guest timer still fires on schedule.
-            let until = (ns != 0).then(|| Instant::now() + Duration::from_nanos(ns));
-            events
-                .lock()
-                .unwrap()
-                .push(Event::Outcome(Yield::Blocked { until }));
-            Ok(0)
-        })?;
+        let prof = self.profile.clone();
+        let result = self.result.clone();
+        target.register_host_function(
+            "Yield",
+            move |ns: u64,
+                  flags: i32,
+                  status: i32,
+                  bytes: Vec<u8>|
+                  -> hyperlight_host::Result<i32> {
+                let _profile = prof.host("Yield");
+                let mut events = events.lock().unwrap();
+                // What the entry saw of the call in flight rides on its
+                // Yield, so a call costs no exit of its own: still running,
+                // or returned with its status and result.
+                if flags & YIELD_CALL_STARTED != 0 {
+                    events.push(Event::CallStarted);
+                }
+                if flags & YIELD_CALL_DONE != 0 {
+                    if !bytes.is_empty() {
+                        *result.lock().unwrap() = Some(bytes);
+                    }
+                    events.push(Event::Outcome(if status == 0 {
+                        Yield::CallDone
+                    } else {
+                        Yield::CallFailed { status }
+                    }));
+                }
+                // Keep the absolute deadline so time the host spends elsewhere
+                // counts against it and the guest timer still fires on schedule.
+                let until = (ns != 0).then(|| Instant::now() + Duration::from_nanos(ns));
+                events.push(Event::Outcome(Yield::Blocked { until }));
+                Ok(0)
+            },
+        )?;
         let events = self.events.clone();
+        let prof = self.profile.clone();
         target.register_host_function("DriverReady", move || -> hyperlight_host::Result<i32> {
+            let _profile = prof.host("DriverReady");
             events.lock().unwrap().push(Event::DriverReady);
             Ok(0)
         })?;
         let events = self.events.clone();
+        let prof = self.profile.clone();
         target.register_host_function("CallStarted", move || -> hyperlight_host::Result<i32> {
+            let _profile = prof.host("CallStarted");
             events.lock().unwrap().push(Event::CallStarted);
             Ok(0)
         })?;
+        // The call returned: its status, and what it returned (empty:
+        // nothing), in one exit.
         let events = self.events.clone();
+        let result = self.result.clone();
+        let prof = self.profile.clone();
         target.register_host_function(
             "CallDone",
-            move |status: i32| -> hyperlight_host::Result<i32> {
+            move |status: i32, bytes: Vec<u8>| -> hyperlight_host::Result<i32> {
+                let _profile = prof.host("CallDone");
+                if !bytes.is_empty() {
+                    *result.lock().unwrap() = Some(bytes);
+                }
                 let done = if status == 0 {
                     Yield::CallDone
                 } else {
@@ -714,18 +1610,36 @@ impl GuestConfig {
                 Ok(0)
             },
         )?;
+        // The embedder's functions, all behind one name: the kernel
+        // forwards a driver's HLCALL_IOC_HOSTCALL here as it is.
+        let table = self.host_functions.clone();
+        let prof = self.profile.clone();
+        target.register_host_function(
+            "HostCall",
+            move |name: String, args: Vec<u8>| -> hyperlight_host::Result<Vec<u8>> {
+                let _profile = prof.host("HostCall");
+                Ok(dispatch_host_call(&table, &name, &args))
+            },
+        )?;
         let events = self.events.clone();
+        let prof = self.profile.clone();
         target.register_host_function(
             "CallRejected",
             move || -> hyperlight_host::Result<i32> {
+                let _profile = prof.host("CallRejected");
                 events.lock().unwrap().push(Event::CallRejected);
                 Ok(0)
             },
         )?;
         let events = self.events.clone();
+        let prof = self.profile.clone();
+        let console = self.console.clone();
         target.register_host_function(
             "Exited",
             move |status: i32| -> hyperlight_host::Result<i32> {
+                let _profile = prof.host("Exited");
+                // Nothing will finish a character the process left cut short.
+                console.finish();
                 events
                     .lock()
                     .unwrap()
@@ -734,16 +1648,16 @@ impl GuestConfig {
             },
         )?;
 
-        // The filesystem and networking host functions exist only when
-        // there is something for them to serve: no mounts, no `fs_*`; no
-        // policy, no `net_*`.  (A guest restored without the mounts its
-        // snapshot was saved with gets EIO on them, as the kernel treats
-        // a missing host function.)
-        if !self.mounts.is_empty() {
-            hostfs::register(target, &self.mounts)?;
-        }
-        if let Some(net) = &self.net {
-            hostnet::register(target, net)?;
+        // The `fs_*` and `net_*` functions are registered on every path, so
+        // a restore offers every host function the snapshot's guest can
+        // call.  Without a policy the network refuses every `socket()`, so
+        // a guest saved under one and restored without it has its sockets
+        // die on resume, and one saved without and restored under one gets
+        // to use the network.
+        hostfs::register(target, &self.mounts, &self.profile)?;
+        match &self.net {
+            Some(net) => hostnet::register(target, net, &self.profile)?,
+            None => hostnet::register(target, &Arc::new(hostnet::Net::disabled()), &self.profile)?,
         }
         Self::register_broker_host_functions(target, self.broker_runtime.as_ref())?;
 
@@ -803,14 +1717,23 @@ impl GuestConfig {
     /// One VM entry: call `name`, then read what the guest said during it.
     /// The guest runs its scheduler until every thread is blocked and
     /// halts; see [`absorb`](Self::absorb) for how the events reduce.
-    fn enter<Args>(&self, sandbox: &mut MultiUseSandbox, name: &str, args: Args) -> Result<Yield>
+    fn enter<Args>(&self, sandbox: &mut Sandbox, name: &str, args: Args) -> Result<Yield>
     where
         Args: hyperlight_host::func::ParameterTuple,
     {
         // An entry starts with an empty inbox: a previous one that failed
         // in the hypervisor may have left events behind.
         self.events.lock().unwrap().clear();
-        sandbox.call::<()>(name, args)?;
+        if let Err(e) = self.profile.entry(name, || sandbox.call::<()>(name, args)) {
+            // A guest stopped short (an abort, a crash, a cancel) poisons
+            // the sandbox: its timeline ends here, and a character it left
+            // cut short with it.  A call refused before the guest ran (too
+            // large for H2G, say) leaves it going, and the character too.
+            if sandbox.status().is_poisoned() {
+                self.console.finish();
+            }
+            return Err(e.into());
+        }
         let yielded = self.absorb()?;
         debug!(?yielded, name, "entry");
         Ok(yielded)
@@ -843,6 +1766,11 @@ impl GuestConfig {
                 }
                 Event::Outcome(done @ (Yield::CallDone | Yield::CallFailed { .. })) => {
                     guest.call_in_flight = false;
+                    // A failed call's result, should a driver send one, is
+                    // not the call's.
+                    if matches!(done, Yield::CallFailed { .. }) {
+                        *self.result.lock().unwrap() = None;
+                    }
                     terminal = Some(done);
                 }
                 Event::DriverReady => guest.has_driver = true,
@@ -861,7 +1789,14 @@ impl GuestConfig {
     /// follows has the guest say again what still holds.
     fn forget(&self) {
         self.events.lock().unwrap().clear();
+        // A result from the timeline the restore discarded is not this one's,
+        // nor is the start of a character it printed.
+        *self.result.lock().unwrap() = None;
+        self.console.forget();
         *self.guest.lock().unwrap() = Guest::default();
+        // The kernel's copy of the environment is the snapshot's.
+        self.env_version
+            .store(next_env_version(), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Whether anything can make the guest runnable again: a pending
@@ -915,16 +1850,47 @@ impl GuestConfig {
 /// Used internally by [`SandboxBuilder::boot`] to auto-detect the entry
 /// point so callers don't need to set one manually.
 fn find_cpio_entry(path: &Path) -> Option<String> {
+    scan_cpio(path).entry
+}
+
+/// The runtime driver a rootfs CPIO carries (`/usr/local/bin/hl_pydriver`,
+/// …), the guest's entry point when none is named; `None` for an image
+/// that runs a program of its own.
+pub fn driver_entry(initrd: &Path) -> Option<String> {
+    find_cpio_entry(initrd)
+}
+
+/// What a single pass over a CPIO archive found.
+#[derive(Default)]
+struct CpioScan {
+    /// The driver entry point (`/usr/local/bin/hl_pydriver`), if any.
+    entry: Option<String>,
+    /// The runtime name from `etc/hluk-runtime`, if the image carries
+    /// one.  Images that share a driver binary (the `agent` image and
+    /// `python-shell` both use `hl_pywarmdriver`) write this file so
+    /// [`default_scratch_mb`] sizes them correctly; without it, the
+    /// driver-based fallback applies and the scratch hint fires when
+    /// the rootfs outgrows that.
+    runtime: Option<String>,
+}
+
+/// Scan a CPIO archive in one pass for the driver entry point and an
+/// optional runtime marker file.
+fn scan_cpio(path: &Path) -> CpioScan {
+    scan_cpio_inner(path).unwrap_or_default()
+}
+
+fn scan_cpio_inner(path: &Path) -> Option<CpioScan> {
     let mut file = File::open(path).ok()?;
     let mut header = [0u8; 110];
+    let mut entry = None;
+    let mut runtime = None;
 
     loop {
         if file.read_exact(&mut header).is_err() {
             break;
         }
 
-        // Every newc CPIO entry starts with magic "070701" (or "070702"
-        // for CRC variant).  Anything else means corrupt or non-CPIO data.
         let magic = std::str::from_utf8(&header[0..6]).ok()?;
         if magic != "070701" && magic != "070702" {
             break;
@@ -937,26 +1903,49 @@ fn find_cpio_entry(path: &Path) -> Option<String> {
         file.read_exact(&mut name_buf).ok()?;
         let name = std::str::from_utf8(&name_buf).ok()?.trim_end_matches('\0');
 
-        // "TRAILER!!!" is the standard CPIO end-of-archive marker.
         if name == "TRAILER!!!" {
             break;
         }
 
-        // Pad past filename to 4-byte boundary (CPIO alignment rule)
         let name_padding = (4 - ((110 + namesize) % 4)) % 4;
         file.seek(SeekFrom::Current(name_padding as i64)).ok()?;
 
-        if name.starts_with("usr/local/bin/hl_") || name.starts_with("usr/bin/hl_") {
-            return Some(format!("/{name}"));
+        if entry.is_none()
+            && (name.starts_with("usr/local/bin/hl_") || name.starts_with("usr/bin/hl_"))
+        {
+            entry = Some(format!("/{name}"));
         }
 
-        // Skip file data + padding to 4-byte boundary
+        // A rootfs may carry its runtime name so scratch memory can be
+        // sized even when the driver binary is shared between images.
+        if runtime.is_none() && name == "etc/hluk-runtime" && filesize < 64 {
+            let mut buf = vec![0u8; filesize as usize];
+            if file.read_exact(&mut buf).is_ok() {
+                if let Ok(s) = std::str::from_utf8(&buf) {
+                    let s = s.trim();
+                    if !s.is_empty() {
+                        runtime = Some(s.to_string());
+                    }
+                }
+                let data_padding = (4 - (filesize % 4)) % 4;
+                file.seek(SeekFrom::Current(data_padding as i64)).ok()?;
+                if entry.is_some() {
+                    break;
+                }
+                continue;
+            }
+        }
+
         let data_padding = (4 - (filesize % 4)) % 4;
         file.seek(SeekFrom::Current((filesize + data_padding) as i64))
             .ok()?;
+
+        if entry.is_some() && runtime.is_some() {
+            break;
+        }
     }
 
-    None
+    Some(CpioScan { entry, runtime })
 }
 
 /// Resolve the entry point: explicit value → auto-detected from initrd → None.
@@ -975,45 +1964,65 @@ fn resolve_entry(entry: &Option<String>, initrd: &Option<PathBuf>) -> Option<Str
 
 // ── Public API ─────────────────────────────────────────────────────────
 
-/// The kernel's `vfs.fstab` parameter for `mounts` (empty for none): one
+/// Mounts the kernel takes: its resume-time reconcile keeps this many
+/// (`HOSTFS_RESUME_MOUNTS_MAX` in lib/hostfs).
+pub const MOUNTS_MAX: usize = 32;
+
+/// Bytes of `vfs.fstab` entries the kernel takes: its cmdline buffer holds
+/// 4 KiB, less the program name, the entry point and the parameter's own
+/// syntax; its resume-time list buffer is larger.
+pub const FSTAB_ENTRIES_MAX: usize = 3584;
+
+/// The guest's mount table for `mounts`, as `vfs.fstab` entries: one
 /// hostfs entry per mount, whose source-device field is the mount's index
 /// (hostfs routes host calls by it) and whose options make the mount
-/// point.  The list is unquoted: entries are separated by spaces and
-/// fields by colons, so a guest path holding either would be misparsed
-/// by the kernel; such a path is refused here, where the error can say
-/// why.
-fn fstab_arg(mounts: &[Mount]) -> Result<String> {
-    let mut arg = String::new();
-    for m in mounts {
+/// point.  A fresh guest reads them off its cmdline ([`fstab_arg`]); a
+/// restored guest fetches them through `GetMounts` on its `resume` entry.
+/// The list is unquoted: entries are separated by spaces and fields by
+/// colons, so a guest path holding either is refused here, where the
+/// error can say why.
+fn fstab_entries(mounts: &[Mount]) -> Result<String> {
+    let mut entries = String::new();
+    for (i, m) in mounts.iter().enumerate() {
         let unfit = |c: char| c.is_whitespace() || matches!(c, ':' | '[' | ']');
         if !m.guest_path.starts_with('/') || m.guest_path.contains(unfit) {
             return Err(Error::MountPath {
                 guest_path: m.guest_path.clone(),
             });
         }
-    }
-    if mounts.is_empty() {
-        return Ok(arg);
-    }
-    arg.push_str(" vfs.fstab=[");
-    for (i, m) in mounts.iter().enumerate() {
         if i > 0 {
-            arg.push(' ');
+            entries.push(' ');
         }
         // Format: sdev:path:drv:flags:opts:ukopts.  flags: MNT_RDONLY is
         // 0x1.  ukopts: mkmp creates the mount point if missing.  No
         // quotes: uk_libparam does not strip them.
         let flags = if m.readonly { "0x1" } else { "0x0" };
-        write!(arg, "{i}:{}:hostfs:{flags}::mkmp", m.guest_path).unwrap();
+        write!(entries, "{i}:{}:hostfs:{flags}::mkmp", m.guest_path).unwrap();
     }
-    arg.push(']');
-    Ok(arg)
+    if mounts.len() > MOUNTS_MAX || entries.len() > FSTAB_ENTRIES_MAX {
+        return Err(Error::MountTable {
+            mounts: mounts.len(),
+            bytes: entries.len(),
+        });
+    }
+    Ok(entries)
+}
+
+/// The kernel's `vfs.fstab` cmdline parameter for `mounts` (empty for
+/// none): [`fstab_entries`] in the brackets uk_libparam expects.
+fn fstab_arg(mounts: &[Mount]) -> Result<String> {
+    let entries = fstab_entries(mounts)?;
+    if entries.is_empty() {
+        return Ok(entries);
+    }
+    Ok(format!(" vfs.fstab=[{entries}]"))
 }
 
 /// Assemble the uninitialized sandbox and its [`GuestConfig`] from the
 /// pieces a [`SandboxBuilder`] gathered.  `kernel` is `None` for the
 /// embedded [`KERNEL`], `Some` for an external one; `initrd` is `None`
 /// for a self-contained kernel that carries its own workload.
+#[allow(clippy::too_many_arguments)]
 fn assemble_sandbox(
     kernel: &Option<PathBuf>,
     initrd: &Option<PathBuf>,
@@ -1022,6 +2031,9 @@ fn assemble_sandbox(
     mounts: Vec<Mount>,
     network: Option<NetworkPolicy>,
     listen_ports: Option<ListenPorts>,
+    host_functions: HostFunctionTable,
+    host_write_err: bool,
+    console: Console,
 ) -> Result<(UninitializedSandbox, GuestConfig)> {
     let guest_binary = match kernel {
         Some(path) => {
@@ -1038,6 +2050,9 @@ fn assemble_sandbox(
         mounts,
         network,
         listen_ports,
+        host_functions,
+        host_write_err,
+        console,
     )
 }
 
@@ -1058,9 +2073,16 @@ fn assemble_sandbox_with_embedded_kernel(
         mounts,
         network,
         listen_ports,
+        HostFunctionTable::default(),
+        true,
+        Console::new(usize::MAX, true),
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "combines upstream host configuration with the selected embedded kernel"
+)]
 fn assemble_sandbox_from_binary(
     guest_binary: GuestBinary,
     initrd: &Option<PathBuf>,
@@ -1069,14 +2091,16 @@ fn assemble_sandbox_from_binary(
     mounts: Vec<Mount>,
     network: Option<NetworkPolicy>,
     listen_ports: Option<ListenPorts>,
+    host_functions: HostFunctionTable,
+    host_write_err: bool,
+    console: Console,
 ) -> Result<(UninitializedSandbox, GuestConfig)> {
     let scratch_size = scratch_mb * 1024 * 1024;
+    info!(scratch_mb, "guest memory");
     let mut cfg = SandboxConfiguration::default();
     cfg.set_scratch_size(scratch_size);
     cfg.set_heap_size(HEAP_SIZE);
-
-    cfg.set_input_data_size(IO_STACK_SIZE);
-    cfg.set_output_data_size(IO_STACK_SIZE);
+    apply_transport(&mut cfg);
 
     // Permit the guest to touch the MSRs the Unikraft kernel programs
     apply_guest_msrs(&mut cfg)?;
@@ -1132,7 +2156,10 @@ fn assemble_sandbox_from_binary(
         mounts,
         network,
         listen_ports,
-    );
+    )
+    .with_host_functions(host_functions)
+    .with_host_write_err(host_write_err)
+    .with_console(console);
 
     config.register(&mut usandbox)?;
 
@@ -1179,6 +2206,12 @@ pub struct SandboxBuilder {
     listen_ports: Option<ListenPorts>,
     broker_runtime: Option<broker_runtime::BrokerRuntime>,
     env_vars: Vec<(String, String)>,
+    resolv_conf: Option<String>,
+    host_functions: std::collections::BTreeMap<String, HostFunction>,
+    profile: Option<bool>,
+    host_write_err: bool,
+    output_limit: usize,
+    echo_output: bool,
 }
 
 impl SandboxBuilder {
@@ -1195,6 +2228,12 @@ impl SandboxBuilder {
             listen_ports: None,
             broker_runtime: None,
             env_vars: Vec::new(),
+            resolv_conf: None,
+            host_functions: std::collections::BTreeMap::new(),
+            profile: None,
+            host_write_err: true,
+            output_limit: usize::MAX,
+            echo_output: true,
         }
     }
 
@@ -1208,7 +2247,7 @@ impl SandboxBuilder {
     }
 
     /// Boot an external kernel that carries its own workload — a native
-    /// app-in-kernel build, or a locally built `elfloader_hyperlight-x86_64`
+    /// app-in-kernel build, or a locally built `elfloader_hyperlight-<arch>`
     /// for kernel development.
     ///
     /// **Advanced.** The embedded kernel is the only combination this crate is
@@ -1233,10 +2272,9 @@ impl SandboxBuilder {
     /// died with the old host read as closed.  Nothing needs to be saved
     /// beside the snapshot.
     ///
-    /// **Mounts must match.** The guest kernel's fstab entries are baked into
-    /// the snapshot; re-supply the same [`mount`](Self::mount)s the snapshot
-    /// was saved with so the host side serves them.  Missing or different
-    /// mounts cause guest I/O errors.
+    /// The [`mount`](Self::mount)s given here are the restored guest's: on
+    /// its `resume` entry the kernel makes its mount table match them, so a
+    /// snapshot saved without mounts serves any mount set.
     pub fn from_snapshot(snapshot: Arc<Snapshot>) -> Self {
         Self {
             snapshot: Some(snapshot),
@@ -1269,7 +2307,8 @@ impl SandboxBuilder {
         self
     }
 
-    /// Scratch memory in MiB (default [`DEFAULT_SCRATCH_MB`]).
+    /// Scratch memory in MiB.  Without it, [`default_scratch_mb`] of the
+    /// initrd, or [`DEFAULT_SCRATCH_MB`] for a kernel with none.
     pub fn scratch_mb(mut self, mb: usize) -> Self {
         self.scratch_mb = Some(mb);
         self
@@ -1293,7 +2332,9 @@ impl SandboxBuilder {
         self
     }
 
-    /// Ports the guest may bind for inbound connections (requires a network policy).
+    /// Ports the guest may bind for inbound connections.  Without a
+    /// [`network`](Self::network) policy the guest can only serve on them:
+    /// it may open no connection of its own.
     pub fn listen_ports(mut self, ports: ListenPorts) -> Self {
         self.listen_ports = Some(ports);
         self
@@ -1310,6 +2351,111 @@ impl SandboxBuilder {
     /// Set a guest environment variable (repeatable).
     pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.env_vars.push((key.into(), value.into()));
+        self
+    }
+
+    /// The guest's `/etc/resolv.conf`: the kernel writes `content` there at
+    /// boot, and again on a restore, so a snapshot resolves names where it
+    /// now runs rather than where it was taken.  Without this the rootfs's
+    /// own file stands.  `options single-request` is added unless present,
+    /// since parallel A and AAAA queries do not work through the socket
+    /// layer.
+    pub fn resolv_conf(mut self, content: impl Into<String>) -> Self {
+        self.resolv_conf = Some(content.into());
+        self
+    }
+
+    /// Profile where this sandbox's time goes, host side: each VM entry
+    /// split into guest and host function time, each host function, and
+    /// Hyperlight's boot and restore.  [`AppSandbox::profile`] reports it.
+    /// Also on with `HLUK_PROFILE=1`; `profile(false)` overrides that.
+    pub fn profile(mut self, on: bool) -> Self {
+        self.profile = Some(on);
+        self
+    }
+
+    /// Offer the guest a function of the host's, by name: the way to give
+    /// code in the sandbox one capability rather than a directory or the
+    /// network.  It takes the guest's argument text and returns its result
+    /// text, or an error message the guest raises; the drivers pass JSON.
+    /// JavaScript calls it as `host.call(name, ...args)` (quickjs, node),
+    /// and in quickjs `a.b` is also the export `b` of the module `host:a`;
+    /// Python as `hyperlight.call(name, *args)` or `hyperlight.host.a.b()`
+    /// (python, python-shell, agent); C# as `Host.Call(name, args)`
+    /// (dotnet-jit); Java as `Host.call(name, args)` (java); the wasmtime
+    /// image satisfies a module's or a component's import `a.b` with it.
+    ///
+    /// ```no_run
+    /// # use hyperlight_unikraft::SandboxBuilder;
+    /// let mut sandbox = SandboxBuilder::from_initrd("rootfs/quickjs.cpio")
+    ///     .host_function("math.add", |args| {
+    ///         let [a, b]: [f64; 2] = serde_json::from_str(args).map_err(|e| e.to_string())?;
+    ///         Ok((a + b).to_string())
+    ///     })
+    ///     .boot()?;
+    /// sandbox.run("import { add } from 'host:math'; console.log(add(2, 3))")?;
+    /// # Ok::<(), hyperlight_unikraft::Error>(())
+    /// ```
+    ///
+    /// Registered with the sandbox, not the guest, so a guest restored from
+    /// a snapshot calls the functions of the builder that restores it.
+    pub fn host_function<F>(mut self, name: impl Into<String>, function: F) -> Self
+    where
+        F: Fn(&str) -> std::result::Result<String, String> + Send + Sync + 'static,
+    {
+        self.host_functions.insert(name.into(), Arc::new(function));
+        self
+    }
+
+    /// Keep at most `bytes` of the guest's output for
+    /// [`drain_output`](AppSandbox::drain_output) between drains, and at
+    /// most `bytes` of its standard error for
+    /// [`drain_stderr`](AppSandbox::drain_stderr).  The host keeps the
+    /// beginning, cut between characters, and counts what it leaves out
+    /// ([`take_output`](AppSandbox::take_output)); the guest carries on,
+    /// told its writes succeeded.  Unlimited by default; `0` keeps nothing.
+    ///
+    /// Enforced on the host, so no guest code gets past it, and the same
+    /// for a fresh guest and a restored one.  What the guest prints while it
+    /// boots counts toward the first drain; drain after every call to give
+    /// each its own budget.  It bounds what the host keeps, not the echo:
+    /// all of it still reaches this process's stdout and stderr unless
+    /// [`echo_output(false)`](Self::echo_output).
+    ///
+    /// ```no_run
+    /// # use hyperlight_unikraft::SandboxBuilder;
+    /// let mut sandbox = SandboxBuilder::from_initrd("rootfs/python.cpio")
+    ///     .output_limit(1 << 20)
+    ///     .echo_output(false)
+    ///     .boot()?;
+    /// sandbox.drain_output(); // the boot's
+    /// sandbox.run("print('x' * (2 << 20))")?;
+    /// let output = sandbox.take_output();
+    /// assert_eq!(output.text.len(), 1 << 20);
+    /// assert!(output.truncated());
+    /// # Ok::<(), hyperlight_unikraft::Error>(())
+    /// ```
+    pub fn output_limit(mut self, bytes: usize) -> Self {
+        self.output_limit = bytes;
+        self
+    }
+
+    /// Whether the guest's output also goes to this process's stdout, and
+    /// its standard error to this process's stderr, as it is written.  On by
+    /// default; off, the output is only captured, up to
+    /// [`output_limit`](Self::output_limit).
+    pub fn echo_output(mut self, on: bool) -> Self {
+        self.echo_output = on;
+        self
+    }
+
+    /// Leave out the `HostWriteErr` host function, as an older or
+    /// third-party host does: the guest's standard error then reaches
+    /// `HostWrite`.  For testing that fallback, on a fresh boot: a snapshot
+    /// saved with `HostWriteErr` will not restore without it.
+    #[doc(hidden)]
+    pub fn without_host_write_err(mut self) -> Self {
+        self.host_write_err = false;
         self
     }
 
@@ -1331,7 +2477,22 @@ impl SandboxBuilder {
             listen_ports,
             broker_runtime,
             env_vars,
+            resolv_conf,
+            host_functions,
+            profile,
+            host_write_err,
+            output_limit,
+            echo_output,
         } = self;
+        // The empty name asks for the list of functions, one per line, so
+        // neither it nor a line break can be in a function's name.
+        if let Some(name) = host_functions
+            .keys()
+            .find(|n| n.is_empty() || n.contains(['\n', '\r']))
+        {
+            return Err(Error::HostFunctionName { name: name.clone() });
+        }
+        let host_functions: HostFunctionTable = Arc::new(host_functions);
 
         let restored = snapshot.is_some();
         if restored
@@ -1343,22 +2504,75 @@ impl SandboxBuilder {
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
+        // A guest that may reach only listed names must still be able to
+        // ask the resolver it was given.
+        if let (Some(rc), Some(NetworkPolicy::AllowList(al))) = (&resolv_conf, &network) {
+            al.exempt_resolvers(net_policy::resolv_conf_nameservers(rc));
+        }
         let (sandbox, cfg) = match snapshot {
             Some(snapshot) => {
-                let (sandbox, cfg) =
-                    restore_snapshot(snapshot, mounts, network, listen_ports, broker_runtime)?;
+                let started = Instant::now();
+                let (sandbox, cfg) = restore_snapshot(
+                    snapshot,
+                    mounts,
+                    network,
+                    listen_ports,
+                    host_functions,
+                    host_write_err,
+                    Console::new(output_limit, echo_output),
+                    broker_runtime,
+                )?;
+                if let Some(on) = profile {
+                    cfg.profile.set_enabled(on);
+                }
+                cfg.profile
+                    .record("boot: sandbox from snapshot", started.elapsed());
                 cfg.set_env_vars(&env_refs);
+                // Read by the resume entry below, which rewrites the file.
+                if let Some(rc) = &resolv_conf {
+                    cfg.set_resolv_conf(rc);
+                }
                 (sandbox, cfg)
             }
             None => {
+                // Scan the initrd once for the driver entry point and
+                // the optional runtime marker; the result sizes the
+                // scratch memory and resolves the entry so
+                // `assemble_sandbox` does not scan a second time.
+                let scan = if scratch_mb.is_none() || entry.is_none() {
+                    initrd.as_deref().map(scan_cpio).unwrap_or_default()
+                } else {
+                    CpioScan::default()
+                };
+                let scratch = scratch_mb.unwrap_or_else(|| {
+                    scan.runtime
+                        .as_deref()
+                        .and_then(runtime_scratch_mb)
+                        .or_else(|| {
+                            scan.entry
+                                .as_deref()
+                                .and_then(|p| p.rsplit('/').next())
+                                .and_then(driver_scratch_mb)
+                        })
+                        .unwrap_or(DEFAULT_SCRATCH_MB)
+                });
+                let entry = entry.or_else(|| {
+                    if let Some(ref d) = scan.entry {
+                        info!(entry = %d, "auto-detected driver entry point");
+                    }
+                    scan.entry
+                });
                 let (mut usandbox, mut cfg) = assemble_sandbox(
                     &kernel,
                     &initrd,
                     &entry,
-                    scratch_mb.unwrap_or(DEFAULT_SCRATCH_MB),
+                    scratch,
                     mounts,
                     network,
                     listen_ports,
+                    host_functions,
+                    host_write_err,
+                    Console::new(output_limit, echo_output),
                 )?;
                 cfg.broker_runtime = broker_runtime;
                 if let Some(runtime) = &cfg.broker_runtime {
@@ -1372,13 +2586,30 @@ impl SandboxBuilder {
                 // on its way to main(), so an entry-point program starts
                 // with these; a driver refreshes them on every call anyway.
                 cfg.set_env_vars(&env_refs);
-                let sandbox = match usandbox.evolve() {
+                // Likewise fetched once the rootfs is mounted, before main().
+                if let Some(rc) = &resolv_conf {
+                    cfg.set_resolv_conf(rc);
+                }
+                if let Some(on) = profile {
+                    cfg.profile.set_enabled(on);
+                }
+                let sandbox = match cfg
+                    .profile
+                    .time("boot: evolve (cold boot)", || usandbox.evolve())
+                {
                     Ok(sandbox) => sandbox,
                     Err(e) => {
-                        // The guest's last words are the diagnosis.
-                        let output = cfg.drain_output();
-                        if !output.is_empty() {
-                            tracing::error!(%output, "guest console output before the boot failure");
+                        // The guest's output is the diagnosis: all of it, a
+                        // character cut short included, or under a limit its
+                        // beginning and how much is missing.
+                        cfg.console.finish();
+                        let output = cfg.take_output();
+                        if !output.text.is_empty() || output.truncated() {
+                            tracing::error!(
+                                output = %output.text,
+                                omitted = output.omitted,
+                                "guest console output before the boot failure"
+                            );
                         }
                         return Err(e.into());
                     }
@@ -1417,6 +2648,40 @@ impl SandboxBuilder {
     }
 }
 
+/// Whether a `resolv.conf` line is an `options` line carrying the
+/// `single-request` option itself: as a token, so `single-request-reopen`
+/// (another option) does not count, and not in a comment.
+fn options_line_has_single_request(line: &str) -> bool {
+    let line = line.trim_start();
+    line.starts_with("options")
+        && line
+            .split_whitespace()
+            .skip(1)
+            .any(|t| t == "single-request")
+}
+
+/// `content` with `options single-request` in it: on its own options line if
+/// it has one, else on a new line.  Empty content stays empty (the rootfs's
+/// file stands).  glibc's parallel A and AAAA queries do not work through
+/// the socket layer, and the option makes them sequential.
+fn with_single_request(content: &str) -> String {
+    let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
+    if !lines.is_empty() && !lines.iter().any(|l| options_line_has_single_request(l)) {
+        match lines
+            .iter_mut()
+            .find(|l| l.trim_start().starts_with("options"))
+        {
+            Some(options) => options.push_str(" single-request"),
+            None => lines.push("options single-request".into()),
+        }
+    }
+    let mut s = lines.join("\n");
+    if !s.is_empty() {
+        s.push('\n');
+    }
+    s
+}
+
 /// What to execute in the guest.
 #[derive(Debug, Clone)]
 pub enum Exec {
@@ -1436,6 +2701,17 @@ pub enum Exec {
     /// `/entrypoint`, …). Dispatched at the same point as any other `Exec`, so
     /// it works identically on a fresh boot or a restored snapshot.
     Guest(String),
+    /// Call the function `function` the guest has defined, with `input`,
+    /// for its result: in the quickjs and node images a global function,
+    /// in the python ones a function of `__main__`, in dotnet-jit a public
+    /// static method, in java a static method, called with `input` parsed
+    /// as JSON and its return
+    /// value (awaited) serialized back; in the wasmtime image an export of
+    /// the module or component the guest has loaded, `input` a JSON array
+    /// of its arguments.  Other images fail the call.  [`AppSandbox::call`] waits for the result;
+    /// [`AppSandbox::take_result`] collects it after a
+    /// [`submit`](AppSandbox::submit).
+    Call { function: String, input: String },
 }
 
 impl From<&str> for Exec {
@@ -1486,7 +2762,7 @@ impl From<String> for Exec {
 /// bring it back.  Dropping the sandbox tears
 /// the VM down and releases every host socket it held.
 pub struct AppSandbox {
-    sandbox: MultiUseSandbox,
+    sandbox: Sandbox,
     config: GuestConfig,
     /// The [`Yield::Exited`] the guest process ended with, once it has;
     /// every later step reports it again.
@@ -1539,6 +2815,43 @@ impl AppSandbox {
                 Yield::Blocked { .. } => {}
             }
         }
+    }
+
+    /// Call a function the guest has defined and wait for its result: a
+    /// handler loaded once (by a [`run`](Self::run), or in a warm snapshot)
+    /// and called many times with different input.  See [`Exec::Call`] for
+    /// what each image does with `function` and `input`.
+    ///
+    /// ```no_run
+    /// # use hyperlight_unikraft::SandboxBuilder;
+    /// let mut sandbox = SandboxBuilder::from_initrd("rootfs/quickjs.cpio").boot()?;
+    /// sandbox.run("function greet(event) { return { message: 'Hello, ' + event.name } }")?;
+    /// let out = sandbox.call("greet", r#"{"name":"World"}"#)?;
+    /// assert_eq!(out, r#"{"message":"Hello, World"}"#);
+    /// # Ok::<(), hyperlight_unikraft::Error>(())
+    /// ```
+    ///
+    /// Errors as [`run`](Self::run) does, and with
+    /// [`Error::ResultNotText`] when the result is not UTF-8.
+    pub fn call(&mut self, function: &str, input: &str) -> Result<String> {
+        self.run(Exec::Call {
+            function: function.to_string(),
+            input: input.to_string(),
+        })?;
+        let bytes = self.take_result().unwrap_or_default();
+        String::from_utf8(bytes).map_err(|e| {
+            // Put it back, so take_result hands it over as bytes.
+            *self.config.result.lock().unwrap() = Some(e.into_bytes());
+            Error::ResultNotText
+        })
+    }
+
+    /// The result of the last call, if its driver sent one: for a call
+    /// submitted with [`submit`](Self::submit) and driven with
+    /// [`step`](Self::step) to [`Yield::CallDone`].  Taken, so a second
+    /// take returns `None`.
+    pub fn take_result(&self) -> Option<Vec<u8>> {
+        self.config.result.lock().unwrap().take()
     }
 
     /// Keep the guest running until its process exits, and return its exit
@@ -1618,21 +2931,39 @@ impl AppSandbox {
         if self.config.call_in_flight() {
             return Err(Error::CallInFlight);
         }
-        let (name, arg) = match exec.into() {
-            Exec::Code(code) => ("Exec", code),
+        // A finished outcome still waiting for a step (the call a restored
+        // snapshot had in flight, finishing on its resume) is not this
+        // call's: it must not end this call's wait.
+        if matches!(
+            self.pending,
+            Some(Yield::CallDone | Yield::CallFailed { .. })
+        ) {
+            self.pending = None;
+        }
+        *self.config.result.lock().unwrap() = None;
+        // Trailing on every call: the kernel answers the driver's
+        // environment refresh from its copy while this matches.
+        let env = self.config.env_version();
+        let yielded = match exec.into() {
+            Exec::Code(code) => self.config.enter(&mut self.sandbox, "Exec", (code, env))?,
             Exec::File(path) => {
                 let code = std::fs::read_to_string(&path).map_err(|source| Error::Script {
                     path: path.clone(),
                     source,
                 })?;
-                ("Exec", code)
+                self.config.enter(&mut self.sandbox, "Exec", (code, env))?
             }
             // Dispatched under its own name so the driver runs the named
             // guest file (empty command → its conventional entrypoint)
             // rather than treating the payload as inline code.
-            Exec::Guest(cmd) => ("GuestExec", cmd),
+            Exec::Guest(cmd) => self
+                .config
+                .enter(&mut self.sandbox, "GuestExec", (cmd, env))?,
+            Exec::Call { function, input } => {
+                self.config
+                    .enter(&mut self.sandbox, "Call", (function, input, env))?
+            }
         };
-        let yielded = self.config.enter(&mut self.sandbox, name, arg)?;
         match self.note(yielded) {
             Yield::Blocked { .. } => {}
             terminal => self.pending = Some(terminal),
@@ -1744,10 +3075,13 @@ impl AppSandbox {
 
     /// Restore a snapshot into this sandbox in place and put the restored
     /// guest right for this host with a `resume` entry, as
-    /// [`SandboxBuilder::boot`] does.
+    /// [`SandboxBuilder::boot`] does, with this sandbox's mounts.
     pub fn restore(&mut self, snapshot: Arc<Snapshot>) -> Result<()> {
         self.ensure_usable()?;
-        self.sandbox.restore(snapshot)?;
+        let sandbox = &mut self.sandbox;
+        self.config
+            .profile
+            .time("restore: hyperlight", || sandbox.restore(snapshot))?;
         // The host sockets belong to the guest state just discarded; the
         // restored guest re-creates the ones it holds on its resume entry.
         if let Some(net) = &self.config.net {
@@ -1784,9 +3118,37 @@ impl AppSandbox {
         self.config.has_driver()
     }
 
-    /// Take the guest output captured so far.
+    /// Take the guest output captured so far: standard output and
+    /// standard error, in the order the guest wrote them.  It also drops
+    /// what [`take_stderr`](Self::take_stderr) would return, text and
+    /// omitted count, so take that first.
     pub fn drain_output(&self) -> String {
         self.config.drain_output()
+    }
+
+    /// Take the guest standard error captured so far, apart from standard
+    /// output.  [`drain_output`](Self::drain_output) has it too, in place.
+    pub fn drain_stderr(&self) -> String {
+        self.config.take_stderr().text
+    }
+
+    /// [`drain_output`](Self::drain_output), and how many bytes
+    /// [`SandboxBuilder::output_limit`] left out of it.
+    pub fn take_output(&self) -> CapturedOutput {
+        self.config.take_output()
+    }
+
+    /// [`drain_stderr`](Self::drain_stderr), and how many bytes
+    /// [`SandboxBuilder::output_limit`] left out of it.
+    pub fn take_stderr(&self) -> CapturedOutput {
+        self.config.take_stderr()
+    }
+
+    /// This sandbox's profile ([`SandboxBuilder::profile`]): print its
+    /// [`report`](Profile::report), or [`reset`](Profile::reset) it after a
+    /// warm-up.  Empty unless profiling is on.
+    pub fn profile(&self) -> &Profile {
+        &self.config.profile
     }
 
     /// Set guest environment variables for the next call.
@@ -1807,28 +3169,39 @@ impl AppSandbox {
 ///
 /// Creates a default [`GuestConfig`] (the snapshot already has the guest's
 /// cmdline/initrd), registers host functions, and rebuilds a
-/// [`MultiUseSandbox`] from the snapshot.  The caller must re-supply the same
-/// mounts the snapshot was saved with (see [`SandboxBuilder::from_snapshot`]).
-///
-/// TODO: Add a `GetMountConfig` host function so the kernel can query
-/// mount configuration at restore time and reconcile its VFS mount
-/// table — unmounting stale entries and mounting new ones — instead of
-/// requiring the caller to pass identical mounts.
+/// [`Sandbox`] from the snapshot.  `mounts` are the restored
+/// guest's: the kernel reads them through `GetMounts` on its `resume`
+/// entry and makes its mount table match.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "restores upstream configuration alongside the scoped broker"
+)]
 fn restore_snapshot(
     snapshot: Arc<Snapshot>,
     mounts: Vec<Mount>,
     network: Option<NetworkPolicy>,
     listen_ports: Option<ListenPorts>,
+    host_functions: HostFunctionTable,
+    host_write_err: bool,
+    console: Console,
     broker_runtime: Option<broker_runtime::BrokerRuntime>,
-) -> Result<(MultiUseSandbox, GuestConfig)> {
+) -> Result<(Sandbox, GuestConfig)> {
     let runtime_for_registration = broker_runtime.clone();
-    let (sandbox, mut config) =
-        restore_snapshot_with(snapshot, mounts, network, listen_ports, |functions| {
+    let (sandbox, mut config) = restore_snapshot_configured(
+        snapshot,
+        mounts,
+        network,
+        listen_ports,
+        host_functions,
+        host_write_err,
+        console,
+        |functions| {
             GuestConfig::register_broker_host_functions(
                 functions,
                 runtime_for_registration.as_ref(),
             )
-        })?;
+        },
+    )?;
     if let Some(runtime) = &broker_runtime {
         runtime.reset_for_fresh_vm()?;
     }
@@ -1842,7 +3215,36 @@ pub(crate) fn restore_snapshot_with<E>(
     network: Option<NetworkPolicy>,
     listen_ports: Option<ListenPorts>,
     register: impl FnOnce(&mut HostFunctions) -> std::result::Result<(), E>,
-) -> std::result::Result<(MultiUseSandbox, GuestConfig), E>
+) -> std::result::Result<(Sandbox, GuestConfig), E>
+where
+    E: From<Error>,
+{
+    restore_snapshot_configured(
+        snapshot,
+        mounts,
+        network,
+        listen_ports,
+        HostFunctionTable::default(),
+        true,
+        Console::new(usize::MAX, true),
+        register,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "preserves the upstream restore contract and typed callback registration"
+)]
+fn restore_snapshot_configured<E>(
+    snapshot: Arc<Snapshot>,
+    mounts: Vec<Mount>,
+    network: Option<NetworkPolicy>,
+    listen_ports: Option<ListenPorts>,
+    host_functions: HostFunctionTable,
+    host_write_err: bool,
+    console: Console,
+    register: impl FnOnce(&mut HostFunctions) -> std::result::Result<(), E>,
+) -> std::result::Result<(Sandbox, GuestConfig), E>
 where
     E: From<Error>,
 {
@@ -1859,7 +3261,10 @@ where
         mounts,
         network,
         listen_ports,
-    );
+    )
+    .with_host_functions(host_functions)
+    .with_host_write_err(host_write_err)
+    .with_console(console);
     let mut hf = HostFunctions::default();
     config.register(&mut hf).map_err(E::from)?;
     register(&mut hf)?;
@@ -1871,12 +3276,11 @@ where
     // know to match (avoiding a spurious layout-override warning) and let
     // it override scratch.
     let mut sbcfg = SandboxConfiguration::default();
-    sbcfg.set_input_data_size(IO_STACK_SIZE);
-    sbcfg.set_output_data_size(IO_STACK_SIZE);
+    apply_transport(&mut sbcfg);
     sbcfg.set_heap_size(HEAP_SIZE);
     apply_guest_msrs(&mut sbcfg).map_err(E::from)?;
 
-    let sandbox = MultiUseSandbox::from_snapshot(snapshot, hf, Some(sbcfg))
+    let sandbox = Sandbox::from_snapshot(snapshot, hf, Some(sbcfg))
         .map_err(Error::from)
         .map_err(E::from)?;
     Ok((sandbox, config))
@@ -1893,8 +3297,178 @@ mod tests {
     /// OCI tags forbid `+`, so a `+build` suffix on the crate version would
     /// make every snapshot save panic.
     #[test]
-    fn snapshot_tag_is_the_crate_version() {
-        assert_eq!(snapshot_tag().to_string(), env!("CARGO_PKG_VERSION"));
+    fn snapshot_tag_is_the_release_and_the_key() {
+        let tag = snapshot_tag().to_string();
+        assert_eq!(tag, format!("{}-{SNAPSHOT_KEY}", env!("CARGO_PKG_VERSION")));
+        assert_eq!(snapshot_tag_key(&tag), Some(SNAPSHOT_KEY));
+        assert_eq!(
+            describe_snapshot_tag(&tag),
+            format!("{} ({SNAPSHOT_KEY})", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn guest_output_push_owned_matches_push() {
+        let writes: &[&[u8]] = &[
+            b"plain",
+            "olé".as_bytes(),
+            b"ends mid \xe2\x82",
+            b"\xac done",
+            b"\xff bad",
+            b"\xc3",
+            b"A",
+            b"\xf0\x9f",
+            b"\x98\x80!",
+            b"",
+            b"tail \xe2",
+        ];
+        let (mut a, mut b) = (GuestOutput::default(), GuestOutput::default());
+        let (mut ta, mut tb) = (String::new(), String::new());
+        for w in writes {
+            ta += &a.push(w);
+            tb += &b.push_owned(w.to_vec());
+            assert_eq!(ta, tb);
+            assert_eq!(a.partial, b.partial);
+        }
+        assert_eq!(a.finish(), b.finish());
+    }
+
+    #[test]
+    fn guest_output_joins_split_characters_and_replaces_bad_bytes() {
+        let mut out = GuestOutput::default();
+        let mut text = out.push(b"ol\xc3");
+        assert_eq!(text, "ol");
+        text += &out.push(b"\xa9 \xff!");
+        assert_eq!(text, "olé \u{fffd}!");
+        text += &out.push(b"\xe2\x82");
+        text += &out.push(b"\xac");
+        assert_eq!(text, "olé \u{fffd}!€");
+        assert!(out.partial.is_empty());
+        // Finished by the next write, even after the text so far is taken.
+        text += &out.push(b"x\xf0\x9f");
+        assert_eq!(std::mem::take(&mut text), "olé \u{fffd}!€x");
+        text += &out.push(b"\x98");
+        text += &out.push(b"\x80 ok");
+        assert_eq!(text, "\u{1f600} ok");
+        // A lead byte the next write does not continue.
+        text += &out.push(b"\xc3");
+        text += &out.push(b"A");
+        assert_eq!(text, "\u{1f600} ok\u{fffd}A");
+        assert!(out.partial.is_empty());
+
+        // A stray lead byte, then a write that starts a character of its
+        // own: the character survives, in order.
+        let mut out = GuestOutput::default();
+        let mut text = out.push(b"ol\xe9");
+        text += &out.push("€5".as_bytes());
+        text += &out.push(b"\n");
+        assert_eq!(text, "ol\u{fffd}€5\n");
+        // Ones that leave a new cut-short character behind each time.
+        let mut out = GuestOutput::default();
+        let mut text = out.push(b"\xc3");
+        text += &out.push(b"\xe2a\xf0\x9f\x98");
+        let tail = out.push(b"\x80");
+        assert_eq!(tail, "\u{1f600}");
+        text += &tail;
+        assert_eq!(text, "\u{fffd}\u{fffd}a\u{1f600}");
+        assert!(out.partial.is_empty());
+        // The guest ends with half a character: it reads as U+FFFD.
+        assert_eq!(out.push(b"!\xe2\x82"), "!");
+        assert_eq!(out.finish(), "\u{fffd}");
+        assert_eq!(out.finish(), "");
+    }
+
+    #[test]
+    fn snapshot_tag_key_reads_only_a_keyed_tag() {
+        assert_eq!(snapshot_tag_key("0.14.0"), None);
+        assert_eq!(
+            snapshot_tag_key("0.15.0-rc1-kdeadbeefdeadbeef-c2"),
+            Some("kdeadbeefdeadbeef-c2")
+        );
+        assert_eq!(snapshot_tag_key("0.15.0-kappa-c2"), None);
+        assert_eq!(
+            snapshot_tag_key(snapshot_tag().as_ref()),
+            Some(SNAPSHOT_KEY)
+        );
+        assert_eq!(describe_snapshot_tag("0.14.0"), "0.14.0");
+    }
+
+    /// A name given twice reaches the guest once, with the last value.
+    #[test]
+    fn env_names_given_twice_keep_the_last() {
+        let config = GuestConfig::new(String::new(), 0, 0, 0, Vec::new(), None, None);
+        config.set_env_vars(&[("A", "1"), ("B", "2"), ("A", "3")]);
+        assert_eq!(*config.env_str.lock().unwrap(), "B=2\0A=3\0");
+    }
+
+    /// Listen ports alone opt into networking, inbound only (see
+    /// hostnet's empty_allow_list_serves_but_reaches_nothing); neither
+    /// leaves it off.
+    #[test]
+    fn listen_ports_alone_enable_networking() {
+        let config = |ports| GuestConfig::new(String::new(), 0, 0, 0, Vec::new(), None, ports);
+        assert!(config(None).net.is_none());
+        assert!(config(Some(ListenPorts::from_ports([8080]))).net.is_some());
+    }
+
+    #[test]
+    fn capture_keeps_everything_under_the_limit() {
+        let mut c = Capture::default();
+        c.push("hello ", 16);
+        c.push("world", 16);
+        assert_eq!(
+            c.take(),
+            CapturedOutput {
+                text: "hello world".into(),
+                omitted: 0
+            }
+        );
+    }
+
+    #[test]
+    fn capture_keeps_the_beginning_and_counts_the_rest() {
+        let mut c = Capture::default();
+        c.push("abcdef", 4);
+        // Room for one more byte later, but the stream has a hole now.
+        c.push("g", 8);
+        let out = c.take();
+        assert_eq!(out.text, "abcd");
+        assert_eq!(out.omitted, 3);
+        assert!(out.truncated());
+        // Drained: a new budget.
+        c.push("xy", 4);
+        assert_eq!(c.take().text, "xy");
+    }
+
+    #[test]
+    fn capture_cuts_between_characters() {
+        let mut c = Capture::default();
+        // "é" is two bytes; the limit falls inside the second one.
+        c.push("aéb", 2);
+        let out = c.take();
+        assert_eq!(out.text, "a");
+        assert_eq!(out.omitted, 3);
+    }
+
+    #[test]
+    fn capture_of_nothing() {
+        let mut c = Capture::default();
+        c.push("abc", 0);
+        c.push("", 0);
+        let out = c.take();
+        assert_eq!(out.text, "");
+        assert_eq!(out.omitted, 3);
+    }
+
+    #[test]
+    fn capture_allocates_no_more_than_the_limit() {
+        let mut c = Capture::default();
+        for _ in 0..1000 {
+            c.push(&"x".repeat(100), 10_000);
+        }
+        assert_eq!(c.text.len(), 10_000);
+        assert_eq!(c.text.capacity(), 10_000);
+        assert_eq!(c.omitted, 90_000);
     }
 
     #[test]
@@ -2054,6 +3628,108 @@ mod tests {
         assert!(m.readonly);
     }
 
+    /// An OCI layout directory whose index names one manifest per tag.
+    fn layout_with_tags(tags: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("oci-layout"),
+            r#"{"imageLayoutVersion":"1.0.0"}"#,
+        )
+        .unwrap();
+        let manifests: Vec<String> = tags
+            .iter()
+            .map(|t| {
+                format!(
+                    r#"{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":1,"annotations":{{"org.opencontainers.image.ref.name":"{t}"}}}}"#
+                )
+            })
+            .collect();
+        std::fs::write(
+            dir.path().join("index.json"),
+            format!(
+                r#"{{"schemaVersion":2,"manifests":[{}]}}"#,
+                manifests.join(",")
+            ),
+        )
+        .unwrap();
+        dir
+    }
+
+    fn load_error(dir: &Path) -> Error {
+        match load_snapshot(dir) {
+            Err(e) => e,
+            Ok(_) => panic!("a snapshot with no blobs loaded"),
+        }
+    }
+
+    #[test]
+    fn a_snapshot_with_another_key_names_the_release_that_saved_it() {
+        let dir = layout_with_tags(&["0.14.0", "0.0.1-k0000000000000000-c0"]);
+        let err = load_error(dir.path());
+        match &err {
+            Error::SnapshotRelease { saved_by, this, .. } => {
+                assert_eq!(saved_by, "0.14.0, 0.0.1 (k0000000000000000-c0)");
+                assert_eq!(
+                    *this,
+                    format!("{} ({SNAPSHOT_KEY})", env!("CARGO_PKG_VERSION"))
+                );
+            }
+            other => panic!("expected SnapshotRelease, got {other}"),
+        }
+        assert!(err.to_string().contains("save it again"));
+    }
+
+    #[test]
+    fn a_snapshot_with_this_key_loads_whatever_release_saved_it() {
+        // The tag matches on the key, so the load goes on to the layout
+        // code, which fails on the missing blob rather than on the tag.
+        let dir = layout_with_tags(&[&format!("0.0.1-{SNAPSHOT_KEY}")]);
+        let err = load_error(dir.path());
+        assert!(
+            !matches!(err, Error::SnapshotRelease { .. }),
+            "refused by key: {err}"
+        );
+        assert!(
+            !err.to_string().contains("no manifest tagged"),
+            "tag not matched: {err}"
+        );
+    }
+
+    #[test]
+    fn fstab_entries_are_the_arg_without_the_brackets() {
+        let mounts = [Mount::rw("/a", "/mnt/a"), Mount::ro("/b", "/mnt/b")];
+        let entries = fstab_entries(&mounts).unwrap();
+        assert_eq!(
+            entries,
+            "0:/mnt/a:hostfs:0x0::mkmp 1:/mnt/b:hostfs:0x1::mkmp"
+        );
+        assert_eq!(
+            fstab_arg(&mounts).unwrap(),
+            format!(" vfs.fstab=[{entries}]")
+        );
+        assert_eq!(fstab_entries(&[]).unwrap(), "");
+    }
+
+    #[test]
+    fn fstab_entries_stop_at_what_the_kernel_takes() {
+        let many: Vec<Mount> = (0..=MOUNTS_MAX)
+            .map(|i| Mount::rw("/tmp", format!("/mnt/{i}")))
+            .collect();
+        assert!(fstab_entries(&many[..MOUNTS_MAX]).is_ok());
+        assert!(matches!(
+            fstab_entries(&many),
+            Err(Error::MountTable { mounts, .. }) if mounts == MOUNTS_MAX + 1
+        ));
+        let long = [Mount::rw(
+            "/tmp",
+            format!("/mnt/{}", "x".repeat(FSTAB_ENTRIES_MAX)),
+        )];
+        assert!(matches!(
+            fstab_entries(&long),
+            Err(Error::MountTable { .. })
+        ));
+    }
+
     #[test]
     fn fstab_single_rw_mount() {
         let arg = fstab_arg(&[Mount::rw("/tmp/share", "/mnt/host")]).unwrap();
@@ -2079,8 +3755,6 @@ mod tests {
     /// for `fs_stat(0, "hello.txt")` and verify Hyperlight can parse it.
     #[test]
     fn flatbuffer_generic_encoder_roundtrip() {
-        use hyperlight_common::flatbuffer_wrappers::function_call::FunctionCall;
-
         // Construct the exact bytes the C fb_encode_generic would produce
         // for hl_hcall_vecbytes("fs_stat", [hlint(0), hlstring("hello.txt")], 2).
         //
@@ -2102,7 +3776,7 @@ mod tests {
         }
 
         // Try to parse the C-style bytes.
-        let c_parsed = FunctionCall::try_from(c_bytes.as_slice());
+        let c_parsed = decode_c_call(&c_bytes);
         assert!(
             c_parsed.is_ok(),
             "C-encoded FunctionCall should parse: {:?}",
@@ -2115,8 +3789,6 @@ mod tests {
     /// Roundtrip test for fs_write_bytes with empty VecBytes.
     #[test]
     fn flatbuffer_generic_encoder_roundtrip_write() {
-        use hyperlight_common::flatbuffer_wrappers::function_call::FunctionCall;
-
         let c_bytes = build_c_generic_fb(
             "fs_write_bytes",
             2, // HL_FCT_HOST
@@ -2139,7 +3811,7 @@ mod tests {
             eprintln!();
         }
 
-        let result = FunctionCall::try_from(c_bytes.as_slice());
+        let result = decode_c_call(&c_bytes);
         match &result {
             Ok(fc) => eprintln!("PARSED: name={}", fc.function_name),
             Err(e) => eprintln!("FAILED: {:?}", e),
@@ -2217,14 +3889,16 @@ mod tests {
         for param in params.iter().take(np) {
             let pvt = align2(pos);
             let ptbl = align4(pvt + PM_VT_SZ);
+            // A byte vector is an hlexternalbytes: its length, laid out
+            // like a ulong; the bytes follow the FlatBuffer.
             let (vvtsz, vtblsz) = match param {
                 CParam::Int(_) => (VW_SCALAR_VT_SZ, VW_INT_TBL_SZ),
-                CParam::ULong(_) => (VW_SCALAR_VT_SZ, VW_ULONG_TBL_SZ),
-                CParam::Str(_) | CParam::VecBytes(_) => (VW_SCALAR_VT_SZ, VW_REF_TBL_SZ),
+                CParam::ULong(_) | CParam::VecBytes(_) => (VW_SCALAR_VT_SZ, VW_ULONG_TBL_SZ),
+                CParam::Str(_) => (VW_SCALAR_VT_SZ, VW_REF_TBL_SZ),
             };
             let vvt = align2(ptbl + PM_TBL_SZ);
             let vtbl = match param {
-                CParam::ULong(_) => align8_off4(vvt + vvtsz),
+                CParam::ULong(_) | CParam::VecBytes(_) => align8_off4(vvt + vvtsz),
                 _ => align4(vvt + vvtsz),
             };
             pos = vtbl + vtblsz;
@@ -2239,19 +3913,11 @@ mod tests {
             });
         }
 
-        // Variable-length data
+        // Strings
         for (i, param) in params.iter().enumerate().take(np) {
-            match param {
-                CParam::Str(s) => {
-                    pl[i].vdata = align4(pos);
-                    pos = pl[i].vdata + 4 + align4(s.len() + 1);
-                }
-                CParam::VecBytes(v) => {
-                    pl[i].vdata = align4(pos);
-                    let dlen = if v.is_empty() { 1 } else { v.len() };
-                    pos = pl[i].vdata + 4 + align4(dlen);
-                }
-                _ => {}
+            if let CParam::Str(s) = param {
+                pl[i].vdata = align4(pos);
+                pos = pl[i].vdata + 4 + align4(s.len() + 1);
             }
         }
 
@@ -2303,10 +3969,10 @@ mod tests {
             // Parameter table
             ew32(&mut buf, layout.ptbl, (layout.ptbl - layout.pvt) as u32);
             let pv_type = match param {
-                CParam::Int(_) => 1u8,      // HL_PV_HLINT
-                CParam::ULong(_) => 4u8,    // HL_PV_HLULONG (was incorrectly 5=hlfloat!)
-                CParam::Str(_) => 7u8,      // HL_PV_HLSTRING
-                CParam::VecBytes(_) => 9u8, // HL_PV_HLVECBYTES
+                CParam::Int(_) => 1u8,       // HL_PV_HLINT
+                CParam::ULong(_) => 4u8,     // HL_PV_HLULONG (was incorrectly 5=hlfloat!)
+                CParam::Str(_) => 7u8,       // HL_PV_HLSTRING
+                CParam::VecBytes(_) => 10u8, // HL_PV_HLEXTERNALBYTES
             };
             buf[layout.ptbl + 4] = pv_type;
             ew32(
@@ -2340,15 +4006,7 @@ mod tests {
                     buf[layout.vdata + 4..layout.vdata + 4 + s.len()].copy_from_slice(s.as_bytes());
                 }
                 CParam::VecBytes(v) => {
-                    ew32(
-                        &mut buf,
-                        layout.vtbl + 4,
-                        (layout.vdata - (layout.vtbl + 4)) as u32,
-                    );
-                    ew32(&mut buf, layout.vdata, v.len() as u32);
-                    if !v.is_empty() {
-                        buf[layout.vdata + 4..layout.vdata + 4 + v.len()].copy_from_slice(v);
-                    }
+                    ew64(&mut buf, layout.vtbl + 4, v.len() as u64);
                 }
             }
         }
@@ -2357,15 +4015,85 @@ mod tests {
         ew32(&mut buf, fnpos, nlen as u32);
         buf[fnpos + 4..fnpos + 4 + nlen].copy_from_slice(name.as_bytes());
 
+        // The byte values, in parameter order
+        for param in params {
+            if let CParam::VecBytes(v) = param {
+                buf.extend_from_slice(v);
+            }
+        }
+
         buf
+    }
+
+    /// The bytes after a C-encoded FunctionCall, handed to the decoder the
+    /// way the host's transport does.
+    struct CExternals<'a>(&'a [u8]);
+
+    impl hyperlight_common::flatbuffer_wrappers::ExternalValueSource for CExternals<'_> {
+        fn take_bytes(&mut self, length: usize) -> anyhow::Result<Vec<u8>> {
+            anyhow::ensure!(length <= self.0.len(), "external bytes cut short");
+            let (value, rest) = self.0.split_at(length);
+            self.0 = rest;
+            Ok(value.to_vec())
+        }
+
+        fn take_chunks(&mut self, length: usize) -> anyhow::Result<Vec<bytes::Bytes>> {
+            Ok(vec![self.take_bytes(length)?.into()])
+        }
+
+        fn finish(&mut self) -> anyhow::Result<()> {
+            anyhow::ensure!(self.0.is_empty(), "unused external bytes");
+            Ok(())
+        }
+    }
+
+    /// Decode what the C encoder produced: the size-prefixed FlatBuffer,
+    /// then the bytes of its VecBytes parameters.
+    fn decode_c_call(
+        payload: &[u8],
+    ) -> anyhow::Result<hyperlight_common::flatbuffer_wrappers::function_call::FunctionCall> {
+        let fb_len = 4 + u32::from_le_bytes(payload[..4].try_into()?) as usize;
+        let (control, externals) = payload.split_at(fb_len);
+        hyperlight_common::flatbuffer_wrappers::function_call::FunctionCall::decode(
+            control,
+            &mut CExternals(externals),
+        )
+    }
+
+    /// Byte parameters travel after the FlatBuffer and come back intact,
+    /// in order, around the other parameters.
+    #[test]
+    fn flatbuffer_generic_encoder_external_bytes() {
+        use hyperlight_common::flatbuffer_wrappers::function_types::ParameterValue;
+
+        let payload = build_c_generic_fb(
+            "HostCall",
+            2,
+            9,
+            &[
+                CParam::VecBytes(b"first"),
+                CParam::Str("name"),
+                CParam::VecBytes(&[]),
+                CParam::VecBytes(b"second"),
+            ],
+        );
+        let call = decode_c_call(&payload).unwrap();
+        assert_eq!(call.function_name, "HostCall");
+        assert_eq!(
+            call.parameters.unwrap(),
+            vec![
+                ParameterValue::VecBytes(b"first".to_vec()),
+                ParameterValue::String("name".into()),
+                ParameterValue::VecBytes(Vec::new()),
+                ParameterValue::VecBytes(b"second".to_vec()),
+            ]
+        );
     }
 
     /// Roundtrip test for fs_read_bytes(mount_idx=0, path="test.txt", offset=0, len=32768)
     /// which uses u64 parameters.
     #[test]
     fn flatbuffer_generic_encoder_roundtrip_ulong() {
-        use hyperlight_common::flatbuffer_wrappers::function_call::FunctionCall;
-
         let c_bytes = build_c_generic_fb(
             "fs_read_bytes",
             2, // HL_FCT_HOST
@@ -2387,7 +4115,7 @@ mod tests {
             eprintln!();
         }
 
-        let c_parsed = FunctionCall::try_from(c_bytes.as_slice());
+        let c_parsed = decode_c_call(&c_bytes);
         assert!(
             c_parsed.is_ok(),
             "C-encoded FunctionCall should parse: {:?}",
@@ -2402,8 +4130,6 @@ mod tests {
     /// (not 5=hlfloat) and that 8-byte alignment is respected.
     #[test]
     fn c_encoder_ulong_alignment_check() {
-        use hyperlight_common::flatbuffer_wrappers::function_call::FunctionCall;
-
         // First, fix the discriminant and test with type=4 (the REAL HL_PV_HLULONG)
         let c_bytes = build_c_generic_fb(
             "fs_write_bytes",
@@ -2427,7 +4153,7 @@ mod tests {
             eprintln!();
         }
 
-        let result = FunctionCall::try_from(c_bytes.as_slice());
+        let result = decode_c_call(&c_bytes);
         match &result {
             Ok(fc) => eprintln!("PARSED: name={}", fc.function_name),
             Err(e) => eprintln!("FAILED: {:?}", e),
@@ -2442,5 +4168,80 @@ mod tests {
             arg,
             " vfs.fstab=[0:/mnt/a:hostfs:0x0::mkmp 1:/mnt/b:hostfs:0x1::mkmp]"
         );
+    }
+
+    #[test]
+    fn single_request_is_added_as_a_token_on_the_options_line() {
+        assert_eq!(with_single_request(""), "");
+        assert_eq!(
+            with_single_request("nameserver 10.0.0.1"),
+            "nameserver 10.0.0.1\noptions single-request\n"
+        );
+        assert_eq!(
+            with_single_request("nameserver 10.0.0.1\noptions ndots:5\n"),
+            "nameserver 10.0.0.1\noptions ndots:5 single-request\n"
+        );
+        // Already there: left alone.
+        assert_eq!(
+            with_single_request("options ndots:5 single-request\n"),
+            "options ndots:5 single-request\n"
+        );
+        // A different option, and a comment, are not the option.
+        assert_eq!(
+            with_single_request("options single-request-reopen\n"),
+            "options single-request-reopen single-request\n"
+        );
+        assert_eq!(
+            with_single_request("# single-request\nnameserver 10.0.0.1\n"),
+            "# single-request\nnameserver 10.0.0.1\noptions single-request\n"
+        );
+    }
+
+    #[test]
+    fn default_scratch_follows_the_driver_in_the_initrd() {
+        let dir = std::env::temp_dir().join(format!("hluk-scratch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let node = write_cpio(
+            &dir,
+            "node.cpio",
+            &[("usr/local/bin/hl_nodedriver", b"ELF")],
+        );
+        assert_eq!(default_scratch_mb(&node), 512);
+        let plain = write_cpio(&dir, "plain.cpio", &[("bin/app", b"ELF")]);
+        assert_eq!(default_scratch_mb(&plain), DEFAULT_SCRATCH_MB);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn runtime_marker_overrides_driver_detection() {
+        let dir = test_dir("cpio-marker");
+        // The agent image shares hl_pywarmdriver with python-shell but
+        // carries etc/hluk-runtime naming the actual runtime.
+        let agent = write_cpio(
+            &dir,
+            "agent.cpio",
+            &[
+                ("usr/local/bin/hl_pywarmdriver", b"ELF"),
+                ("etc/hluk-runtime", b"agent\n"),
+            ],
+        );
+        assert_eq!(default_scratch_mb(&agent), 1536, "marker wins over driver");
+        let scan = scan_cpio(&agent);
+        assert_eq!(scan.runtime.as_deref(), Some("agent"));
+        assert_eq!(
+            scan.entry.as_deref(),
+            Some("/usr/local/bin/hl_pywarmdriver")
+        );
+
+        // Without the marker the same driver maps to python-shell.
+        let shell = write_cpio(
+            &dir,
+            "shell.cpio",
+            &[("usr/local/bin/hl_pywarmdriver", b"ELF")],
+        );
+        assert_eq!(default_scratch_mb(&shell), 256);
+        assert!(scan_cpio(&shell).runtime.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
