@@ -10,6 +10,8 @@ JUST_VERSION=1.58.0
 BAZELISK_VERSION=1.28.1
 BAZELISK_SHA256=22e7d3a188699982f661cf4687137ee52d1f24fec1ec893d91a6c4d791a75de8
 LLVM_VERSION=22
+BUILDER_IMAGE=workerd-hyperlight-builder
+EXECUTOR_NAME=workerd-sandbox-executor
 # See tools/lib/go-toolchain.sh for why a pinned Go toolchain is needed
 # (Ubuntu jammy's golang-go is 1.18, too old for vegeta's go.mod) and how
 # it's installed/verified.
@@ -76,6 +78,48 @@ step() {
 fail() {
     printf 'error: %s\n' "$*" >&2
     exit 1
+}
+
+check_docker_access() {
+    local diagnostic endpoint current_groups account_groups
+
+    if diagnostic="$(docker info 2>&1)"; then
+        return
+    fi
+    printf 'error: Docker access check failed:\n%s\n' "$diagnostic" >&2
+    if [[ "${diagnostic,,}" != *"permission denied"* &&
+        "${diagnostic,,}" != *"access denied"* ]]; then
+        fail "check that Docker is running and the selected context/DOCKER_HOST is correct; rerun 'docker info'"
+    fi
+    if [[ -n "${DOCKER_CONTEXT:-}" ]]; then
+        endpoint="$(docker context inspect "$DOCKER_CONTEXT" --format '{{.Endpoints.docker.Host}}')" ||
+            fail "could not inspect the selected Docker context"
+    elif [[ -n "${DOCKER_HOST:-}" ]]; then
+        endpoint="$DOCKER_HOST"
+    else
+        endpoint="$(docker context inspect --format '{{.Endpoints.docker.Host}}')" ||
+            fail "could not inspect the selected Docker context"
+    fi
+    case "$endpoint" in
+        unix:///var/run/docker.sock | unix:///run/docker.sock)
+            current_groups="$(id -nG)" ||
+                fail "could not read current-session group membership"
+            if [[ " $current_groups " != *" docker "* ]]; then
+                account_groups="$(id -nG "$(id -un)")" ||
+                    fail "could not read account group membership"
+                if [[ " $account_groups " == *" docker "* ]]; then
+                    printf 'Your account belongs to the docker group, but this login session does not.\n' >&2
+                else
+                    printf 'This login session does not belong to the docker group. Ask your administrator to approve local Docker socket access, or use an approved rootless/remote Docker context.\n' >&2
+                fi
+                fail "after an approved group change, sign out and start a new login session; check 'id -nG' and rerun 'docker info'"
+            fi
+            fail "the docker group is already active; check socket ownership/ACLs and the selected Docker context, then rerun 'docker info'"
+            ;;
+        *)
+            fail "check permissions/authentication for the selected rootless or remote Docker endpoint; docker-group membership is not required for every Docker configuration"
+            ;;
+    esac
 }
 
 configure_user_home() {
@@ -176,10 +220,9 @@ for command in cargo curl docker file git go patch python3 sqlite3 \
     command -v "$command" >/dev/null ||
         fail "missing '$command' (rerun with --install-deps where applicable)"
 done
-[[ -c /dev/kvm && -r /dev/kvm && -w /dev/kvm ]] ||
+test -c /dev/kvm && test -r /dev/kvm && test -w /dev/kvm ||
     fail "/dev/kvm must exist and be readable/writable by the current user"
-docker info >/dev/null 2>&1 ||
-    fail "Docker is not usable by the current user"
+check_docker_access
 
 step "Checking the Hyperlight fork revision"
 git -C "$root" merge-base --is-ancestor "$HYPERLIGHT_COMMIT" HEAD ||
@@ -280,19 +323,18 @@ EOF
 
 step "Preparing the Workerd executor builder"
 docker build \
-    --tag workerd-hyperlight-builder \
+    --tag "$BUILDER_IMAGE" \
     --file "$builder_file" \
     "$workerd_dir/.devcontainer"
 
-builder_image_id="$(
-    docker image inspect --format '{{.Id}}' workerd-hyperlight-builde
-)"
+builder_image_id="$(docker image inspect --format '{{.Id}}' "$BUILDER_IMAGE")" ||
+    fail "could not inspect the Workerd builder image '$BUILDER_IMAGE'"
 builder_cache_key="${builder_image_id#sha256:}"
 [[ "$builder_cache_key" =~ ^[0-9a-f]{64}$ ]] ||
     fail "could not determine the Workerd builder image ID"
 builder_cache_root="$cache_root/bazel/builders/$builder_cache_key"
 executor_dir="$root/build-elfloader/workerd-executor"
-executor_path="$executor_dir/workerd-sandbox-executor"
+executor_path="$executor_dir/$EXECUTOR_NAME"
 packaged_executor_path="$executor_dir/executor"
 executor_stamp="$executor_dir/build.stamp"
 expected_executor_stamp="$(
@@ -321,13 +363,14 @@ else
         --user "$(id -u):$(id -g)" \
         --env HOME=/tmp/workerd-builder-home \
         --env "WORKERD_BAZEL_JOBS=$jobs" \
+        --env "WORKERD_EXECUTOR_NAME=$EXECUTOR_NAME" \
         --mount "type=bind,src=$workerd_dir,dst=/workspace" \
         --mount "type=bind,src=$builder_cache_root,dst=/cache/builder" \
         --mount "type=bind,src=$shared_bazel_cache,dst=/cache/shared" \
         --mount "type=bind,src=$shared_repository_cache,dst=/cache/repository" \
         --mount "type=bind,src=$executor_dir,dst=/output" \
         --workdir /workspace \
-        workerd-hyperlight-builder \
+        "$BUILDER_IMAGE" \
         bash -c '
             set -euo pipefail
             mkdir -p "$HOME"
@@ -351,9 +394,9 @@ else
                 -L/opt/libcxx22 -Wl,-rpath,/opt/libcxx22 \
                 /tmp/libcxx-check.cc -o /tmp/libcxx-check
             LD_LIBRARY_PATH=/opt/libcxx22 /tmp/libcxx-check
-            executor=bazel-bin/src/workerd/server/workerd-sandbox-executo
+            executor="bazel-bin/src/workerd/server/$WORKERD_EXECUTOR_NAME"
             bazel --output_base=/cache/builder/output \
-                build //src/workerd/server:workerd-sandbox-executor \
+                build "//src/workerd/server:$WORKERD_EXECUTOR_NAME" \
                 --config=opt \
                 --strip=always \
                 --//:io_backend=cxx \
@@ -368,8 +411,10 @@ else
                 --host_action_env=LD_LIBRARY_PATH=/opt/libcxx22
             "$executor" --self-test
             llvm-strip "$executor"
-            install -m 0755 "$executor" /output/workerd-sandbox-executo
+            install -m 0755 "$executor" "/output/$WORKERD_EXECUTOR_NAME"
         '
+    [[ -x "$executor_path" ]] ||
+        fail "the Workerd build did not produce '$executor_path'"
     printf '%s\n' "$expected_executor_stamp" >"$executor_stamp.tmp"
     mv "$executor_stamp.tmp" "$executor_stamp"
 fi
@@ -379,7 +424,7 @@ cd "$root"
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-8}"
 just build-workerd-kernel
 bash examples/workerd-executor/build-rootfs.sh \
-    build-elfloader/workerd-executor/workerd-sandbox-executo
+    "$executor_path"
 
 step "Building the Hyperlight demo"
 cargo +"$RUST_VERSION" build --release --locked --example workerd-demo
@@ -398,7 +443,7 @@ docker run --rm \
     --env HOME=/tmp \
     --mount "type=bind,src=$root,dst=/repo" \
     --workdir /repo/experiments/workerd-component-model \
-    workerd-hyperlight-builder \
+    "$BUILDER_IMAGE" \
     bash -c '
         set -euo pipefail
         node_major="$(node --version |
@@ -410,9 +455,11 @@ docker run --rm \
 git diff --exit-code -- experiments/workerd-component-model
 
 step "Checking the packaged executor"
-build-elfloader/workerd-executor/executor --self-test
-file build-elfloader/workerd-executor/executo
-if readelf -l build-elfloader/workerd-executor/executor | grep -q INTERP; then
+"$packaged_executor_path" --self-test
+file "$packaged_executor_path"
+program_headers="$(readelf -l "$packaged_executor_path")" ||
+    fail "could not inspect the packaged executor '$packaged_executor_path'"
+if grep -q INTERP <<<"$program_headers"; then
     fail "the packaged executor is not static"
 fi
 
@@ -424,7 +471,7 @@ Demo binary:
   $root/target/release/examples/workerd-demo
 
 Packaged executor:
-  $root/build-elfloader/workerd-executor/executo
+  $packaged_executor_path
 
 Next:
   docs/azure-workerd-hyperlight-runbook.md
